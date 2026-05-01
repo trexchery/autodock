@@ -139,14 +139,14 @@ and you don't want to log in via the browser flow first — useful on headless
 servers or when receiving a token from another machine — register it directly:
 
 ```bash
-cswap --add-token sk-ant-oat01-... --email user@example.com
-cswap --add-token sk-ant-oat01-... --email user@example.com --slot 3
-cswap --add-token - --email user@example.com           # read token from stdin
-cswap --add-token --email user@example.com             # prompt securely (no echo)
+cswap --add-token sk-ant-oat01-...
+cswap --add-token sk-ant-oat01-... --slot 3
+cswap --add-token - --slot 3                 # read token from stdin
+cswap --add-token --email user@example.com   # optional label override
 ```
 
-`--email` is required so cswap's metadata stays aligned with the rest of the
-accounts. No Anthropic API calls are made.
+`--email` is optional; omitted values use `setup-token-{slot}@token.local`.
+No Anthropic API calls are made.
 
 ## Uninstall
 

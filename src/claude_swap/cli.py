@@ -149,8 +149,7 @@ Examples:
         const="",
         help=(
             "Register a raw OAuth setup-token as a new account. "
-            "Pass '-' to read from stdin or omit the value to be prompted securely. "
-            "Requires --email."
+            "Pass '-' to read from stdin or omit the value to be prompted securely."
         ),
     )
 
