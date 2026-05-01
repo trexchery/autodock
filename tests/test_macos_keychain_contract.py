@@ -23,7 +23,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -85,9 +85,10 @@ class TestBackupCredentialsKeyring:
         with patch("claude_swap.switcher.keyring", create=True) as mock_keyring:
             macos_switcher._delete_account_credentials("3", "bob@example.com")
 
-            mock_keyring.delete_password.assert_called_once_with(
-                "claude-code", "account-3-bob@example.com"
-            )
+            mock_keyring.delete_password.assert_has_calls([
+                call("claude-code", "account-3-bob@example.com"),
+                call("claude-code", "account-None-bob@example.com"),
+            ])
 
 
 # ---------------------------------------------------------------------------

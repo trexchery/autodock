@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -801,6 +801,156 @@ class TestPerformSwitchPostDisplay:
         assert "Switched to" in output
         assert "usage display unavailable" in output
         assert "restart Claude Code" in output
+
+    def test_switch_with_unset_active_account_does_not_write_none_backup(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+    ):
+        """purge -> add-token -> switch-to must not back up live creds as None."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "target-token",
+                    "refreshToken": None,
+                    "expiresAt": None,
+                    "scopes": ["user:inference"],
+                    "subscriptionType": None,
+                    "rateLimitTier": None,
+                }
+            }),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+        }
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "existing-live-token",
+                "refreshToken": "existing-refresh",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert ("None", "test@example.com") not in creds_store
+        assert ("None", "test@example.com") not in configs_store
+        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == (
+            "target-token"
+        )
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+
+    def test_switch_uses_live_identity_for_current_backup_slot(
+        self,
+        temp_home: Path,
+    ):
+        """Do not trust stale activeAccountNumber when backing up live creds."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "realiti44@gmail.com",
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 3,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [3, 4],
+            "accounts": {
+                "3": {
+                    "email": "onurcetinkol@gmail.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+                "4": {
+                    "email": "realiti44@gmail.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+            },
+        })
+        target_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "target-token",
+                "refreshToken": "target-refresh",
+            }
+        })
+        live_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "realiti-live-token",
+                "refreshToken": "realiti-live-refresh",
+            }
+        })
+        creds_store = {
+            ("3", "onurcetinkol@gmail.com"): target_creds,
+            ("4", "realiti44@gmail.com"): "old-realiti-backup",
+        }
+        configs_store = {
+            ("3", "onurcetinkol@gmail.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "onurcetinkol@gmail.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+            ("4", "realiti44@gmail.com"): "old-realiti-config",
+        }
+        live_state = {"creds": live_creds}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("3")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert creds_store[("4", "realiti44@gmail.com")] == live_creds
+        assert ("3", "realiti44@gmail.com") not in creds_store
+        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == (
+            "target-token"
+        )
 
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
@@ -1699,6 +1849,16 @@ class TestAddAccountFromToken:
         assert oauth_blob["accessToken"] == "token-v2"
         assert oauth_blob["scopes"] == list(SETUP_TOKEN_SCOPES)
 
+    def test_update_in_place_rejects_inconsistent_metadata(self, temp_home):
+        """Never write account-None-* credentials if sequence lookup is corrupt."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_account_exists", return_value=True), \
+             patch.object(switcher, "_write_account_credentials") as write_creds, \
+             pytest.raises(ConfigError, match="metadata.*inconsistent"):
+            switcher.add_account_from_token("token-v2", "user@example.com")
+
+        write_creds.assert_not_called()
+
     def test_invalid_email_raises(self, temp_home):
         """A malformed email should raise ValidationError."""
         switcher = self._make_switcher(temp_home)
@@ -1744,3 +1904,36 @@ class TestAddAccountFromToken:
 
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
+
+
+class TestPurge:
+    """Tests for purge cleanup."""
+
+    def test_purge_removes_legacy_none_keyring_entry(self, temp_home):
+        """Purge should clean account-None-* keyring entries from older buggy runs."""
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.MACOS
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "user@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+
+        with patch("builtins.input", return_value="y"), \
+             patch("claude_swap.switcher.keyring.delete_password") as delete_password:
+            switcher.purge()
+
+        delete_password.assert_has_calls([
+            call("claude-code", "account-1-user@example.com"),
+            call("claude-code", "account-None-user@example.com"),
+        ])

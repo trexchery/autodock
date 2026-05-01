@@ -334,21 +334,27 @@ class ClaudeAccountSwitcher:
         On macOS/Windows: Removes from system keyring.
         """
         if self.platform in (Platform.LINUX, Platform.WSL):
-            cred_file = self.credentials_dir / f".creds-{account_num}-{email}.enc"
-            try:
-                if cred_file.exists():
-                    cred_file.unlink()
-            except Exception as e:
-                self._logger.warning(f"Failed to delete credentials file: {e}")
+            cred_files = [self.credentials_dir / f".creds-{account_num}-{email}.enc"]
+            if str(account_num) != "None":
+                cred_files.append(self.credentials_dir / f".creds-None-{email}.enc")
+            for cred_file in cred_files:
+                try:
+                    if cred_file.exists():
+                        cred_file.unlink()
+                except Exception as e:
+                    self._logger.warning(f"Failed to delete credentials file: {e}")
         else:
             # Use keyring for macOS/Windows
-            username = f"account-{account_num}-{email}"
-            try:
-                keyring.delete_password(KEYRING_SERVICE, username)
-            except keyring.errors.PasswordDeleteError:
-                pass  # Credential doesn't exist, that's fine
-            except Exception as e:
-                self._logger.warning(f"Failed to delete credentials from keyring: {e}")
+            usernames = [f"account-{account_num}-{email}"]
+            if str(account_num) != "None":
+                usernames.append(f"account-None-{email}")
+            for username in usernames:
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, username)
+                except keyring.errors.PasswordDeleteError:
+                    pass  # Credential doesn't exist, that's fine
+                except Exception as e:
+                    self._logger.warning(f"Failed to delete credentials from keyring: {e}")
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config)."""
@@ -760,6 +766,10 @@ class ClaudeAccountSwitcher:
                  and acc.get("organizationUuid", "") == ""),
                 None,
             )
+            if account_num is None:
+                raise ConfigError(
+                    f"Existing account metadata for {email} is inconsistent"
+                )
             credentials = json.dumps({
                 "claudeAiOauth": {
                     "accessToken": token,
@@ -1262,16 +1272,29 @@ class ClaudeAccountSwitcher:
         """
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
-            current_account = str(data.get("activeAccountNumber"))
+            active_account = data.get("activeAccountNumber")
+            current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
             current_identity = self._get_current_account()
+            if current_identity is not None:
+                current_email, current_org_uuid = current_identity
+                current_account = next(
+                    (
+                        num for num, account in data.get("accounts", {}).items()
+                        if account.get("email") == current_email
+                        and account.get("organizationUuid", "") == current_org_uuid
+                    ),
+                    None,
+                )
 
             config_path = self._get_claude_config_path()
 
-            # Fresh-machine path: no live Claude session yet (e.g. right after
-            # cswap --import on a new machine). Skip the back-up-current step
-            # since there's nothing to back up, and install the target directly.
-            if current_identity is None:
+            # Direct activation path: either there is no live Claude session
+            # yet (e.g. right after import), or claude-swap has no tracked
+            # active account yet (e.g. purge -> add-token -> switch-to while a
+            # live Claude credential still exists). In both cases, skip the
+            # back-up-current step so we never write account-None-* backups.
+            if current_identity is None or current_account is None:
                 target_creds = self._read_account_credentials(
                     target_account, target_email
                 )
@@ -1453,25 +1476,33 @@ class ClaudeAccountSwitcher:
                 email = account_info.get("email", "")
                 if self.platform in (Platform.LINUX, Platform.WSL):
                     # Remove credential files on Linux
-                    cred_file = (
+                    cred_files = [
                         self.credentials_dir / f".creds-{account_num}-{email}.enc"
-                    )
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
+                    ]
+                    if str(account_num) != "None":
+                        cred_files.append(
+                            self.credentials_dir / f".creds-None-{email}.enc"
+                        )
+                    for cred_file in cred_files:
+                        try:
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(f"Credential file: {cred_file.name}")
+                        except Exception:
+                            pass  # Ignore errors during purge
                 else:
                     # Remove from keyring on macOS/Windows
-                    username = f"account-{account_num}-{email}"
-                    try:
-                        keyring.delete_password(KEYRING_SERVICE, username)
-                        removed_items.append(f"Credential: {username}")
-                    except keyring.errors.PasswordDeleteError:
-                        pass  # Credential doesn't exist
-                    except Exception:
-                        pass  # Ignore other errors during purge
+                    usernames = [f"account-{account_num}-{email}"]
+                    if str(account_num) != "None":
+                        usernames.append(f"account-None-{email}")
+                    for username in usernames:
+                        try:
+                            keyring.delete_password(KEYRING_SERVICE, username)
+                            removed_items.append(f"Credential: {username}")
+                        except keyring.errors.PasswordDeleteError:
+                            pass  # Credential doesn't exist
+                        except Exception:
+                            pass  # Ignore other errors during purge
 
         # Remove backup directory
         if self.backup_dir.exists():
