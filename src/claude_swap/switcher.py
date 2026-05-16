@@ -1176,9 +1176,11 @@ class ClaudeAccountSwitcher:
                         limit = spend["limit"]
                         pct = spend["pct"]
                         if "clock" in spend:
-                            lines.append(f"${used:,.2f} / ${limit:,.2f}  ·  {pct:.1f}% used   resets {spend['clock']:<12}  in {spend['countdown']}")
+                            lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+                        elif "reset_date" in spend:
+                            lines.append(f"$$: {pct:>3.0f}%   resets {spend['reset_date']:<12}  ${used:,.2f} / ${limit:,.2f}")
                         else:
-                            lines.append(f"${used:,.2f} / ${limit:,.2f}  ·  {pct:.1f}% used")
+                            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
                     h5 = usage.get("five_hour")
                     d7 = usage.get("seven_day")
                     if h5:
