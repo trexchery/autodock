@@ -1033,7 +1033,6 @@ class ClaudeAccountSwitcher:
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
                 is_active=is_active,
-                org_uuid=org_uuid,
                 persist_credentials=persist,
             )
 
@@ -1071,8 +1070,6 @@ class ClaudeAccountSwitcher:
                     pct = spend["pct"]
                     if "clock" in spend:
                         lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
-                    elif "reset_date" in spend:
-                        lines.append(f"$$: {pct:>3.0f}%   resets {spend['reset_date']:<12}  ${used:,.2f} / ${limit:,.2f}")
                     else:
                         lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
                 h5 = usage.get("five_hour")
@@ -1166,7 +1163,6 @@ class ClaudeAccountSwitcher:
                 usage = oauth.fetch_usage_for_account(
                     account_num, current_email, creds,
                     is_active=True,
-                    org_uuid=current_org_uuid,
                 )
                 if usage:
                     lines = []
@@ -1177,8 +1173,6 @@ class ClaudeAccountSwitcher:
                         pct = spend["pct"]
                         if "clock" in spend:
                             lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
-                        elif "reset_date" in spend:
-                            lines.append(f"$$: {pct:>3.0f}%   resets {spend['reset_date']:<12}  ${used:,.2f} / ${limit:,.2f}")
                         else:
                             lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
                     h5 = usage.get("five_hour")
