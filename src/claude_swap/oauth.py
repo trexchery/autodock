@@ -116,16 +116,6 @@ def build_token_status(credentials: str) -> str | None:
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
-def format_monthly_reset() -> str:
-    """Return the first day of next month as a short local date string (e.g. 'Jun 1')."""
-    now = datetime.now(timezone.utc).astimezone()
-    if now.month == 12:
-        reset = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        reset = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    return f"{reset.strftime('%b')} {reset.day}"
-
-
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
@@ -190,15 +180,26 @@ def build_usage_result(data: dict) -> dict | None:
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
-        spend_entry: dict = {
-            "used": float(eu["used_credits"]) / 100,
-            "limit": float(eu["monthly_limit"]) / 100,
-            "pct": float(eu["utilization"]),
-            "currency": eu.get("currency", "USD"),
-        }
-        if eu.get("resets_at"):
-            spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
-        result["spend"] = spend_entry
+        # Claude Code returns nullable used_credits, monthly_limit, and utilization
+        # (monthly_limit=None = unlimited). All three are needed to render the spend
+        # line, so when any is null skip just the spend entry; five_hour/seven_day
+        # go through unchanged.
+        used_credits = eu.get("used_credits")
+        monthly_limit = eu.get("monthly_limit")
+        utilization = eu.get("utilization")
+        if used_credits is not None and monthly_limit is not None and utilization is not None:
+            try:
+                spend_entry: dict = {
+                    "used": float(used_credits) / 100,
+                    "limit": float(monthly_limit) / 100,
+                    "pct": float(utilization),
+                    "currency": eu.get("currency", "USD"),
+                }
+                if eu.get("resets_at"):
+                    spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+                result["spend"] = spend_entry
+            except (TypeError, ValueError) as e:
+                _logger.debug("extra_usage parse failed: %r", e)
 
     return result if result else None
 

@@ -161,6 +161,88 @@ class TestFetchUsage:
         assert "clock" in result["seven_day"]
         assert "countdown" in result["seven_day"]
 
+    @staticmethod
+    def _fetch_with_response(response_data):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+            return oauth.fetch_usage("sk-test-token")
+
+    def test_extra_usage_complete(self):
+        """All extra_usage fields populated — spend, five_hour, and seven_day all present."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True,
+                "used_credits": 72900,
+                "monthly_limit": 500000,
+                "utilization": 14.58,
+                "currency": "USD",
+            },
+        })
+        assert result is not None
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert result["spend"]["used"] == 729.0
+        assert result["spend"]["limit"] == 5000.0
+        assert result["spend"]["pct"] == 14.58
+        assert result["spend"]["currency"] == "USD"
+
+    def test_extra_usage_unlimited_keeps_other_rows(self):
+        """Unlimited (monthly_limit=None) drops the spend entry without losing five_hour/seven_day."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True,
+                "used_credits": 72900,
+                "monthly_limit": None,
+                "utilization": None,
+                "currency": "USD",
+            },
+        })
+        assert result is not None
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert "spend" not in result
+
+    def test_extra_usage_partial_keeps_other_rows(self):
+        """A null in used_credits leaves the rest of the response untouched."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True,
+                "used_credits": None,
+                "monthly_limit": 500000,
+                "utilization": 14.58,
+            },
+        })
+        assert result is not None
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert "spend" not in result
+
+    def test_extra_usage_disabled_keeps_other_rows(self):
+        """is_enabled=False suppresses spend even with valid numeric fields."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": False,
+                "used_credits": 72900,
+                "monthly_limit": 500000,
+                "utilization": 14.58,
+            },
+        })
+        assert result is not None
+        assert result["five_hour"]["pct"] == 22.0
+        assert result["seven_day"]["pct"] == 61.0
+        assert "spend" not in result
+
 
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""

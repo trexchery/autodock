@@ -1022,7 +1022,7 @@ class ClaudeAccountSwitcher:
         def fetch(
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
-            num, email, _, org_uuid, is_active, creds = account_info
+            num, email, _, _, is_active, creds = account_info
             if not creds or not oauth.extract_access_token(creds):
                 return "no credentials"
 
@@ -1160,11 +1160,24 @@ class ClaudeAccountSwitcher:
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             creds = self._read_credentials() or ""
             if creds and oauth.extract_access_token(creds):
-                usage = oauth.fetch_usage_for_account(
-                    account_num, current_email, creds,
-                    is_active=True,
-                )
-                if usage:
+                # Reuse the cache list_accounts writes (cache-first). On miss,
+                # fetch with is_active=True (Claude Code owns active credentials,
+                # cswap must not refresh them) and merge into existing entries so
+                # other accounts' rows survive.
+                usage_cache_path = self.backup_dir / "cache" / "usage.json"
+                cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+                if (cached is not MISSING and isinstance(cached, dict)
+                        and account_num in cached):
+                    usage = cached[account_num]
+                else:
+                    usage = oauth.fetch_usage_for_account(
+                        account_num, current_email, creds,
+                        is_active=True,
+                    )
+                    existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+                    existing[account_num] = usage
+                    write_cache(usage_cache_path, existing)
+                if isinstance(usage, dict):
                     lines = []
                     spend = usage.get("spend")
                     if spend:
