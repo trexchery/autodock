@@ -64,6 +64,33 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds
 
+
+def _format_usage_lines(usage: dict) -> list[str]:
+    lines: list[str] = []
+    spend = usage.get("spend")
+    if spend:
+        used = spend["used"]
+        limit = spend["limit"]
+        pct = spend["pct"]
+        if "clock" in spend:
+            lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+        else:
+            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
+    h5 = usage.get("five_hour")
+    if h5:
+        if "clock" in h5:
+            lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
+        else:
+            lines.append(f"5h: {h5['pct']:>3.0f}%")
+    d7 = usage.get("seven_day")
+    if d7:
+        if "clock" in d7:
+            lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
+        else:
+            lines.append(f"7d: {d7['pct']:>3.0f}%")
+    return lines
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -1080,28 +1107,7 @@ class ClaudeAccountSwitcher:
             elif usage is None:
                 print(f"     {dimmed('usage unavailable')}")
             else:
-                lines = []
-                spend = usage.get("spend")
-                if spend:
-                    used = spend["used"]
-                    limit = spend["limit"]
-                    pct = spend["pct"]
-                    if "clock" in spend:
-                        lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
-                    else:
-                        lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
-                h5 = usage.get("five_hour")
-                d7 = usage.get("seven_day")
-                if h5:
-                    if "clock" in h5:
-                        lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
-                    else:
-                        lines.append(f"5h: {h5['pct']:>3.0f}%")
-                if d7:
-                    if "clock" in d7:
-                        lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
-                    else:
-                        lines.append(f"7d: {d7['pct']:>3.0f}%")
+                lines = _format_usage_lines(usage)
                 for j, line in enumerate(lines):
                     connector = "└" if j == len(lines) - 1 else "├"
                     print(f"     {dimmed(connector)} {muted(line)}")
@@ -1196,24 +1202,7 @@ class ClaudeAccountSwitcher:
                     existing[account_num] = usage
                     write_cache(usage_cache_path, existing)
                 if isinstance(usage, dict):
-                    lines = []
-                    spend = usage.get("spend")
-                    if spend:
-                        used = spend["used"]
-                        limit = spend["limit"]
-                        pct = spend["pct"]
-                        if "clock" in spend:
-                            lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
-                        else:
-                            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
-                    h5 = usage.get("five_hour")
-                    d7 = usage.get("seven_day")
-                    if h5:
-                        suffix = f"   resets {h5['clock']:<12}  in {h5['countdown']}" if "clock" in h5 else ""
-                        lines.append(f"5h: {h5['pct']:>3.0f}%{suffix}")
-                    if d7:
-                        suffix = f"   resets {d7['clock']:<12}  in {d7['countdown']}" if "clock" in d7 else ""
-                        lines.append(f"7d: {d7['pct']:>3.0f}%{suffix}")
+                    lines = _format_usage_lines(usage)
                     for j, line in enumerate(lines):
                         connector = "└" if j == len(lines) - 1 else "├"
                         print(f"  {dimmed(connector)} {muted(line)}")
