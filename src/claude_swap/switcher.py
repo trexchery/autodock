@@ -1080,9 +1080,18 @@ class ClaudeAccountSwitcher:
             elif usage is None:
                 print(f"     {dimmed('usage unavailable')}")
             else:
+                lines = []
+                spend = usage.get("spend")
+                if spend:
+                    used = spend["used"]
+                    limit = spend["limit"]
+                    pct = spend["pct"]
+                    if "clock" in spend:
+                        lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+                    else:
+                        lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
                 h5 = usage.get("five_hour")
                 d7 = usage.get("seven_day")
-                lines = []
                 if h5:
                     if "clock" in h5:
                         lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
@@ -1167,6 +1176,47 @@ class ClaudeAccountSwitcher:
                 f"({current_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
+            creds = self._read_credentials() or ""
+            if creds and oauth.extract_access_token(creds):
+                # Reuse the cache list_accounts writes (cache-first). On miss,
+                # fetch with is_active=True (Claude Code owns active credentials,
+                # cswap must not refresh them) and merge into existing entries so
+                # other accounts' rows survive.
+                usage_cache_path = self.backup_dir / "cache" / "usage.json"
+                cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+                if (cached is not MISSING and isinstance(cached, dict)
+                        and account_num in cached):
+                    usage = cached[account_num]
+                else:
+                    usage = oauth.fetch_usage_for_account(
+                        account_num, current_email, creds,
+                        is_active=True,
+                    )
+                    existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
+                    existing[account_num] = usage
+                    write_cache(usage_cache_path, existing)
+                if isinstance(usage, dict):
+                    lines = []
+                    spend = usage.get("spend")
+                    if spend:
+                        used = spend["used"]
+                        limit = spend["limit"]
+                        pct = spend["pct"]
+                        if "clock" in spend:
+                            lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+                        else:
+                            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
+                    h5 = usage.get("five_hour")
+                    d7 = usage.get("seven_day")
+                    if h5:
+                        suffix = f"   resets {h5['clock']:<12}  in {h5['countdown']}" if "clock" in h5 else ""
+                        lines.append(f"5h: {h5['pct']:>3.0f}%{suffix}")
+                    if d7:
+                        suffix = f"   resets {d7['clock']:<12}  in {d7['countdown']}" if "clock" in d7 else ""
+                        lines.append(f"7d: {d7['pct']:>3.0f}%{suffix}")
+                    for j, line in enumerate(lines):
+                        connector = "└" if j == len(lines) - 1 else "├"
+                        print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
 

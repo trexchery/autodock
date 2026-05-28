@@ -157,6 +157,7 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -176,6 +177,29 @@ def build_usage_result(data: dict) -> dict | None:
         if d7.get("resets_at"):
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
         result["seven_day"] = d7_entry
+
+    eu = data.get("extra_usage")
+    if eu and eu.get("is_enabled"):
+        # Claude Code returns nullable used_credits, monthly_limit, and utilization
+        # (monthly_limit=None = unlimited). All three are needed to render the spend
+        # line, so when any is null skip just the spend entry; five_hour/seven_day
+        # go through unchanged.
+        used_credits = eu.get("used_credits")
+        monthly_limit = eu.get("monthly_limit")
+        utilization = eu.get("utilization")
+        if used_credits is not None and monthly_limit is not None and utilization is not None:
+            try:
+                spend_entry: dict = {
+                    "used": float(used_credits) / 100,
+                    "limit": float(monthly_limit) / 100,
+                    "pct": float(utilization),
+                    "currency": eu.get("currency", "USD"),
+                }
+                if eu.get("resets_at"):
+                    spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+                result["spend"] = spend_entry
+            except (TypeError, ValueError) as e:
+                _logger.debug("extra_usage parse failed: %r", e)
 
     return result if result else None
 

@@ -359,6 +359,100 @@ class TestStatus:
         switcher.status()
 
 
+class TestStatusCache:
+    """status() shares the usage.json cache with list_accounts."""
+
+    def test_status_uses_cached_usage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A fresh cache entry for the active account skips the API call."""
+        from claude_swap.cache import write_cache
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        cached_usage = {
+            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                  "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
+        }
+        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+            switcher.status()
+
+        mock_fetch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "25%" in output
+        assert "60%" in output
+
+    def test_status_fetches_on_cache_miss_with_is_active_true(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """On cache miss, fetch with is_active=True (never refresh active creds) and write back."""
+        from claude_swap.cache import read_cache, MISSING
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        usage_result = {
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
+            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
+        }
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result) as mock_fetch:
+            switcher.status()
+
+        mock_fetch.assert_called_once()
+        assert mock_fetch.call_args.kwargs.get("is_active") is True
+
+        output = capsys.readouterr().out
+        assert "10%" in output
+
+        cache_path = switcher.backup_dir / "cache" / "usage.json"
+        cached = read_cache(cache_path, 300)
+        assert cached is not MISSING
+        assert cached["1"] == usage_result
+
+    def test_status_preserves_other_accounts_in_cache(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A cache miss for the active account merges into existing entries instead of clobbering."""
+        from claude_swap.cache import read_cache, write_cache, MISSING
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        # Cache has only account "2"; status() runs for account "1"
+        existing = {"2": {"five_hour": {"pct": 80}}}
+        cache_path = switcher.backup_dir / "cache" / "usage.json"
+        write_cache(cache_path, existing)
+
+        usage_result = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch("claude_swap.oauth.fetch_usage_for_account", return_value=usage_result):
+            switcher.status()
+
+        cached = read_cache(cache_path, 300)
+        assert cached is not MISSING
+        assert cached["1"] == usage_result
+        assert cached["2"] == {"five_hour": {"pct": 80}}
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
