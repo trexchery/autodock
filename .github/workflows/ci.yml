@@ -43,4 +43,9 @@ jobs:
           pip install pytest
 
       - name: Run macOS Keychain tests (contract + real security wrapper)
-        run: pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v
+        # faulthandler dumps every thread's stack if a test exceeds 60s — a
+        # `security` call blocking on an invisible SecurityAgent dialog would
+        # otherwise hang the job with no clue where. The step timeout is the
+        # backstop that actually kills it.
+        timeout-minutes: 5
+        run: pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60
