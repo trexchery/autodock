@@ -2,19 +2,18 @@
 
 Two layers of coverage:
 
-1. **Mocked keyring tests** (run on every PR, every platform): assert that the
-   backup-credentials path passes the correct `(service, username)` tuple to
-   `keyring.get/set/delete_password`. This guards the multi-account backup
-   namespace — there's no Windows runner, so without these the keyring args
-   for backup creds are uncovered on every CI run.
+1. **Mocked tests** (run on every PR, every platform): assert that the macOS
+   backup-credentials path passes the correct `(service, account)` tuple to the
+   `macos_keychain` security wrapper, under the new `claude-swap` service. This
+   guards the multi-account backup namespace on every CI run.
 
 2. **Real-keychain integration tests** (GHA macOS only): exercise
    `_read_credentials` / `_write_credentials` end-to-end against a temporary
    keychain, comparing token values rather than argv shape.
 
-The Layer 2 gate (`GITHUB_ACTIONS=true AND sys.platform=="darwin"`) is
-deliberate: no local opt-in env var, so a developer cannot accidentally
-swap their default keychain by running pytest.
+The Layer 2 gate (`GITHUB_ACTIONS=true AND sys.platform=="darwin"`, plus the
+`no_keychain_fake` marker) is deliberate: no local opt-in, so a developer cannot
+accidentally swap their default keychain by running pytest.
 """
 
 from __future__ import annotations
@@ -44,50 +43,50 @@ def macos_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     return switcher
 
 
-class TestBackupCredentialsKeyring:
-    """Mocked tests for backup-creds keyring args on macOS/Windows.
+class TestBackupCredentialsSecurity:
+    """Mocked tests for the macOS backup-creds path: assert the correct
+    (service, account) tuple flows to the ``macos_keychain`` security wrapper.
 
-    `keyring` is conditionally imported in switcher.py
-    (`if sys.platform != "linux": import keyring`), so on a Linux runner the
-    symbol isn't bound. `patch(..., create=True)` injects it for the test.
+    The autouse ``block_real_keychain`` guard already prevents any real Keychain
+    access; here we install a MagicMock to assert the exact call shape. The
+    per-account backup service is the new ``claude-swap`` (not the old keyring
+    ``claude-code``).
     """
 
-    def test_read_account_credentials_calls_keyring_with_correct_keys(
+    def test_read_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch(
-            "claude_swap.switcher.keyring", create=True
-        ) as mock_keyring:
-            mock_keyring.get_password.return_value = "fake-token"
+        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
+            mock_kc.get_password.return_value = "fake-token"
 
             result = macos_switcher._read_account_credentials("1", "user@example.com")
 
-            mock_keyring.get_password.assert_called_once_with(
-                "claude-code", "account-1-user@example.com"
+            mock_kc.get_password.assert_called_once_with(
+                "claude-swap", "account-1-user@example.com"
             )
             assert result == "fake-token"
 
-    def test_write_account_credentials_calls_keyring_with_correct_keys(
+    def test_write_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch("claude_swap.switcher.keyring", create=True) as mock_keyring:
+        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
             macos_switcher._write_account_credentials(
                 "2", "alice@example.com", "secret-token"
             )
 
-            mock_keyring.set_password.assert_called_once_with(
-                "claude-code", "account-2-alice@example.com", "secret-token"
+            mock_kc.set_password.assert_called_once_with(
+                "claude-swap", "account-2-alice@example.com", "secret-token"
             )
 
-    def test_delete_account_credentials_calls_keyring_with_correct_keys(
+    def test_delete_account_credentials_uses_security_service(
         self, macos_switcher: ClaudeAccountSwitcher
     ):
-        with patch("claude_swap.switcher.keyring", create=True) as mock_keyring:
+        with patch("claude_swap.switcher.macos_keychain") as mock_kc:
             macos_switcher._delete_account_credentials("3", "bob@example.com")
 
-            mock_keyring.delete_password.assert_has_calls([
-                call("claude-code", "account-3-bob@example.com"),
-                call("claude-code", "account-None-bob@example.com"),
+            mock_kc.delete_password.assert_has_calls([
+                call("claude-swap", "account-3-bob@example.com"),
+                call("claude-swap", "account-None-bob@example.com"),
             ])
 
 
@@ -166,6 +165,7 @@ def tmp_keychain(tmp_path: Path):
         subprocess.run(["security", "delete-keychain", test_keychain], check=False)
 
 
+@pytest.mark.no_keychain_fake
 @mac_ci_only
 def test_read_credentials_finds_claude_code_seeded_entry(tmp_keychain: str):
     username = os.environ["USER"]
@@ -190,6 +190,7 @@ def test_read_credentials_finds_claude_code_seeded_entry(tmp_keychain: str):
     assert switcher._read_credentials() == "fake-token-read"
 
 
+@pytest.mark.no_keychain_fake
 @mac_ci_only
 def test_write_credentials_creates_user_scoped_entry(tmp_keychain: str):
     # If _write_credentials ever stores the entry under a hardcoded account name
