@@ -26,6 +26,7 @@ from unittest.mock import call, patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -155,6 +156,17 @@ def tmp_keychain(tmp_path: Path):
             ["security", "list-keychains", "-d", "user", "-s", test_keychain],
             check=True,
         )
+        # Harden against an invisible SecurityAgent dialog hanging the job: a
+        # `security` call against a (re-)locked keychain blocks forever on a
+        # headless runner waiting for an unlock prompt nobody can click. Remove
+        # the auto-lock timeout and unlock *after* the default/search-list swap
+        # (the order fastlane's setup_ci uses).
+        subprocess.run(
+            ["security", "set-keychain-settings", test_keychain], check=True
+        )
+        subprocess.run(
+            ["security", "unlock-keychain", "-p", "", test_keychain], check=True
+        )
         yield test_keychain
     finally:
         # Restore the search list BEFORE the default: macOS won't report a
@@ -226,3 +238,19 @@ def test_write_credentials_creates_user_scoped_entry(tmp_keychain: str):
         f"security find-generic-password failed: {result.stderr}"
     )
     assert result.stdout.strip() == "fake-token-write"
+
+
+@pytest.mark.no_keychain_fake
+@mac_ci_only
+def test_wrapper_roundtrip_real_keychain(tmp_keychain: str):
+    """set → get → delete through the real wrapper against the temp keychain.
+
+    Covers the full production read/write/delete path the other Layer-2 tests
+    only half-exercise: a wrapper-created item (no ``-A`` any-app access) read
+    back via the keychain *search list* (no explicit keychain argument), then
+    deleted, with the rc-44 "not found" contract checked at the end.
+    """
+    macos_keychain.set_password("claude-swap-test", "acct-1", "round-trip-token")
+    assert macos_keychain.get_password("claude-swap-test", "acct-1") == "round-trip-token"
+    macos_keychain.delete_password("claude-swap-test", "acct-1")
+    assert macos_keychain.get_password("claude-swap-test", "acct-1") is None
