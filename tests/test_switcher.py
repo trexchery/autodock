@@ -51,6 +51,57 @@ class TestEmailValidation:
             assert not switcher._validate_email(email), f"Expected {email} to be invalid"
 
 
+class TestFindAccountSlot:
+    """Test the (email, organizationUuid) -> slot composite-key lookup."""
+
+    DATA = {
+        "accounts": {
+            "1": {"email": "user@example.com", "organizationUuid": ""},
+            "2": {"email": "user@example.com", "organizationUuid": "org-123"},
+            "3": {"email": "other@example.com"},  # legacy record, no org field
+        }
+    }
+
+    def test_matches_composite_identity(self):
+        assert (
+            ClaudeAccountSwitcher._find_account_slot(
+                self.DATA, "user@example.com", "org-123"
+            )
+            == "2"
+        )
+
+    def test_same_email_wrong_org_is_no_match(self):
+        assert (
+            ClaudeAccountSwitcher._find_account_slot(
+                self.DATA, "user@example.com", "org-999"
+            )
+            is None
+        )
+
+    def test_absent_email_is_no_match(self):
+        assert (
+            ClaudeAccountSwitcher._find_account_slot(
+                self.DATA, "nobody@example.com", ""
+            )
+            is None
+        )
+
+    def test_empty_org_matches_missing_or_empty_org_field(self):
+        # Slot 1 has organizationUuid "", slot 3 omits the field entirely; both
+        # are personal accounts and must match an empty org_uuid query.
+        assert (
+            ClaudeAccountSwitcher._find_account_slot(self.DATA, "user@example.com", "")
+            == "1"
+        )
+        assert (
+            ClaudeAccountSwitcher._find_account_slot(self.DATA, "other@example.com", "")
+            == "3"
+        )
+
+    def test_empty_data_is_no_match(self):
+        assert ClaudeAccountSwitcher._find_account_slot({}, "user@example.com", "") is None
+
+
 class TestPlatformDetection:
     """Test platform detection."""
 

@@ -629,17 +629,23 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
 
+    @staticmethod
+    def _find_account_slot(
+        data: dict, email: str, organization_uuid: str
+    ) -> str | None:
+        """Return the slot key for the account matching (email, organizationUuid), else None."""
+        for num, account in data.get("accounts", {}).items():
+            if (account.get("email") == email and
+                    account.get("organizationUuid", "") == organization_uuid):
+                return num
+        return None
+
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
         if not data:
             return False
-
-        for account in data.get("accounts", {}).values():
-            if (account.get("email") == email and
-                    account.get("organizationUuid", "") == organization_uuid):
-                return True
-        return False
+        return self._find_account_slot(data, email, organization_uuid) is not None
 
     @staticmethod
     def _get_display_tag(email: str, org_name: str, org_uuid: str) -> str:
@@ -774,12 +780,7 @@ class ClaudeAccountSwitcher:
         # When no slot specified and account already exists, refresh credentials in place
         if slot is None and self._account_exists(current_email, current_org_uuid):
             seq = self._get_sequence_data()
-            account_num = next(
-                (num for num, acc in seq.get("accounts", {}).items()
-                 if acc.get("email") == current_email and
-                 acc.get("organizationUuid", "") == current_org_uuid),
-                None,
-            )
+            account_num = self._find_account_slot(seq, current_email, current_org_uuid)
             matched_org_name = seq["accounts"][account_num].get("organizationName", "") if account_num else ""
 
             current_creds = self._read_credentials()
@@ -824,11 +825,8 @@ class ClaudeAccountSwitcher:
 
             # Find if current account already exists in a different slot
             if self._account_exists(current_email, current_org_uuid):
-                old_num = next(
-                    (num for num, acc in data.get("accounts", {}).items()
-                     if acc.get("email") == current_email and
-                     acc.get("organizationUuid", "") == current_org_uuid),
-                    None,
+                old_num = self._find_account_slot(
+                    data, current_email, current_org_uuid
                 )
                 if old_num and old_num != account_num:
                     migrate_from = old_num
@@ -973,12 +971,7 @@ class ClaudeAccountSwitcher:
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
             seq = self._get_sequence_data()
-            account_num = next(
-                (num for num, acc in seq.get("accounts", {}).items()
-                 if acc.get("email") == email
-                 and acc.get("organizationUuid", "") == ""),
-                None,
-            )
+            account_num = self._find_account_slot(seq, email, "")
             if account_num is None:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
@@ -1018,12 +1011,7 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data()
 
             if self._account_exists(email, ""):
-                old_num = next(
-                    (num for num, acc in data.get("accounts", {}).items()
-                     if acc.get("email") == email
-                     and acc.get("organizationUuid", "") == ""),
-                    None,
-                )
+                old_num = self._find_account_slot(data, email, "")
                 if old_num and old_num != account_num:
                     migrate_from = old_num
 
@@ -1203,11 +1191,7 @@ class ClaudeAccountSwitcher:
         active_num = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            for num, account in data.get("accounts", {}).items():
-                if (account.get("email") == current_email and
-                        account.get("organizationUuid", "") == current_org_uuid):
-                    active_num = num
-                    break
+            active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str]] = []
         for num in data.get("sequence", []):
@@ -1427,14 +1411,10 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return
 
-        account_num = None
+        account_num = self._find_account_slot(data, current_email, current_org_uuid)
         org_name = ""
-        for num, info in data.get("accounts", {}).items():
-            if (info.get("email") == current_email and
-                    info.get("organizationUuid", "") == current_org_uuid):
-                account_num = num
-                org_name = info.get("organizationName", "") or ""
-                break
+        if account_num is not None:
+            org_name = data["accounts"][account_num].get("organizationName", "") or ""
 
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
@@ -1574,12 +1554,9 @@ class ClaudeAccountSwitcher:
         # Where the user actually is right now (live identity), falling back to
         # the recorded active slot. Used so usage-aware switching never moves
         # them onto an account worse than their current one.
-        current_num = next(
-            (num for num, acc in data.get("accounts", {}).items()
-             if acc.get("email") == current_email
-             and acc.get("organizationUuid", "") == current_org_uuid),
-            str(active_account) if active_account is not None else None,
-        )
+        current_num = self._find_account_slot(data, current_email, current_org_uuid)
+        if current_num is None:
+            current_num = str(active_account) if active_account is not None else None
 
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
@@ -1762,13 +1739,8 @@ class ClaudeAccountSwitcher:
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = next(
-                    (
-                        num for num, account in data.get("accounts", {}).items()
-                        if account.get("email") == current_email
-                        and account.get("organizationUuid", "") == current_org_uuid
-                    ),
-                    None,
+                current_account = self._find_account_slot(
+                    data, current_email, current_org_uuid
                 )
 
             config_path = self._get_claude_config_path()
