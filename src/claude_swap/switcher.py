@@ -2215,7 +2215,7 @@ class ClaudeAccountSwitcher:
                 "session can take up to ~30 seconds to pick up the new account."
             ))
         else:
-            print(dimmed("Active on your next message — no restart needed."))
+            print(dimmed("New account is active on your next message — no restart needed."))
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
