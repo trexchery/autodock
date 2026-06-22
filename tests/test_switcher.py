@@ -971,8 +971,8 @@ class TestPerformSwitchPostDisplay:
         switcher._print_switch_followup()
 
         out = capsys.readouterr().out
-        assert "within about 30 seconds" in out
         assert "apply immediately" in out
+        assert "30 seconds" in out
         assert "no restart needed" not in out
 
     def test_switch_followup_non_macos(self, temp_home: Path, capsys):

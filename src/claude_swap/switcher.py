@@ -2211,8 +2211,8 @@ class ClaudeAccountSwitcher:
             backend = "keychain" if self._use_keychain() else "file"
         if backend == "keychain":
             print(dimmed(
-                "Switch takes effect within about 30 seconds — "
-                "restart Claude Code to apply immediately."
+                "Restart Claude Code to apply immediately — otherwise the "
+                "session can take up to ~30 seconds to pick up the new account."
             ))
         else:
             print(dimmed("Active on your next message — no restart needed."))
