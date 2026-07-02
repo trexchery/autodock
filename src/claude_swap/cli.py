@@ -183,7 +183,11 @@ Examples:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing accounts during import",
+        help=(
+            "Overwrite existing accounts during import; with --switch-to, "
+            "activate the stored credentials without backing up the current "
+            "login first"
+        ),
     )
     parser.add_argument(
         "--full",
@@ -287,8 +291,8 @@ Examples:
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")
 
-    if args.force and not args.import_:
-        parser.error("--force can only be used with --import")
+    if args.force and not (args.import_ or args.switch_to):
+        parser.error("--force can only be used with --import or --switch-to")
 
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
@@ -338,7 +342,9 @@ Examples:
         elif args.switch:
             payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         elif args.switch_to:
-            payload = switcher.switch_to(args.switch_to, json_output=args.json)
+            payload = switcher.switch_to(
+                args.switch_to, json_output=args.json, force=args.force
+            )
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

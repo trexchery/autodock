@@ -2063,9 +2063,14 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False
+        self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict | None:
-        """Switch to specific account."""
+        """Switch to specific account.
+
+        ``force`` activates the target's stored credentials directly, skipping
+        both the already-active no-op guard and the backup-current step —
+        the recovery path for a live login gone stale (e.g. after --import).
+        """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -2113,11 +2118,14 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-        # JSON mode: short-circuit a no-op before mutating. Re-activating the
-        # account you're already on would otherwise re-write credentials, take
-        # the lock, and (on macOS) touch the Keychain — wasteful for a scripted
-        # idempotent "ensure active = N". Human mode keeps its existing behavior.
-        if json_output and data:
+        # Short-circuit a no-op before mutating (issue #79). A self-switch
+        # would first back up the live credentials into the target slot —
+        # destroying a freshly imported backup with a possibly stale login —
+        # then read them straight back. It also re-writes credentials, takes
+        # the lock, and (on macOS) touches the Keychain for nothing. --force
+        # skips this guard on purpose: its job is to rewrite the live login
+        # from the stored backup.
+        if not force and data:
             identity = self._get_current_account()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
@@ -2126,6 +2134,16 @@ class ClaudeAccountSwitcher:
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
                     ref = account_ref(int(target_account), email)
+                    if not json_output:
+                        print(
+                            f"{accent('Already on')} Account-{target_account} ({email})"
+                        )
+                        print(dimmed(
+                            "To rewrite the live login from the stored backup "
+                            "(e.g. after --import), run: "
+                            f"cswap --switch-to {target_account} --force"
+                        ))
+                        return None
                     return self._switch_noop(
                         strategy="direct",
                         reason="already-active",
@@ -2134,10 +2152,28 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
-        op = self._perform_switch(target_account, emit_output=not json_output)
-        return self._switch_result_from_op(op, "direct") if json_output else None
+        op = self._perform_switch(
+            target_account, emit_output=not json_output, force_activate=force
+        )
+        result = self._switch_result_from_op(op, "direct") if json_output else None
+        # A forced self-activation really rewrote the live credentials from the
+        # stored backup — "already-active" would misdescribe that mutation.
+        # A cross-slot force stays "switched": reason reports the outcome, not
+        # the skipped-backup mechanism.
+        if result is not None and force and not result["switched"]:
+            to = result["to"]
+            result["reason"] = "activated"
+            result["message"] = (
+                f"Activated Account-{to['number']} ({to['email']}) from stored backup"
+            )
+        return result
 
-    def _perform_switch(self, target_account: str, emit_output: bool = True) -> dict:
+    def _perform_switch(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+    ) -> dict:
         """Perform the actual account switch with transaction support.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
@@ -2146,6 +2182,11 @@ class ClaudeAccountSwitcher:
         output is suppressed — the live-session warning, the "Switched"/"Activated"
         lines, the nested list_accounts() summary and the followup — and the
         live-session warning rides back in ``warnings`` instead.
+
+        ``force_activate`` routes through the direct activation path even when a
+        managed live login exists: the stored backup is written over the live
+        credentials without backing the live ones up first (post-import recovery
+        when the live login is stale).
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -2190,18 +2231,24 @@ class ClaudeAccountSwitcher:
 
             config_path = self._get_claude_config_path()
 
-            # Direct activation path: either there is no live Claude session
-            # yet (e.g. right after import), or claude-swap has no tracked
-            # active account yet (e.g. purge -> add-token -> switch-to while a
-            # live Claude credential still exists). In both cases, skip the
-            # back-up-current step so we never write account-None-* backups.
-            if current_identity is None or current_account is None:
-                # Account left: None on a fresh machine (no live account at all),
-                # else the unmanaged live account (slot unknown to cswap).
-                from_ref = (
-                    None if current_identity is None
-                    else account_ref(None, current_identity[0])
-                )
+            # Direct activation path: there is no live Claude session yet
+            # (e.g. right after import), claude-swap has no tracked active
+            # account yet (e.g. purge -> add-token -> switch-to while a live
+            # Claude credential still exists), or --force asked to rewrite the
+            # live login from the stored backup. In all cases, skip the
+            # back-up-current step: it would either write account-None-*
+            # backups or (force) poison the stored backup with stale creds.
+            if force_activate or current_identity is None or current_account is None:
+                # Account left: None on a fresh machine (no live account at
+                # all); an unnumbered ref for an unmanaged live account (slot
+                # unknown to cswap); a numbered ref when --force ran with a
+                # managed live login.
+                if current_identity is None:
+                    from_ref = None
+                elif current_account is None:
+                    from_ref = account_ref(None, current_identity[0])
+                else:
+                    from_ref = account_ref(int(current_account), current_identity[0])
                 target_creds = self._read_account_credentials(
                     target_account, target_email
                 )
@@ -2290,9 +2337,15 @@ class ClaudeAccountSwitcher:
                             )
                     raise
 
-                self._logger.info(
-                    f"Activated account {target_account} (no prior live account)"
-                )
+                if force_activate and current_identity is not None:
+                    self._logger.info(
+                        f"Activated account {target_account} "
+                        "(forced, backup of current login skipped)"
+                    )
+                else:
+                    self._logger.info(
+                        f"Activated account {target_account} (no prior live account)"
+                    )
                 if emit_output:
                     print(
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
