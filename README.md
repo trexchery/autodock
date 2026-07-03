@@ -79,13 +79,12 @@ Launch Claude Code as a specific account in the current terminal only — every 
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
-cswap run 2 --no-share          # don't share your ~/.claude customizations
-cswap run 2 --share-history     # one conversation history across all accounts
+cswap run 2 --share-history     # share your chat history with this account too
 ```
 
-Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile.
+Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default.
 
-Conversation history stays per-account by default. Pass `--share-history` to share `projects/` and `history.jsonl` from `~/.claude` instead, so every account sees (and `--resume` lists) the same conversations. Any history the profile already accumulated is merged into `~/.claude` on first use — nothing disappears. `--no-share-history` returns the profile to per-account history. Not supported on Windows yet (sharing uses copies there, which would fork the history rather than share it).
+Each account keeps its own chat history by default. Pass `--share-history` if you want your accounts to continue the same conversations — a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. Not supported on Windows yet.
 
 ### Refresh expired tokens
 
