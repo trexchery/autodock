@@ -82,37 +82,34 @@ _USAGE_CACHE_TTL = 15  # seconds
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
-    lines: list[str] = []
+    # Collect (label, body) rows first, then pad every label to the widest one so
+    # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+    rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
         if "clock" in spend:
-            lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+            rows.append(("$$", f"{pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}"))
         else:
-            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
-    h5 = usage.get("five_hour")
-    if h5:
-        if "clock" in h5:
-            lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
-        else:
-            lines.append(f"5h: {h5['pct']:>3.0f}%")
-    d7 = usage.get("seven_day")
-    if d7:
-        if "clock" in d7:
-            lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
-        else:
-            lines.append(f"7d: {d7['pct']:>3.0f}%")
+            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+    for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
+        if w:
+            if "clock" in w:
+                rows.append((label, f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}"))
+            else:
+                rows.append((label, f"{w['pct']:>3.0f}%"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else ""
         if "clock" in w:
-            lines.append(f"{w['name']}: {w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}{marker}")
+            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}{marker}"))
         else:
-            lines.append(f"{w['name']}: {w['pct']:>3.0f}%{marker}")
-    return lines
+            rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+    width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
+    return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:

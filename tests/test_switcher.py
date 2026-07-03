@@ -3647,3 +3647,23 @@ class TestFormatUsageLines:
         usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
         lines = _format_usage_lines(usage)
         assert all(not line.startswith("Fable:") for line in lines)
+
+    def test_scoped_labels_align_columns_with_standard_windows(self):
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 62.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        # Labels are padded to the widest ("Fable:"), so the % column lines up.
+        assert lines[0] == "5h:      0%"
+        assert lines[1].startswith("7d:     62%   resets Jul 5 08:59")
+        assert lines[2].startswith("Fable: 100%   resets Jul 5 08:59")
+        assert len({line.index("%") for line in lines}) == 1
+
+    def test_standard_windows_alone_keep_legacy_layout(self):
+        usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
+        lines = _format_usage_lines(usage)
+        assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
