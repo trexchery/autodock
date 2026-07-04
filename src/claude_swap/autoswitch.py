@@ -73,6 +73,19 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
+# Adaptive scheduler: the baseline request volume is O(1) per tick — the
+# active account plus ONE due candidate (stalest data first) — instead of
+# every account in parallel. Candidates far from mattering are served stale
+# from the usage store. The engine escalates to a full refresh only when a
+# switch could actually be near: active utilization within this margin of the
+# threshold, or active usage unknown (failover needs fresh candidate data).
+ESCALATION_MARGIN_PCT = 15.0
+# A candidate whose binding pct moved at least this much between polls is
+# being used elsewhere (another PC / session mode) → poll it more closely;
+# an unmoved one backs off, up to the cap.
+MOVEMENT_DELTA_PCT = 1.0
+CANDIDATE_MAX_INTERVAL_S = 600.0
+
 
 def _now_iso() -> str:
     return (
@@ -116,23 +129,40 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
+    # account number → last fetch-error cause ("http-429", "timeout", ...) for
+    # accounts whose usage is unknown this tick. Additive field.
+    fetch_errors: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "active": self.active,
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.fetch_errors:
+            fields["fetchErrors"] = self.fetch_errors
+        return fields
+
+    def _describe(self, num: str) -> str:
+        h = self.headroom.get(num)
+        if h is not None:
+            return f"{100 - h:.0f}%"
+        err = self.fetch_errors.get(num)
+        return f"? ({err})" if err else "?"
 
     def human(self) -> str:
         if self.active is None:
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        used = f"{100 - h:.0f}% used" if h is not None else "usage unknown"
+        if h is not None:
+            used = f"{100 - h:.0f}% used"
+        else:
+            err = self.fetch_errors.get(str(num))
+            used = f"usage unknown ({err})" if err else "usage unknown"
         others = ", ".join(
-            f"#{n}: {100 - v:.0f}%" if v is not None else f"#{n}: ?"
-            for n, v in self.headroom.items()
+            f"#{n}: {self._describe(n)}"
+            for n in self.headroom
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
@@ -278,6 +308,38 @@ def _refresh_fingerprint(credentials: str) -> str | None:
     if not isinstance(token, str) or not token:
         return None
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def _binding_pct(usage: dict | None) -> float | None:
+    """Utilization of the binding (higher) 5h/7d window, or None."""
+    headroom = oauth.account_headroom(usage)
+    return None if headroom is None else 100.0 - headroom
+
+
+def _limiting_reset_ts(usage: dict | None) -> float | None:
+    """Epoch when the last of the ≥100% windows resets (account usable again)."""
+    if not isinstance(usage, dict):
+        return None
+    latest: float | None = None
+    for key in ("five_hour", "seven_day"):
+        window = usage.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)) or pct < 100.0:
+            continue
+        resets_at = window.get("resets_at")
+        if not resets_at:
+            continue
+        try:
+            ts = datetime.fromisoformat(
+                str(resets_at).replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
 
 
 def _ref(number: str, email: str) -> dict:
@@ -506,14 +568,17 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        usage = self.switcher.usage_by_account()
-        headroom = {
-            num: oauth.account_headroom(entry if isinstance(entry, dict) else None)
-            for num, entry in usage.items()
-        }
+        entries, usage, headroom = self._collect_scheduled_usage(current)
         self._emit(
             PollEvent(
-                active=active_ref, headroom=headroom, threshold=settings.threshold
+                active=active_ref,
+                headroom=headroom,
+                threshold=settings.threshold,
+                fetch_errors={
+                    num: entry.last_error
+                    for num, entry in entries.items()
+                    if usage.get(num) is None and entry.last_error
+                },
             )
         )
 
@@ -718,6 +783,142 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- adaptive usage scheduling ---------------------------------------------
+
+    def _collect_scheduled_usage(
+        self, current: str
+    ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
+        """Two-phase usage collection with an O(1) baseline.
+
+        Phase A fetches the active account plus ONE due candidate (the one
+        with the stalest data — never-fetched first, then oldest fetch);
+        everyone else is served from the usage store. Phase B refetches ALL
+        candidates and recomputes before any switch decision when a switch
+        could be near: active utilization within ``ESCALATION_MARGIN_PCT`` of
+        the threshold, or active usage unknown (failover must not run on
+        stale candidate data). Candidate selection never runs on the
+        pre-escalation snapshot.
+
+        Stalest-first needs no rotation cursor: it reads the persisted store,
+        so the loop and cron-driven ``--once`` runs schedule identically.
+        Backoff (``backoffUntil``) is enforced by the collector even for the
+        active account — a Retry-After must never be defeated — and during an
+        idle-hold no candidate is polled at all (slow crawl for everything).
+
+        Returns ``(entries, usage, headroom)`` where ``usage`` carries
+        decision values and ``headroom`` the derived headroom per account.
+        """
+        now = self.clock()
+        candidates = [
+            n for n in self.switcher.switchable_account_numbers() if n != current
+        ]
+
+        pre = self.switcher.usage_entries_by_account(fetch=set())
+        plan: set[str] = {current}
+        if self._idle_hold_since is None:
+            pick = self._due_candidate(candidates, pre, now)
+            if pick is not None:
+                plan.add(pick)
+        entries = self.switcher.usage_entries_by_account(fetch=plan)
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+
+        active_value = usage.get(current)
+        active_headroom = oauth.account_headroom(
+            active_value if isinstance(active_value, dict) else None
+        )
+        escalate = bool(candidates) and (
+            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            or (
+                active_headroom is not None
+                and 100.0 - active_headroom
+                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+            )
+        )
+        if escalate:
+            entries = self.switcher.usage_entries_by_account(
+                fetch={current, *candidates}
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+
+        headroom = {
+            num: oauth.account_headroom(value if isinstance(value, dict) else None)
+            for num, value in usage.items()
+        }
+        if not self.dry_run:
+            self._update_poll_plans(candidates, pre, entries, now)
+        return entries, usage, headroom
+
+    @staticmethod
+    def _due_candidate(
+        candidates: list[str], entries: dict, now: float
+    ) -> str | None:
+        """The due candidate with the stalest data, or None.
+
+        Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
+        accounts (api-key / no credentials) have nothing to fetch. A
+        perpetually failing account can't monopolize the slot: its backoff
+        removes it from the due set between attempts.
+        """
+        due: list[tuple[int, float, str]] = []
+        for num in candidates:
+            entry = entries.get(num)
+            if entry is None:
+                due.append((0, 0.0, num))
+                continue
+            if entry.sentinel is not None:
+                continue
+            if entry.in_backoff(now):
+                continue
+            if entry.next_poll_at is not None and now < entry.next_poll_at:
+                continue
+            if entry.fetched_at is None:
+                due.append((0, 0.0, num))
+            else:
+                due.append((1, entry.fetched_at, num))
+        if not due:
+            return None
+        due.sort()
+        return due[0][2]
+
+    def _update_poll_plans(
+        self, candidates: list[str], pre: dict, post: dict, now: float
+    ) -> None:
+        """Adapt each just-fetched candidate's poll cadence, persisted in the
+        store (survives ``--once`` engine restarts).
+
+        Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since its
+        previous poll — someone is using it elsewhere) halves the interval,
+        floored at the engine interval; no movement backs it off ×1.5 up to
+        ``CANDIDATE_MAX_INTERVAL_S``. A candidate at its limit skips straight
+        to its window reset (``nextPollAt`` only — the learned interval is
+        kept for when it comes back).
+        """
+        plans: dict[str, tuple[float | None, float | None]] = {}
+        for num in candidates:
+            before, after = pre.get(num), post.get(num)
+            if before is None or after is None or after.sentinel is not None:
+                continue
+            if after.fetched_at is None or after.fetched_at == before.fetched_at:
+                continue  # not fetched this pass
+            base = before.poll_interval_s or self.settings.interval_seconds
+            prev_pct = _binding_pct(before.last_good)
+            new_pct = _binding_pct(after.last_good)
+            if prev_pct is None or new_pct is None:
+                interval = self.settings.interval_seconds
+            elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
+                interval = max(self.settings.interval_seconds, base / 2)
+            else:
+                interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
+            next_poll = now + interval
+            headroom = oauth.account_headroom(after.last_good)
+            if headroom is not None and headroom <= 0:
+                reset_ts = _limiting_reset_ts(after.last_good)
+                if reset_ts is not None and reset_ts > next_poll:
+                    next_poll = reset_ts
+            plans[num] = (next_poll, interval)
+        if plans:
+            self.switcher.set_usage_poll_plan(plans)
 
     def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
         if self.dry_run:

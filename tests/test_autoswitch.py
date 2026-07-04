@@ -23,6 +23,7 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.usage_store import UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -46,6 +47,15 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
 
 
+def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
+    """Synthesize the store entry a live fetch would have produced."""
+    if isinstance(value, dict):
+        return UsageEntry(last_good=value, fetched_at=now, age_s=0.0)
+    if isinstance(value, str):
+        return UsageEntry(sentinel=value)
+    return UsageEntry()
+
+
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
@@ -58,6 +68,9 @@ class EngineHarness:
         self.settings = AutoSwitchSettings(**settings_kwargs)
         self.events: list = []
         self.clock = FakeClock()
+        # Keep the usage store on the same fake clock as the engine so
+        # freshness/claims/poll scheduling are deterministic in tests.
+        self.switcher._usage_store.clock = self.clock
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
@@ -110,7 +123,12 @@ class EngineHarness:
         }))
 
     def tick_with_usage(self, usage: dict) -> TickOutcome:
-        with patch.object(self.switcher, "_usage_by_account", return_value=usage):
+        entries = {
+            num: _entry_for(value, self.clock.now) for num, value in usage.items()
+        }
+        with patch.object(
+            self.switcher, "usage_entries_by_account", return_value=entries
+        ):
             return self.engine.tick()
 
     def active_number(self) -> int | None:
@@ -381,6 +399,150 @@ class TestIdleHold:
         assert harness.engine._idle_hold_since is None
 
 
+class TestAdaptiveScheduler:
+    """End-to-end through the real store: O(1) baseline, escalations,
+    skip-to-reset, movement-based cadence."""
+
+    def _harness(self, temp_home, monkeypatch, accounts=3, **settings_kwargs):
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home, **settings_kwargs)
+        emails = ["a@example.com", "b@example.com", "c@example.com"]
+        for num in range(1, accounts + 1):
+            h.seed(num, emails[num - 1])
+        h.make_live("a@example.com", 1)
+        # Deterministic owner detection: Claude Code "running" → the active
+        # account is fetched hands-off (is_active=True), never refreshed.
+        monkeypatch.setattr(h.switcher, "_active_cc_running", lambda: True)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    @staticmethod
+    def _counting_fetch(counts, usage_by_num, errors_by_num=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None):
+            counts[num] = counts.get(num, 0) + 1
+            error = (errors_by_num or {}).get(num)
+            if error:
+                return oauth.UsageOutcome(None, error=error)
+            value = usage_by_num.get(num)
+            return oauth.UsageOutcome(dict(value) if value else None)
+        return fake
+
+    def _tick(self, h, counts, usage_by_num, errors_by_num=None):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._counting_fetch(counts, usage_by_num, errors_by_num),
+        ):
+            return h.engine.tick()
+
+    def test_baseline_fetches_active_plus_one_candidate(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch)
+        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        for expected in ({"1": 1, "2": 1}, {"1": 2, "2": 1, "3": 1},
+                         {"1": 3, "2": 2, "3": 1}):
+            self._tick(h, counts, usage)
+            assert counts == expected, "one candidate per tick, stalest first"
+            h.clock.advance(60)
+
+    def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
+        # threshold 90, margin 15 → active at 80% is within the escalation band.
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        outcome = self._tick(
+            h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)}
+        )
+        assert outcome is TickOutcome.NO_ACTION  # still below the threshold
+        assert counts == {"1": 1, "2": 1, "3": 1}  # but everyone got refreshed
+
+    def test_active_unknown_escalates_before_failover(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch, unhealthy_ticks=1)
+        counts: dict[str, int] = {}
+        outcome = self._tick(
+            h, counts,
+            {"2": _usage(10), "3": _usage(50)},
+            errors_by_num={"1": "timeout"},
+        )
+        # Candidate data was refreshed in the same tick the failover ran on.
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_exhausted_candidate_skips_to_its_reset(self, temp_home, monkeypatch):
+        from datetime import datetime, timezone
+
+        h = self._harness(temp_home, monkeypatch)
+        reset_iso = "2026-07-05T12:00:00Z"
+        reset_ts = datetime(2026, 7, 5, 12, tzinfo=timezone.utc).timestamp()
+        usage = {"1": _usage(50), "2": _usage(100, reset_iso), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        for _ in range(3):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        assert counts["2"] == 1  # fetched once, then parked until its reset
+        entry = h.switcher._usage_store.entries(
+            {"2": ("b@example.com", "")}
+        )["2"]
+        assert entry.next_poll_at == pytest.approx(reset_ts)
+
+    def test_movement_adapts_poll_interval(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(10)}
+        counts: dict[str, int] = {}
+
+        def interval() -> float | None:
+            return h.switcher._usage_store.entries(
+                {"2": ("b@example.com", "")}
+            )["2"].poll_interval_s
+
+        self._tick(h, counts, usage)          # first data point → base interval
+        assert interval() == 60.0
+        h.clock.advance(60)
+        self._tick(h, counts, usage)          # unmoved → backs off ×1.5
+        assert interval() == 90.0
+        assert counts["2"] == 2
+        h.clock.advance(60)
+        self._tick(h, counts, usage)          # not due yet (90s interval)
+        assert counts["2"] == 2
+        h.clock.advance(60)
+        usage["2"] = _usage(20)               # moved 10 pts on another machine
+        self._tick(h, counts, usage)
+        assert counts["2"] == 3
+        assert interval() == 60.0             # halved (floored at engine interval)
+
+    def test_idle_hold_skips_candidate_polling(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch)
+        # Active token locally expired while "Claude Code is running" (owner
+        # patched True) → sentinel without any request.
+        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-live",
+                "expiresAt": 1000,
+            },
+        }))
+        usage = {"2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        h.clock.advance(60)
+        counts.clear()
+        # Hold established → the next tick polls nothing at all: the active
+        # fetch short-circuits locally and no candidate slot is spent.
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert counts == {}
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert set(reasons) == {"active-idle"}
+
+    def test_poll_event_carries_fetch_errors(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)
+        counts: dict[str, int] = {}
+        self._tick(
+            h, counts, {"2": _usage(10)}, errors_by_num={"1": "http-429"}
+        )
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.fetch_errors.get("1") == "http-429"
+        assert "http-429" in poll.human()
+        assert poll.to_json()["fetchErrors"] == {"1": "http-429"}
+
+
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()
@@ -551,10 +713,14 @@ class TestQuarantineLifecycle:
         harness.engine._quarantine("2", "b@example.com", "invalid_grant")
         harness.events.clear()
         fresh_engine = harness._make_engine()
+        usage = {"1": _usage(95), "2": _usage(0), "3": _usage(50)}
         with patch.object(
             harness.switcher,
-            "_usage_by_account",
-            return_value={"1": _usage(95), "2": _usage(0), "3": _usage(50)},
+            "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in usage.items()
+            },
         ):
             outcome = fresh_engine.tick()
         # 2 has the most headroom but is quarantined → 3 wins.
