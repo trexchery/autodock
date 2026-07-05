@@ -44,7 +44,13 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
-from claude_swap.models import Platform, SwitchTransaction, get_timestamp
+from claude_swap.models import (
+    AccountSnapshot,
+    AccountsSnapshot,
+    Platform,
+    SwitchTransaction,
+    get_timestamp,
+)
 from claude_swap.printer import (
     abbreviate_path,
     accent,
@@ -555,6 +561,43 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(accounts_info, fetch=fetch)
 
+    def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
+        """One-pass structured snapshot of every managed account, for the TUI.
+
+        Metadata, active-slot detection, and usage entries all come from a
+        single ``_build_accounts_info`` + ``_collect_usage_entries`` pass, so
+        the view is coherent — two separate calls could interleave with other
+        collectors and disagree about the active slot or freshness. ``fetch``
+        has ``_collect_usage_entries`` semantics: ``None`` makes every stale
+        account eligible; a set restricts which accounts *may* be fetched
+        this pass.
+        """
+        accounts_info = self._build_accounts_info()
+        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        active_number: str | None = None
+        accounts: list[AccountSnapshot] = []
+        for num, email, org_name, org_uuid, is_active, _creds in accounts_info:
+            n = str(num)
+            if is_active:
+                active_number = n
+            accounts.append(
+                AccountSnapshot(
+                    number=n,
+                    email=email,
+                    org_name=org_name,
+                    org_uuid=org_uuid,
+                    is_active=is_active,
+                    kind=self._account_kind(n),
+                    switchable=self._account_is_switchable(n),
+                    usage=entries[n],
+                )
+            )
+        return AccountsSnapshot(
+            active_number=active_number,
+            accounts=tuple(accounts),
+            taken_at=self._usage_store.clock(),
+        )
+
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
         read (no fetching, no credential access). The TUI watch view diffs
@@ -932,7 +975,7 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
-    def add_account(self, slot: int | None = None) -> None:
+    def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         """Add current account to managed accounts.
 
         Args:
@@ -940,6 +983,8 @@ class ClaudeAccountSwitcher:
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
                   is already occupied by a different account.
+            assume_yes: Skip that overwrite prompt (callers with their own
+                  confirmation UI, e.g. the TUI, confirm before calling).
         """
         self._setup_directories()
         self._init_sequence_file()
@@ -1021,14 +1066,15 @@ class ClaudeAccountSwitcher:
                     print(
                         f"{existing_email} {muted(f'[{existing_tag}]')}"
                     )
-                    try:
-                        answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        print(f"\n{dimmed('Cancelled')}")
-                        return
-                    if answer not in ("y", "yes"):
-                        print(dimmed("Cancelled"))
-                        return
+                    if not assume_yes:
+                        try:
+                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{dimmed('Cancelled')}")
+                            return
+                        if answer not in ("y", "yes"):
+                            print(dimmed("Cancelled"))
+                            return
                     displace_slot = (account_num, existing_email)
         else:
             account_num = str(self._get_next_account_number())
@@ -1101,7 +1147,11 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
-        self, token: str, email: str | None = None, slot: int | None = None
+        self,
+        token: str,
+        email: str | None = None,
+        slot: int | None = None,
+        assume_yes: bool = False,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -1119,6 +1169,8 @@ class ClaudeAccountSwitcher:
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
                    carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
+            assume_yes: Skip the occupied-slot overwrite prompt (callers with
+                   their own confirmation UI, e.g. the TUI, confirm first).
         """
         import getpass
 
@@ -1224,14 +1276,15 @@ class ClaudeAccountSwitcher:
                     )
                     warning(f"Slot {slot} already occupied")
                     print(f"{existing_email} {muted(f'[{existing_tag}]')}")
-                    try:
-                        answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        print(f"\n{dimmed('Cancelled')}")
-                        return
-                    if answer not in ("y", "yes"):
-                        print(dimmed("Cancelled"))
-                        return
+                    if not assume_yes:
+                        try:
+                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{dimmed('Cancelled')}")
+                            return
+                        if answer not in ("y", "yes"):
+                            print(dimmed("Cancelled"))
+                            return
                     displace_slot = (account_num, existing_email)
         else:
             account_num = str(self._get_next_account_number())
