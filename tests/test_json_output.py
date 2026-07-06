@@ -68,10 +68,10 @@ class TestJsonHelpers:
         # derive the live value from resets_at, same as the human view.
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
         usage = {"seven_day": {"pct": 62.0, "resets_at": resets_at,
-                               "countdown": "17h 0m", "clock": "15:59"}}
+                               "countdown": "17h 0m", "clock": "stale-clock"}}
         out = usage_to_json(usage)
         assert out["sevenDay"]["countdown"].startswith("2h")
-        assert out["sevenDay"]["clock"] != "15:59"
+        assert out["sevenDay"]["clock"] != "stale-clock"
 
     def test_usage_to_json_falls_back_to_cached_strings_without_resets_at(self):
         # Entries persisted by older versions have no resets_at — the
