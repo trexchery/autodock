@@ -137,6 +137,32 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
+### Menu bar (macOS)
+
+Run a menu bar app that shows each account's usage and lets you switch with a click:
+
+```bash
+# Install with the optional menu bar extra
+uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+
+cswap --menubar
+```
+
+The menu shows every managed account's 5h / 7d / spend usage, switches accounts
+(specific / rotate / best / next-available), and mirrors the TUI's add / remove /
+refresh actions. A Settings submenu controls what the menu-bar title shows and
+the refresh interval.
+
+**Auto-switch.** Enable *Settings → Auto-switch accounts* to run the same
+auto-switch engine as [`cswap auto`](#automatic-switching) in the background: it switches
+you to the account with the most headroom when the active account nears its
+limit, then notifies you to restart Claude Code. *Settings → Auto-switch
+threshold* (80% / 90% / 95% / 98%) sets the trigger level. That threshold and the
+rest of the policy (cooldown, hysteresis, poll interval) are the shared
+`autoswitch.*` settings, so the menu bar and the CLI stay in sync — tune the rest
+with `cswap config set autoswitch.<key> <value>`. Auto-switch is off until you
+enable it.
+
 ### Other commands
 
 ```bash
