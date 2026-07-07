@@ -3539,6 +3539,31 @@ class TestMacosKeychainFallback:
         s._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._use_keychain() is False
 
+    def test_kc_call_failure_schedules_a_recheck(self, temp_home: Path, monkeypatch):
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        before = time.time()
+        with pytest.raises(KeychainError):
+            s._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._keychain_disabled_until > before  # a re-probe is scheduled
+
+    def test_keychain_recovers_after_cooldown(self, temp_home: Path):
+        # A long-running daemon (menu bar / TUI) must re-probe after the cooldown
+        # so a transient `security` timeout doesn't disable the Keychain for the
+        # whole process — the stuck-in-file-mode "no credentials" display bug.
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False
+        s._keychain_disabled_until = time.time() - 1  # cooldown already elapsed
+        assert s._use_keychain() is True             # re-probes
+        assert s._keychain_usable_cache is None       # re-armed for a fresh op
+        assert s._keychain_disabled_until == 0.0
+
+    def test_keychain_stays_file_mode_during_cooldown(self, temp_home: Path):
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False
+        s._keychain_disabled_until = time.time() + 100  # still within cooldown
+        assert s._use_keychain() is False
+
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain
     ):

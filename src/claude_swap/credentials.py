@@ -61,6 +61,14 @@ CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
 _ACTIVE_READ_ATTEMPTS = 2
 _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 
+# After a Keychain failure the store drops to file mode so one CLI invocation
+# can't split-brain between backends. A long-running daemon (menu bar / TUI)
+# instead re-probes this long after the last failure: far longer than any CLI
+# command runs (so the guarantee holds — a sub-second command never re-probes),
+# short enough that a transient `security` timeout self-heals within a minute
+# instead of disabling the Keychain for the whole process lifetime.
+KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
+
 
 class ActiveCredentials(NamedTuple):
     """Outcome of reading Claude Code's active credential.
@@ -129,6 +137,10 @@ class CredentialStore:
         # most recent active-credential write landed ("keychain" | "file"), for the
         # post-switch follow-up message.
         self._keychain_usable_cache: bool | None = None
+        # When file mode was entered by a real failure, the epoch after which to
+        # re-probe the Keychain (see KEYCHAIN_RECHECK_COOLDOWN_S). 0.0 = no
+        # pending re-probe (never failed, or forced to file mode deliberately).
+        self._keychain_disabled_until: float = 0.0
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -149,20 +161,32 @@ class CredentialStore:
             result = fn(*args)
         except macos_keychain.KEYCHAIN_ERRORS:
             self._keychain_usable_cache = False
+            self._keychain_disabled_until = time.time() + KEYCHAIN_RECHECK_COOLDOWN_S
             raise
         if self._keychain_usable_cache is None:
             self._keychain_usable_cache = True
         return result
 
     def _use_keychain(self) -> bool:
-        """Whether credential *writes* should target the macOS Keychain this run.
+        """Whether credential ops should target the macOS Keychain right now.
 
-        ``False`` off macOS. On macOS, ``True`` until a Keychain op has failed this
-        process (the cache flips to ``False`` and sticks). Unknown (``None``) is
-        optimistic — the first real op tries the Keychain and records the outcome.
+        ``False`` off macOS. On macOS, ``True`` until a Keychain op fails, which
+        drops to file mode. That failure records a re-probe deadline
+        (``KEYCHAIN_RECHECK_COOLDOWN_S``): within one CLI invocation the deadline
+        never passes, so a command can't split-brain between backends, but a
+        long-running daemon re-probes once the cooldown elapses so a transient
+        ``security`` timeout self-heals instead of sticking for the whole process.
+        A directly-forced ``False`` with no deadline (0.0) stays sticky.
         """
         if self._host.platform != Platform.MACOS:
             return False
+        if (
+            self._keychain_usable_cache is False
+            and self._keychain_disabled_until
+            and time.time() >= self._keychain_disabled_until
+        ):
+            self._keychain_usable_cache = None  # cooldown elapsed → re-probe
+            self._keychain_disabled_until = 0.0
         return self._keychain_usable_cache is not False
 
     def _read_credentials(self) -> str | None:
