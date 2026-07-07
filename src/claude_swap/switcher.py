@@ -29,6 +29,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
@@ -144,6 +145,7 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — Claude Code refreshes the active account",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
+    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; run: cswap login",
 }
 
 
@@ -1030,6 +1032,9 @@ class ClaudeAccountSwitcher:
 
             self._write_account_credentials(account_num, current_email, current_creds)
             self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, current_org_uuid)}
+            )
 
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
@@ -1137,6 +1142,9 @@ class ClaudeAccountSwitcher:
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
         self._write_account_config(account_num, current_email, current_config)
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (current_email, organization_uuid)}
+        )
 
         # Update sequence.json
         data = self._get_sequence_data()
@@ -1743,6 +1751,12 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities)
+        # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
+        # drives the "re-login needed" display and (via ``num not in sentinels``
+        # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        for num in info_by_num:
+            if num not in sentinels and entries[num].token_dead():
+                sentinels[num] = USAGE_RELOGIN_REQUIRED
         to_fetch = [
             num
             for num in info_by_num
