@@ -210,6 +210,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -247,6 +248,14 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="SECONDS",
         help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="NAME",
+        help=(
+            "Also switch when this model's weekly limit is hit (e.g. Fable), "
+            "not just the account-wide 5h/7d windows"
+        ),
     )
     parser.add_argument(
         "--include-api-key-accounts",

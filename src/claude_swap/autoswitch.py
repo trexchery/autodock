@@ -398,6 +398,10 @@ class AutoSwitchEngine:
     ):
         self.switcher = switcher
         self.settings = settings
+        # Model whose per-model weekly limit also binds the switch decision
+        # (empty = account-wide 5h/7d only). Passed to every account_headroom
+        # call so active and candidates are judged on the same axes.
+        self._models = (settings.model,) if settings.model else ()
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -870,7 +874,7 @@ class AutoSwitchEngine:
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None
+            active_value if isinstance(active_value, dict) else None, self._models
         )
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
@@ -887,7 +891,9 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = {
-            num: oauth.account_headroom(value if isinstance(value, dict) else None)
+            num: oauth.account_headroom(
+                value if isinstance(value, dict) else None, self._models
+            )
             for num, value in usage.items()
         }
         if not self.dry_run:
