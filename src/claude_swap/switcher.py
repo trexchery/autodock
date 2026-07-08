@@ -29,6 +29,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
@@ -144,6 +145,7 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — Claude Code refreshes the active account",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
+    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
 }
 
 
@@ -1030,6 +1032,9 @@ class ClaudeAccountSwitcher:
 
             self._write_account_credentials(account_num, current_email, current_creds)
             self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, current_org_uuid)}
+            )
 
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
@@ -1137,6 +1142,9 @@ class ClaudeAccountSwitcher:
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
         self._write_account_config(account_num, current_email, current_config)
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (current_email, organization_uuid)}
+        )
 
         # Update sequence.json
         data = self._get_sequence_data()
@@ -1249,6 +1257,13 @@ class ClaudeAccountSwitcher:
                 )
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
+            # A refreshed credential invalidates any dead-token quarantine on this
+            # slot (mirrors ``add_account``); otherwise the stale strike row keeps
+            # the account stuck at "re-login needed" and it never fetches the new
+            # token. Token accounts are always personal, so org is "".
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -1322,6 +1337,11 @@ class ClaudeAccountSwitcher:
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
+        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (email, "")}
+        )
 
         data = self._get_sequence_data()
         record = {
@@ -1743,6 +1763,12 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities)
+        # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
+        # drives the "re-login needed" display and (via ``num not in sentinels``
+        # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        for num in info_by_num:
+            if num not in sentinels and entries[num].token_dead():
+                sentinels[num] = USAGE_RELOGIN_REQUIRED
         to_fetch = [
             num
             for num in info_by_num
@@ -1763,6 +1789,13 @@ class ClaudeAccountSwitcher:
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
             entries = store.entries(identities)
+            # A fetch that just returned invalid_grant advances the strike to the
+            # dead threshold. The pre-fetch quarantine scan above couldn't see it,
+            # so surface "re-login needed" in *this* pass instead of leaving the
+            # slot looking merely refresh-failed until the next refresh notices.
+            for num in to_fetch:
+                if entries[num].token_dead():
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))

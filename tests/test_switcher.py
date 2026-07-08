@@ -1319,8 +1319,11 @@ class TestPerformSwitchPostDisplay:
 
         try:
             with patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=rotated_creds,
+                # Patch the classifying base (refresh_oauth_credentials delegates
+                # to it), so both the proactive and 401-retry paths see the
+                # rotation regardless of which wrapper they call.
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated_creds, None),
             ), patch(
                 "claude_swap.oauth.request_usage_data",
                 return_value={
@@ -2001,6 +2004,73 @@ class TestGetCurrentAccountOrgSupport:
 
 
 # ── Task 5: add_account with org fields ──────────────────────────────────────
+
+class TestDeadTokenQuarantine:
+    """A dead refresh-token account is surfaced as re-login-needed and not fetched."""
+
+    def _dead_creds(self):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt", "expiresAt": 1,
+        }})
+
+    def _make_dead(self, switcher, num="2", identity=("test@example.com", "")):
+        store = switcher._usage_store
+        from claude_swap.usage_store import FetchRecord
+        store.record({num: FetchRecord(error="invalid_grant")}, {num: identity})
+
+    def test_collector_surfaces_relogin_sentinel_and_skips_fetch(self, temp_home):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        fetch.assert_not_called()  # quarantined: no endless 401/429 loop
+
+    def test_relogin_surfaces_same_pass_on_invalid_grant(self, temp_home):
+        # A fetch that returns invalid_grant crosses the dead threshold this pass;
+        # the pre-fetch quarantine scan couldn't see it, so the collector must
+        # still render "re-login needed" now, not only on the next refresh.
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(error="invalid_grant")},
+        ) as run:
+            entries = switcher._collect_usage_entries(info)
+
+        run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_readd_clears_quarantine(self, temp_home):
+        # Re-adding an account (fresh credential) must lift the quarantine, so
+        # the disabled fetches don't leave it stuck at "re-login needed" forever.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        identity = ("user@example.com", "org-A")
+        self._make_dead(switcher, num="1", identity=identity)
+        assert switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "user@example.com", "accountUuid": "u",
+            "organizationUuid": "org-A", "organizationName": "Acme",
+        }}))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
 
 class TestAddAccountOrgFields:
     def test_allows_same_email_different_org(self, temp_home):
@@ -2780,6 +2850,45 @@ class TestAddAccountFromToken:
         oauth_blob = json.loads(stored_creds)["claudeAiOauth"]
         assert oauth_blob["accessToken"] == "token-v2"
         assert oauth_blob["scopes"] == list(SETUP_TOKEN_SCOPES)
+
+    def test_update_in_place_clears_quarantine(self, temp_home):
+        """Refreshing a token in place must lift the dead-token quarantine, so a
+        stale strike doesn't leave the account stuck at 're-login needed' and
+        never fetching the new token (mirrors add_account)."""
+        from claude_swap.usage_store import FetchRecord
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "user@example.com")
+
+        identity = ("user@example.com", "")
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant")}, {"1": identity}
+        )
+        assert switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", "user@example.com")
+
+        assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+    def test_new_write_clears_stale_quarantine(self, temp_home):
+        """Writing a fresh credential into a slot whose lingering usage row still
+        carries a dead-token strike (same identity) must start it clean."""
+        from claude_swap.usage_store import FetchRecord
+        switcher = self._make_switcher(temp_home)
+        identity = ("user@example.com", "")
+        switcher._usage_store.record(
+            {"5": FetchRecord(error="invalid_grant")}, {"5": identity}
+        )
+        assert switcher._usage_store.entries({"5": identity})["5"].token_dead()
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", "user@example.com", slot=5)
+
+        assert not switcher._usage_store.entries({"5": identity})["5"].token_dead()
 
     def test_update_in_place_rejects_inconsistent_metadata(self, temp_home):
         """Never write account-None-* credentials if sequence lookup is corrupt."""
