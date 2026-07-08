@@ -161,7 +161,10 @@ class CredentialStore:
             result = fn(*args)
         except macos_keychain.KEYCHAIN_ERRORS:
             self._keychain_usable_cache = False
-            self._keychain_disabled_until = time.time() + KEYCHAIN_RECHECK_COOLDOWN_S
+            # Monotonic so a wall-clock jump can't expire the cooldown early/late.
+            self._keychain_disabled_until = (
+                time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
+            )
             raise
         if self._keychain_usable_cache is None:
             self._keychain_usable_cache = True
@@ -176,18 +179,33 @@ class CredentialStore:
         never passes, so a command can't split-brain between backends, but a
         long-running daemon re-probes once the cooldown elapses so a transient
         ``security`` timeout self-heals instead of sticking for the whole process.
-        A directly-forced ``False`` with no deadline (0.0) stays sticky.
+        A pinned file mode with no deadline (0.0) stays sticky — see
+        :meth:`_pin_file_mode` for why a write fallback must never re-probe.
         """
         if self._host.platform != Platform.MACOS:
             return False
         if (
             self._keychain_usable_cache is False
             and self._keychain_disabled_until
-            and time.time() >= self._keychain_disabled_until
+            and time.monotonic() >= self._keychain_disabled_until
         ):
             self._keychain_usable_cache = None  # cooldown elapsed → re-probe
             self._keychain_disabled_until = 0.0
         return self._keychain_usable_cache is not False
+
+    def _pin_file_mode(self) -> None:
+        """Pin file mode for the rest of the process — no Keychain re-probe.
+
+        A read timeout is safe to recover from (re-probe on cooldown), but an
+        active-credential *write* that falls back to the file is not: its
+        best-effort delete of the old Keychain item may have failed, leaving a
+        stale entry. Re-probing later could read that residual and show the wrong
+        account, so once a write falls back we never re-probe onto a Keychain we
+        could not verify-clear. Clears any re-probe deadline a prior read
+        scheduled, which could otherwise still be pending.
+        """
+        self._keychain_usable_cache = False
+        self._keychain_disabled_until = 0.0
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
@@ -563,6 +581,11 @@ class CredentialStore:
         except Exception as e:
             raise CredentialWriteError(f"Failed to write credentials: {e}")
         self._delete_active_keychain_entry()
+        if self._host.platform == Platform.MACOS:
+            # The delete above is best-effort; a stale Keychain item may remain.
+            # Pin file mode so a later read-timeout cooldown can't re-probe onto
+            # that residual and resurrect the wrong account (see _pin_file_mode).
+            self._pin_file_mode()
         self._last_active_credentials_backend = "file"
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
