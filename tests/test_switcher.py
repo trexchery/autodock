@@ -5036,7 +5036,7 @@ class TestStashAndRetentionStore:
         return switcher
 
     def test_safety_copy_write_and_list(self, temp_home):
-        """The store is write-only in production; bytes land 0600 base64."""
+        """The store is write-only in production; bytes land as base64."""
         switcher = self._switcher(temp_home)
         store = switcher._store
         entry_id = store._write_unclaimed_credential(
@@ -5046,6 +5046,12 @@ class TestStashAndRetentionStore:
         entries = store._list_unclaimed_credentials()
         assert entries[entry_id]["reason"] == "alien"
         assert entries[entry_id]["createdAt"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="File permissions work differently on Windows")
+    def test_safety_copy_file_is_owner_only(self, temp_home):
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        entry_id = store._write_unclaimed_credential("secret-bytes", {})
         mode = store._stash_entry_path(entry_id).stat().st_mode & 0o777
         assert mode == 0o600
 
