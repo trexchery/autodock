@@ -350,3 +350,49 @@ def test_adapt_snapshot_shape_and_active_selection():
 
 def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
+
+
+# --- weekly reset roll-forward (static 7-day cadence) --------------------------
+
+def test_rolled_weekly_window_advances_passed_reset():
+    w = {"pct": 95.0, "resets_at": _iso(-3 * 86400), "countdown": "stale", "clock": "old"}
+    rolled = menubar._rolled_weekly_window(w, _NOW)
+    assert rolled["pct"] == 0.0  # the window objectively rolled over
+    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
+    assert "countdown" not in rolled and "clock" not in rolled  # stale strings dropped
+
+
+def test_rolled_weekly_window_advances_multiple_missed_weeks():
+    w = {"pct": 80.0, "resets_at": _iso(-10 * 86400)}  # two boundaries crossed
+    rolled = menubar._rolled_weekly_window(w, _NOW)
+    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
+
+
+def test_rolled_weekly_window_leaves_future_or_unknown_untouched():
+    future = {"pct": 42.0, "resets_at": _iso(2 * 86400)}
+    assert menubar._rolled_weekly_window(future, _NOW) is future
+    no_reset = {"pct": 42.0}
+    assert menubar._rolled_weekly_window(no_reset, _NOW) is no_reset
+    assert menubar._rolled_weekly_window(None, _NOW) is None
+
+
+def test_usage_summary_reflects_passed_weekly_reset():
+    # 7d reset a day ago: show it as reset (0%) with the next weekly boundary,
+    # from the static schedule alone. 5h is untouched (dynamic session window).
+    usage = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
+    }
+    assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d 0% (6d 0h)"
+
+
+def test_usage_summary_scoped_reflects_passed_weekly_reset():
+    usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}]}
+    # rolled to 0% → the over-limit "(!)" marker is gone too
+    assert menubar.usage_summary(usage, _NOW) == "Fable 0% (6d 0h)"
+
+
+def test_format_title_reflects_passed_weekly_reset():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
+    usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
