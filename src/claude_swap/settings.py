@@ -49,11 +49,12 @@ class AutoSwitchSettings:
     strategy: str = "best"  # reserved for future strategies; only "best" in v1
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
-    # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus").
-    # Each named model's per-model weekly limit is folded into the binding
-    # window, so the engine switches off an account whose model quota is
-    # exhausted even while its 5h/7d windows still have headroom. None =
-    # account-wide 5h/7d only (default).
+    # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
+    # or "all" for every scoped window an account reports. Each named model's
+    # per-model weekly limit is folded into the binding window, so the engine
+    # switches off an account whose model quota is exhausted even while its
+    # 5h/7d windows still have headroom. None = account-wide 5h/7d only
+    # (default).
     model: str | None = None
 
 
@@ -119,7 +120,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
-            help="Also switch on these models' weekly limits (e.g. Fable or Fable,Opus)",
+            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
     )
 }
@@ -131,6 +132,20 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
+
+
+def parse_model_names(value: str | None) -> tuple[str, ...]:
+    """Split a comma-separated model list, trimmed and case-insensitively
+    deduped (first spelling wins). Shared by the auto engine and the manual
+    switch strategies so both read ``autoswitch.model`` identically."""
+    if not value:
+        return ()
+    seen: dict[str, str] = {}
+    for part in value.split(","):
+        name = part.strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return tuple(seen.values())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:

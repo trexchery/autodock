@@ -256,7 +256,8 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Also switch when a per-model weekly limit is hit, not just the "
             "account-wide 5h/7d windows. One name or a comma-separated list "
-            "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus')"
+            "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
+            "for every per-model window an account reports"
         ),
     )
     parser.add_argument(

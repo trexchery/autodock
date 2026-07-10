@@ -112,6 +112,43 @@ class TestAccountHeadroom:
         usage = {"scoped": [{"name": "Opus", "pct": 100.0}]}
         assert oauth.account_headroom(usage, ["Fable"]) is None
 
+    def test_all_sentinel_matches_every_scoped_window(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Sonnet", "pct": 97.0},
+            ],
+        }
+        assert oauth.account_headroom(usage, ["all"]) == 3.0
+        assert oauth.account_headroom(usage, ["ALL"]) == 3.0
+
+
+class TestRelevantWindows:
+    """Test relevant_windows — the canonical window source."""
+
+    def test_carries_labels_pcts_and_resets(self):
+        usage = {
+            "five_hour": {"pct": 80.0, "resets_at": "2026-07-10T12:00:00Z"},
+            "seven_day": {"pct": 20.0},
+            "scoped": [
+                {"name": "Fable", "pct": 95.0, "resets_at": "2026-07-12T09:00:00Z"},
+            ],
+        }
+        assert oauth.relevant_windows(usage, ["Fable"]) == [
+            ("5h", 80.0, "2026-07-10T12:00:00Z"),
+            ("7d", 20.0, None),
+            ("Fable", 95.0, "2026-07-12T09:00:00Z"),
+        ]
+
+    def test_scoped_excluded_without_models(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 99.0}]}
+        assert oauth.relevant_windows(usage) == [("5h", 10.0, None)]
+
+    def test_non_dict_usage_is_empty(self):
+        assert oauth.relevant_windows(None) == []
+        assert oauth.relevant_windows("no credentials") == []
+
 
 class TestFormatReset:
     """Test format_reset."""

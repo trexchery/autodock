@@ -14,6 +14,7 @@ from claude_swap.autoswitch import (
     NO_RESET_FALLBACK_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
+    ConfigWarningEvent,
     ErrorEvent,
     NoSwitchEvent,
     PollEvent,
@@ -1503,3 +1504,112 @@ class TestModelAwareSwitch:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_all_sentinel_binds_every_scoped_window(self, temp_home):
+        # "all" needs no names: each account's own scoped windows bind,
+        # whatever they're called.
+        h = self._seed(temp_home, model="all")
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Sonnet", "pct": 100.0}]},
+            "2": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Sonnet", "pct": 20.0}]},
+            "3": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Opus", "pct": 60.0}]},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_dual_exhausted_candidate_recovers_at_its_later_reset(self, temp_home):
+        # #2 is blocked on both its 5h (resets 12:00) and Fable (15:00): it's
+        # only usable again at the LATER one. #3 recovers later still (20:00),
+        # so the all-exhausted wake is #2's Fable reset — which the old
+        # earliest-of-any-window scan (12:00) would have jumped early for.
+        h = self._seed(temp_home, model="Fable")
+        fable_reset = "2026-07-05T15:00:00Z"
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95, 10),
+            "2": {
+                "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T12:00:00Z"},
+                "seven_day": {"pct": 0.0},
+                "scoped": [
+                    {"name": "Fable", "pct": 100.0, "resets_at": fable_reset},
+                ],
+            },
+            "3": {
+                "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T20:00:00Z"},
+                "seven_day": {"pct": 0.0},
+            },
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.earliest_reset_at == fable_reset
+
+    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home):
+        # Candidates blocked ONLY by Fable: the wake must come from the scoped
+        # reset — the 5h/7d-only scan would find no ≥100% window at all.
+        h = self._seed(temp_home, model="Fable")
+        fable_reset = "2026-07-06T09:00:00Z"
+        blocked = {
+            "five_hour": {"pct": 3.0, "resets_at": "2026-07-05T12:00:00Z"},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": fable_reset}],
+        }
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95, 10), "2": blocked, "3": blocked,
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.earliest_reset_at == fable_reset
+
+    def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
+        # Fable at 88% is inside the escalation band: poll every tick, not at
+        # the relaxed far-from-threshold cadence a 5%-used 5h would suggest.
+        h = self._seed(temp_home, model="Fable")
+        entry = UsageEntry(
+            last_good=_model_usage(5, 88), fetched_at=h.clock.now, age_s=0.0
+        )
+        assert h.engine._active_poll_interval_s(entry) == h.settings.interval_seconds
+        relaxed = AutoSwitchEngine(
+            h.switcher, AutoSwitchSettings(), h.events.append, clock=h.clock
+        )
+        assert relaxed._active_poll_interval_s(entry) > h.settings.interval_seconds
+
+    def test_unmatched_model_name_warns_once(self, temp_home):
+        h = self._seed(temp_home, model="Fabel")  # deliberate typo
+        usage = {
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        }
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "Fabel" in warnings[0].message
+        assert warnings[0].to_json()["event"] == "config-warning"
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_no_false_warning_while_an_account_is_unreadable(self, temp_home):
+        h = self._seed(temp_home, model="Fabel")
+        h.tick_with_usage({
+            "1": _model_usage(5, 10), "2": _model_usage(5, 10), "3": None,
+        })
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+        # Once every account reports, the check completes and warns.
+        h.tick_with_usage({
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        })
+        assert any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_matching_name_never_warns(self, temp_home):
+        h = self._seed(temp_home, model="Fable")
+        h.tick_with_usage({
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        })
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)

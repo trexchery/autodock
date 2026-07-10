@@ -45,7 +45,7 @@ from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate
 
@@ -310,6 +310,22 @@ class ErrorEvent(AutoSwitchEvent):
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
 
 
+@dataclass(frozen=True)
+class ConfigWarningEvent(AutoSwitchEvent):
+    """A configuration value is syntactically fine but provably inert (e.g.
+    an ``autoswitch.model`` name no account reports). Not an error: the
+    engine keeps running on the axes that do exist."""
+
+    kind: ClassVar[str] = "config-warning"
+    message: str
+
+    def _fields(self) -> dict:
+        return {"message": self.message}
+
+    def human(self) -> str:
+        return f"warning: {self.message}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -332,9 +348,9 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def binding_pct(usage: dict | None) -> float | None:
-    """Utilization of the binding (higher) 5h/7d window, or None."""
-    headroom = oauth.account_headroom(usage)
+def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
+    """Utilization of the binding (worst) relevant window, or None."""
+    headroom = oauth.account_headroom(usage, models)
     return None if headroom is None else 100.0 - headroom
 
 
@@ -359,41 +375,35 @@ def _window_pcts(usage: dict | None) -> dict[str, float]:
     return out
 
 
-def _limiting_reset_ts(usage: dict | None) -> float | None:
-    """Epoch when the last of the ≥100% windows resets (account usable again)."""
-    if not isinstance(usage, dict):
-        return None
+def _limiting_reset_ts(
+    usage: dict | None, models: tuple[str, ...] = ()
+) -> float | None:
+    """Epoch when the last of the ≥100% relevant windows resets (account
+    usable again)."""
     latest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
+    for _, pct, resets_at in oauth.relevant_windows(usage, models):
+        if pct < 100.0:
             continue
-        pct = window.get("pct")
-        if not isinstance(pct, (int, float)) or pct < 100.0:
-            continue
-        ts = _window_reset_ts(window)
+        ts = _parse_reset_ts(resets_at)
         if ts is not None and (latest is None or ts > latest):
             latest = ts
     return latest
 
 
-def _earliest_future_reset_ts(usage: dict | None, now: float) -> float | None:
-    """Epoch of the next window reset still ahead of ``now``, any utilization."""
-    if not isinstance(usage, dict):
-        return None
+def _earliest_future_reset_ts(
+    usage: dict | None, now: float, models: tuple[str, ...] = ()
+) -> float | None:
+    """Epoch of the next relevant-window reset ahead of ``now``, any
+    utilization."""
     earliest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
-        ts = _window_reset_ts(window)
+    for _, _, resets_at in oauth.relevant_windows(usage, models):
+        ts = _parse_reset_ts(resets_at)
         if ts is not None and ts > now and (earliest is None or ts < earliest):
             earliest = ts
     return earliest
 
 
-def _window_reset_ts(window: dict) -> float | None:
-    resets_at = window.get("resets_at")
+def _parse_reset_ts(resets_at: str | None) -> float | None:
     if not resets_at:
         return None
     try:
@@ -430,12 +440,10 @@ class AutoSwitchEngine:
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
-        # separated list ("Fable", "Opus,Sonnet", ...); split once here and
-        # pass to every account_headroom call so active and candidates are
-        # judged on the same axes.
-        self._models = tuple(
-            m.strip() for m in (settings.model or "").split(",") if m.strip()
-        )
+        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
+        # pass everywhere usage windows are read — decisions, cadence, and
+        # reset scheduling must all see the same axes.
+        self._models = parse_model_names(settings.model)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -453,6 +461,10 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
+        # warned) on the first tick where every relevant account has readable
+        # usage — adaptive polling legitimately leaves gaps before that.
+        self._model_check_done = not self._models
 
     # -- state file ---------------------------------------------------------
 
@@ -710,6 +722,9 @@ class AutoSwitchEngine:
             )
         )
 
+        if not self._model_check_done:
+            self._check_model_names(quarantined, usage)
+
         if (
             self.switcher.account_kind_for(current) == "api_key"
             and not settings.include_api_key_accounts
@@ -872,7 +887,7 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage)
+            earliest = self._earliest_recovery(usage)
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(
@@ -1015,7 +1030,7 @@ class AutoSwitchEngine:
         escalation are enforced elsewhere and unaffected.
         """
         interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good)
+        pct = binding_pct(entry.last_good, self._models)
         if pct is None:
             return interval
         distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
@@ -1051,8 +1066,8 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good)
-            new_pct = binding_pct(after.last_good)
+            prev_pct = binding_pct(before.last_good, self._models)
+            new_pct = binding_pct(after.last_good, self._models)
             if prev_pct is None or new_pct is None:
                 interval = self.settings.interval_seconds
             elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
@@ -1060,13 +1075,15 @@ class AutoSwitchEngine:
             else:
                 interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
             next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good)
+            headroom = oauth.account_headroom(after.last_good, self._models)
             if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good)
+                reset_ts = _limiting_reset_ts(after.last_good, self._models)
                 if reset_ts is not None and reset_ts > next_poll:
                     next_poll = reset_ts
             else:
-                reset_ts = _earliest_future_reset_ts(after.last_good, now)
+                reset_ts = _earliest_future_reset_ts(
+                    after.last_good, now, self._models
+                )
                 if reset_ts is not None:
                     next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
             plans[num] = (next_poll, interval)
@@ -1132,24 +1149,72 @@ class AutoSwitchEngine:
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
 
-    @staticmethod
-    def _earliest_reset(usage: dict[str, dict | str | None]) -> datetime | None:
-        """Earliest known window reset across all accounts (UTC)."""
-        earliest: datetime | None = None
-        for entry in usage.values():
-            if not isinstance(entry, dict):
-                continue
-            for window in ("five_hour", "seven_day"):
-                resets_at = (entry.get(window) or {}).get("resets_at")
-                if not resets_at:
-                    continue
-                try:
-                    when = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if earliest is None or when < earliest:
-                    earliest = when
-        return earliest
+    def _check_model_names(
+        self, quarantined: set[str], usage: dict[str, dict | str | None]
+    ) -> None:
+        """One-shot ``autoswitch.model`` typo guard.
+
+        A configured name that no account reports means the filter looks
+        active while gating nothing. That's only provable once every
+        relevant oauth account has readable usage this tick — adaptive
+        polling legitimately leaves gaps before that — and never worth a
+        forced refresh of its own.
+        """
+        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        if not wanted:
+            self._model_check_done = True  # bare "all" needs no name match
+            return
+        relevant = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        values = [usage.get(n) for n in relevant]
+        readable = [v for v in values if isinstance(v, dict)]
+        if not readable or len(readable) != len(values):
+            return  # not every account observed yet — re-check next tick
+        seen = {
+            s["name"].lower()
+            for v in readable
+            for s in (v.get("scoped") or [])
+            if isinstance(s, dict) and isinstance(s.get("name"), str)
+        }
+        self._model_check_done = True
+        missing = [name for low, name in wanted.items() if low not in seen]
+        if missing:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        f"autoswitch.model: {', '.join(missing)} matches no "
+                        "account's usage windows — only the 5h/7d limits are "
+                        "being watched for it (typo?)"
+                    )
+                )
+            )
+
+    def _earliest_recovery(
+        self, usage: dict[str, dict | str | None]
+    ) -> datetime | None:
+        """Earliest moment any account becomes usable again (UTC).
+
+        Per account that's the *latest* reset among its ≥100% relevant
+        windows — an account blocked on both 5h and a scoped weekly limit
+        isn't usable when the 5h rolls over — then the minimum across
+        accounts, the active one included (its recovery also ends the
+        blocked state). Accounts whose exhausted windows carry no reset
+        time contribute nothing: never assume early recovery; the bounded
+        blocked-cadence fallback re-checks instead."""
+        earliest: float | None = None
+        for value in usage.values():
+            usable_at = _limiting_reset_ts(
+                value if isinstance(value, dict) else None, self._models
+            )
+            if usable_at is not None and (earliest is None or usable_at < earliest):
+                earliest = usable_at
+        if earliest is None:
+            return None
+        return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
