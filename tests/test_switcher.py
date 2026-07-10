@@ -3606,6 +3606,91 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (at 5h/7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    @staticmethod
+    def _model_usage(five_h: float, fable: float) -> dict:
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    def test_next_available_with_models_skips_and_names_the_window(
+        self, temp_home: Path, capsys
+    ):
+        """A Fable-exhausted candidate is skipped, the skip names the binding
+        window, and the config source is announced up front."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._model_usage(0, 10),
+            "2": self._model_usage(5, 100),
+            "3": self._model_usage(20, 20),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(
+                strategy="next-available",
+                models=("Fable",),
+                model_source="autoswitch.model",
+            )
+
+        out = capsys.readouterr().out
+        assert "Using configured model limits: Fable (from autoswitch.model)" in out
+        assert "Skipping Account-2 (at Fable limit)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_next_available_without_models_ignores_scoped(
+        self, temp_home: Path, capsys
+    ):
+        """Default behavior unchanged: scoped windows are invisible."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._model_usage(0, 10),
+            "2": self._model_usage(5, 100),
+            "3": self._model_usage(20, 20),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Using configured model limits" not in out
+        assert "Skipping" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_best_with_models_folds_scoped_into_the_comparison(
+        self, temp_home: Path, capsys
+    ):
+        """Fable binding flips the pick: on 5h alone nothing beats current,
+        with Fable folded in account 2 provably has the most headroom."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._model_usage(5, 90),
+            "2": self._model_usage(5, 20),
+            "3": self._model_usage(50, 80),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best", models=("Fable",), model_source="cli")
+
+        out = capsys.readouterr().out
+        assert "Using configured model limits: Fable (from --model)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
     def test_skip_exhausted_all_limited_stays_put(self, temp_home: Path, capsys):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")

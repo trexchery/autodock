@@ -1897,7 +1897,7 @@ class ClaudeAccountSwitcher:
         return {num: entry.decision_value() for num, entry in entries.items()}
 
     def _select_best_switchable(
-        self, current_num: str | None
+        self, current_num: str | None, models: tuple[str, ...] = ()
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -1906,7 +1906,9 @@ class ClaudeAccountSwitcher:
         lands on strictly more headroom — never onto an account worse than (or
         merely unverifiable against) where the user already is. When a switch
         can't be proven beneficial, it stays put; bare ``cswap --switch``
-        remains the way to force a plain rotation. Returns ``(target, note)``:
+        remains the way to force a plain rotation. ``models`` folds the named
+        per-model weekly windows into every headroom comparison (see
+        ``oauth.account_headroom``). Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -1932,13 +1934,15 @@ class ClaudeAccountSwitcher:
             return None, "none"
 
         usage = self._usage_by_account()
-        current_headroom = oauth.account_headroom(usage.get(str(current_num)))
+        current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
             return None, "current-unavailable"
 
-        scored = [(oauth.account_headroom(usage.get(num)), num) for num in others]
+        scored = [
+            (oauth.account_headroom(usage.get(num), models), num) for num in others
+        ]
         known = [(h, num) for h, num in scored if h is not None]
         if not known:
             return None, "no-comparison"
@@ -2388,7 +2392,11 @@ class ClaudeAccountSwitcher:
         }
 
     def switch(
-        self, strategy: str | None = None, json_output: bool = False
+        self,
+        strategy: str | None = None,
+        json_output: bool = False,
+        models: tuple[str, ...] = (),
+        model_source: str | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -2398,6 +2406,13 @@ class ClaudeAccountSwitcher:
                   of advancing the rotation; ``"next-available"`` rotates to the
                   next account, skipping any currently at its 5h/7d limit. ``None``
                   (the default) performs a plain rotation.
+            models: Per-model weekly windows folded into every usage
+                  comparison of the usage-aware strategies (parsed display
+                  names, or the ``all`` sentinel — see
+                  ``oauth.relevant_windows``). Empty = 5h/7d only.
+            model_source: Where ``models`` came from (``"cli"`` or
+                  ``"autoswitch.model"``) — announced up front so a config
+                  fallback silently steering the pick is impossible.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -2409,6 +2424,14 @@ class ClaudeAccountSwitcher:
         """
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
+        if strategy_label == "rotation":
+            models = ()  # model limits only steer the usage-aware strategies
+        if models and not json_output:
+            source = "--model" if model_source == "cli" else model_source
+            print(dimmed(
+                f"Using configured model limits: {', '.join(models)}"
+                + (f" (from {source})" if source else "")
+            ))
 
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -2515,7 +2538,7 @@ class ClaudeAccountSwitcher:
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
         if strategy == "best":
-            target, note = self._select_best_switchable(current_num)
+            target, note = self._select_best_switchable(current_num, models)
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
                 return (
@@ -2638,15 +2661,28 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate))
+                headroom = oauth.account_headroom(usage.get(candidate), models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
+                    label = "5h/7d"
+                    if models:
+                        # Name what actually binds ("Fable", "5h/Fable", ...)
+                        # so a config-driven skip is never mysterious.
+                        at = [
+                            name
+                            for name, pct, _ in oauth.relevant_windows(
+                                usage.get(candidate), models
+                            )
+                            if pct >= 100.0
+                        ]
+                        if at:
+                            label = "/".join(at)
                     if json_output:
                         warnings.append(
-                            f"Skipped Account-{candidate} (at 5h/7d limit)"
+                            f"Skipped Account-{candidate} (at {label} limit)"
                         )
                     else:
-                        print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
+                        print(f"{accent('Skipping')} Account-{candidate} (at {label} limit)")
                     continue
             next_account = candidate
             break
