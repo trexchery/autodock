@@ -144,6 +144,11 @@ class PollEvent(AutoSwitchEvent):
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # account number → ordered window label → utilization pct ("5h", "7d",
+    # then scoped model display names). Additive field: the binding pct alone
+    # (e.g. "89%") hides which window binds — #115 was reported off that
+    # ambiguity.
+    windows: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -153,9 +158,14 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
+        if self.windows:
+            fields["windowsPct"] = self.windows
         return fields
 
     def _describe(self, num: str) -> str:
+        wins = self.windows.get(num)
+        if wins:
+            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -326,6 +336,27 @@ def binding_pct(usage: dict | None) -> float | None:
     """Utilization of the binding (higher) 5h/7d window, or None."""
     headroom = oauth.account_headroom(usage)
     return None if headroom is None else 100.0 - headroom
+
+
+def _window_pcts(usage: dict | None) -> dict[str, float]:
+    """Ordered window label → pct: "5h", "7d", then scoped display names."""
+    if not isinstance(usage, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            out[label] = float(window["pct"])
+    scoped = usage.get("scoped")
+    if isinstance(scoped, list):
+        for entry in scoped:
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("name"), str)
+                and isinstance(entry.get("pct"), (int, float))
+            ):
+                out[entry["name"]] = float(entry["pct"])
+    return out
 
 
 def _limiting_reset_ts(usage: dict | None) -> float | None:
@@ -662,6 +693,11 @@ class AutoSwitchEngine:
                     num: entry.last_error
                     for num, entry in entries.items()
                     if usage.get(num) is None and entry.last_error
+                },
+                windows={
+                    num: pcts
+                    for num, value in usage.items()
+                    if (pcts := _window_pcts(value if isinstance(value, dict) else None))
                 },
             )
         )

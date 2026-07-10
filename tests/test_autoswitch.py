@@ -1106,6 +1106,24 @@ class TestEventsShape:
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
         line = poll.human()
         assert "Account-1" in line and "42% used" in line
+        # Others show per-window pcts, not just the ambiguous binding pct.
+        assert "#2: 5h 10% · 7d 0%" in line
+        assert "#3: ?" in line
+
+    def test_poll_event_windows_include_scoped_and_reach_json(self, harness):
+        harness.tick_with_usage({
+            "1": _usage(42),
+            "2": {
+                "five_hour": {"pct": 3.0},
+                "seven_day": {"pct": 89.0},
+                "scoped": [{"name": "Fable", "pct": 21.0}],
+            },
+            "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert "#2: 5h 3% · 7d 89% · Fable 21%" in poll.human()
+        payload = poll.to_json()
+        assert payload["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0, "Fable": 21.0}
 
 
 class TestRunLoop:
