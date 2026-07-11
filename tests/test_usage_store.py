@@ -193,10 +193,10 @@ class TestBackoff:
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)
         assert BACKOFF_BASE_S * 2**4 == 480.0
 
-    def test_edge_429_backoff_waits_a_refill(self, store, clock):
-        # "Retry-After: 0" is the drained-bucket edge: the token's budget is
-        # empty and refills slowly, so even the first backoff waits at least
-        # one refill's worth (EDGE_BACKOFF_S); the exponential curve may push
+    def test_edge_429_backoff_floors_at_edge_backoff(self, store, clock):
+        # "Retry-After: 0" is the saturated-window edge: the token's rolling
+        # hour is full and frees only as old requests age out, so even the
+        # first backoff waits EDGE_BACKOFF_S; the exponential curve may push
         # past it, capped at BACKOFF_CAP_S.
         expected = [300.0, 300.0, 300.0, 300.0, 480.0, 600.0, 600.0]
         for i, want in enumerate(expected):

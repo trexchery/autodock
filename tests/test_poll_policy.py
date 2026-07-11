@@ -154,19 +154,35 @@ class TestJitter:
 
 
 class TestBudgetInvariants:
-    """Relationships the measured rate limit demands of the constants."""
+    """Relationships the measured rate limit demands of the constants.
 
-    def test_sustained_floor_is_at_most_one_per_three_minutes(self):
+    Measured 2026-07-11 (probe3): a rolling ~60-minute window of ~28-30
+    requests per token × UA-class — not a refilling bucket. Capacity returns
+    only as old requests age out of the trailing hour, so a saturated window
+    needs up to 60 minutes to recover.
+    """
+
+    def test_sustained_floor_stays_under_the_hourly_cap(self):
+        # 3600/180 = 20 requests/hour vs the measured ~28-30/hour window.
         assert poll_policy.MIN_INTERVAL_S >= 180.0
         assert poll_policy.SERVE_TTL_S >= 180.0
 
-    def test_edge_backoff_waits_at_least_a_refill(self):
-        assert poll_policy.EDGE_BACKOFF_S >= 150.0  # ~1 request / 2.5 min
+    def test_edge_backoff_probes_slower_than_capacity_frees(self):
+        # While saturated, capacity returns at up to ~30/hour as the old
+        # burst ages out; probing at ≥300 s (≤12/hour) lets recovery win.
+        assert poll_policy.EDGE_BACKOFF_S >= 300.0
 
-    def test_urgent_mode_fits_inside_the_burst_bucket(self):
-        # Worst case: the escalation band crossed at URGENT_INTERVAL_S until a
-        # switch — the band is 15 pts, heavy burn ~5 pts/min → ~15 urgent
-        # polls, under the measured ~27-request burst capacity.
-        band_minutes = poll_policy.ESCALATION_MARGIN_PCT / 5.0
-        polls = band_minutes * 60.0 / poll_policy.URGENT_INTERVAL_S
+    def test_post_429_floor_covers_the_saturation_horizon(self):
+        # A 429 means the trailing hour is full, and it takes up to 60
+        # minutes for the spending burst to age out entirely.
+        assert poll_policy.RECENT_429_WINDOW_S >= 3600.0
+        assert poll_policy.POST_429_MIN_INTERVAL_S >= poll_policy.MIN_INTERVAL_S
+
+    def test_urgent_episode_alone_fits_inside_the_window_cap(self):
+        # Urgent mode is bounded by construction: each further urgent poll
+        # needs ≥ MOVEMENT_DELTA_PCT of movement, so the slowest qualifying
+        # burn crosses the escalation band in margin/delta polls — inside the
+        # ~28-30 request rolling-hour window even before the post-429 floor
+        # (which absorbs any overshoot) is considered.
+        polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
         assert polls < 27

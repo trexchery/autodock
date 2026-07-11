@@ -135,7 +135,7 @@ class UsageEntry:
     # When this token last answered 429 (any Retry-After). Deliberately NOT
     # cleared by a later success: the planner keeps the cadence floored at
     # poll_policy.POST_429_MIN_INTERVAL_S until RECENT_429_WINDOW_S has
-    # passed, giving the drained bucket time to refill.
+    # passed, giving the saturated rolling-hour window time to age out.
     last_429_at: float | None = None
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.

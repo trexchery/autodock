@@ -1,13 +1,17 @@
 """Cadence policy for the ``/api/oauth/usage`` endpoint — every number in one place.
 
-The endpoint enforces a per-access-token budget on non-first-party clients
-(measured 2026-07-11: a rested token tolerates a burst of ~27 requests, then
-refills at roughly one request per 2.5 minutes; n=1, treat as an estimate —
-``HANDOFF-usage-cadence-probe.md`` describes the bracketing probe that pins it
-down). Sustained polling above the refill rate drains the bucket and parks the
-token on an oscillating-429 edge for as long as the traffic continues, so the
-budget target is an **average of at most ~1 request / 3 minutes per token**,
-with the burst capacity left as headroom for manual commands, wake-from-sleep
+The endpoint enforces a per-access-token budget on non-first-party clients:
+a **rolling ~60-minute window of ~28-30 requests per token × UA-class**
+(measured 2026-07-11, probe3, two runs: a rested token admitted 30 requests
+before the first 429; the post-drain 429 oscillation ended exactly when the
+drain burst aged 60 minutes; steady 1/180 s polling then ran 96 minutes from
+a rested window with zero 429s). It is NOT a bucket with a refill rate:
+capacity returns only as old requests age out of the trailing hour, so a
+burst saturates the token for up to a full hour — pausing does not restore
+headroom early, and earlier "refill rate" estimates were artifacts of
+measuring while saturated. The budget target is an **average of at most
+~1 request / 3 minutes per token** (20/hour vs the ~28-30/hour cap), leaving
+~8-10 requests/hour of headroom for manual commands, wake-from-sleep
 catch-up, and the bounded urgent mode below.
 
 Plans computed here are persisted per account in the usage store
@@ -15,8 +19,8 @@ Plans computed here are persisted per account in the usage store
 surface — ``cswap list``, the TUI, the menu bar, the auto engine — inherits
 the same cadence no matter how often it repaints.
 
-If the probe revises the measured shape, adjust the constants in this module
-only.
+If a future probe revises the measured shape, adjust the constants in this
+module only.
 """
 
 from __future__ import annotations
@@ -40,8 +44,9 @@ MIN_INTERVAL_S = 180.0
 # switch threshold, with movement observed this poll (i.e. actually burning
 # toward the limit). Bounded by construction: either the threshold is crossed
 # (the engine switches away) or the movement stops (the next poll decays back
-# to MIN_INTERVAL_S) — worst case ≈ margin/burn-rate minutes of 1/min polling,
-# well inside the burst capacity.
+# to MIN_INTERVAL_S) — worst case margin/movement-delta ≈ 15 polls per
+# episode, inside the measured ~28-30 request rolling-hour window; overshoot
+# on top of steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
@@ -59,14 +64,16 @@ MOVEMENT_DELTA_PCT = 1.0
 # (watch + menu bar + auto) drift apart instead of fetching in lockstep.
 JITTER_FRAC = 0.1
 
-# Reaction to a 429 with ``Retry-After: 0`` (the drained-bucket edge): wait at
-# least one refill's worth before retrying at all (used by the usage store's
-# failure backoff)...
+# Reaction to a 429 with ``Retry-After: 0`` (the saturated-window edge):
+# probe at most every 5 minutes (≤12/hour) so aging-out — up to ~30/hour —
+# outpaces the probing (used by the usage store's failure backoff)...
 EDGE_BACKOFF_S = 300.0
 # ...and while any 429 was seen on the token within this window, floor the
-# planned cadence here so the bucket refills instead of re-draining.
+# planned cadence here so freed capacity accumulates instead of being
+# re-spent. The window matches the saturation horizon: a full trailing hour
+# takes up to 60 minutes to age out.
 POST_429_MIN_INTERVAL_S = 360.0
-RECENT_429_WINDOW_S = 1800.0
+RECENT_429_WINDOW_S = 3600.0
 
 # The engine escalates to a full candidate refresh when the active account is
 # within this margin of the threshold (decision policy, but the urgent-mode
