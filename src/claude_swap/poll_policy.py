@@ -9,10 +9,17 @@ a rested window with zero 429s). It is NOT a bucket with a refill rate:
 capacity returns only as old requests age out of the trailing hour, so a
 burst saturates the token for up to a full hour — pausing does not restore
 headroom early, and earlier "refill rate" estimates were artifacts of
-measuring while saturated. The budget target is an **average of at most
-~1 request / 3 minutes per token** (20/hour vs the ~28-30/hour cap), leaving
-~8-10 requests/hour of headroom for manual commands, wake-from-sleep
-catch-up, and the bounded urgent mode below.
+measuring while saturated. Error bars: the horizon is bracketed to ~55-64
+minutes from a single transition event, the exact edge algorithm (likely a
+Cloudflare sliding-window approximation) is undocumented, and Anthropic can
+retune it any day — so the constants below lean only on the robust parts:
+a sustained rate safely under the cap, and an ~hour recovery horizon. The
+budget target is an **average of at most ~1 request / 3 minutes per token**
+(20/hour vs the ~28-30/hour cap), leaving ~8-10 requests/hour of headroom
+for manual commands, wake-from-sleep catch-up, and the bounded urgent mode
+below. Health invariant to watch in the logs: steady state shows zero
+http-429, and any post-burst 429 clears within ≤60 minutes — an episode
+outlasting an hour at modest rates means this model needs revisiting.
 
 Plans computed here are persisted per account in the usage store
 (``nextPollAt``/``pollIntervalS``) by whichever collector fetched, so every

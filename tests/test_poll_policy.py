@@ -170,7 +170,9 @@ class TestBudgetInvariants:
     Measured 2026-07-11 (probe3): a rolling ~60-minute window of ~28-30
     requests per token × UA-class — not a refilling bucket. Capacity returns
     only as old requests age out of the trailing hour, so a saturated window
-    needs up to 60 minutes to recover.
+    needs up to 60 minutes to recover. These invariants lean only on the
+    robust parts of that measurement (a safe sustained cadence and an
+    hour-scale recovery horizon), not on the exact server algorithm.
     """
 
     def test_sustained_floor_stays_under_the_hourly_cap(self):

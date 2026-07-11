@@ -1020,7 +1020,7 @@ class TestTryFetchUsageOutcome:
             for r in caplog.records
             if r.levelno == logging.WARNING and "http-429" in r.getMessage()
         )
-        # "Retry-After: 0" is the drained-bucket edge — same budget hint.
+        # "Retry-After: 0" is the saturated-budget edge — same hint.
         assert "retry-after 0s" in line
         assert "per-token usage budget" in line
 

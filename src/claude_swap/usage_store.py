@@ -56,15 +56,16 @@ TRUST_MAX_AGE_S = 3600.0
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
 
-# The usage endpoint enforces a per-access-token budget on non-first-party
-# User-Agents (proven 2026-07-11: idle token, polling alone trips it; see
-# poll_policy for the measured bucket/refill shape). Cumulative polling from
-# cswap's own surfaces is exactly what drains it. Retry-After tells the rules
-# apart:
-# - "Retry-After: 0" = the drained-bucket edge: the token's budget is empty
-#   and refills at roughly one request per 2.5 minutes, so an immediate retry
-#   mostly re-drains it. Back off at least one refill's worth
-#   (poll_policy.EDGE_BACKOFF_S) before trying again.
+# The usage endpoint enforces a per-access-token request budget on
+# non-first-party User-Agents (proven 2026-07-11: an idle token, polling
+# alone trips it; poll_policy documents the measured shape — an hour-scale
+# rolling window, exact edge algorithm undocumented). Cumulative polling from
+# cswap's own surfaces is exactly what saturates it. Retry-After tells the
+# rules apart:
+# - "Retry-After: 0" = the saturated-budget edge: the trailing hour's budget
+#   is spent and frees only as old requests age out, so immediate retries
+#   mostly prolong the oscillating state. Wait at least
+#   poll_policy.EDGE_BACKOFF_S before probing again.
 # - "Retry-After: N>0" = the burst rule (several rapid requests on one token
 #   → hard block; measured: accurate, counts down, not extended by probing).
 #   Honored as the wait, up to a safety cap so a pathological header can
@@ -234,7 +235,7 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
-        # Drained-bucket edge: wait at least one refill before retrying.
+        # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
     # Burst rule: wait at least what the server asked (up to the safety cap);
     # our own curve may wait longer.
