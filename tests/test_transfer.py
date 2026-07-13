@@ -209,6 +209,26 @@ class TestAliasTransfer:
                 )
                 assert "alias" not in seq["accounts"][imported_num]
 
+    def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
+        """Re-importing a backup of an account that already carries the same
+        alias locally must not be treated as a collision with itself."""
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="dev")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 1, "alice@example.com", alias="dev")
+
+                import_accounts(dst, str(out_file), force=True)
+
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["1"]["alias"] == "dev"
+
     def test_import_duplicate_alias_within_export_rejected(self, temp_home: Path):
         src = _linux_switcher(temp_home)
         _seed_account(src, 1, "alice@example.com", alias="dev")

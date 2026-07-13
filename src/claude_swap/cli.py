@@ -372,6 +372,8 @@ Examples:
 
     if args.unset and args.alias_name:
         parser.error("--unset does not take a NAME argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
     if args.account is not None and not args.unset and not args.alias_name:
         parser.error("NAME is required (or pass --unset to remove the alias)")
 

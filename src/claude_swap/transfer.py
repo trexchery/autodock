@@ -316,8 +316,10 @@ def import_accounts(
     # Pass 1: validate every account before any writes. A malformed account
     # later in the list must not leave earlier accounts half-imported.
     local_data = switcher._get_sequence_data_migrated() or {}
-    local_aliases = {
-        (acc.get("alias") or "").lower()
+    local_aliases: dict[str, tuple[str, str]] = {
+        (acc.get("alias") or "").lower(): (
+            acc.get("email", ""), acc.get("organizationUuid", "") or "",
+        )
         for acc in local_data.get("accounts", {}).values()
         if acc.get("alias")
     }
@@ -359,10 +361,11 @@ def import_accounts(
             if alias_key in seen_aliases:
                 raise TransferError(f"duplicate alias in export: {alias_key}")
             seen_aliases.add(alias_key)
-            if alias_key in local_aliases:
+            owner = local_aliases.get(alias_key)
+            if owner is not None and owner != (email, org_uuid):
                 _eprint(
                     f"Warning: alias '{alias_key}' for {email} already used by an "
-                    "existing account — dropping the imported alias"
+                    "existing account, dropping the imported alias"
                 )
                 alias = None
 

@@ -324,8 +324,15 @@ class ClaudeAccountSwitcher:
         return bool(re.match(pattern, email))
 
     def _validate_alias(self, alias: str) -> bool:
-        """Validate alias format: letters/digits/-/_/. only, not purely digits."""
+        """Validate alias format: letters/digits/-/_/. only, not purely digits.
+
+        Must not start with '-': argparse treats a leading-hyphen positional
+        as an option, so such an alias could never be passed back in on the
+        command line once set.
+        """
         if not re.match(r"^[A-Za-z0-9._-]+$", alias):
+            return False
+        if alias.startswith("-"):
             return False
         return not alias.isdigit()
 

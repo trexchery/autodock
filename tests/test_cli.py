@@ -635,6 +635,15 @@ class TestRunCommand:
         )
         assert "run 2" in result.stdout
 
+    def test_main_help_mentions_alias(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "alias <num|email>" in result.stdout
+
     def test_session_error_exits_cleanly(self, capsys):
         class FailingSessionManager:
             def __init__(self, switcher):
@@ -1208,6 +1217,13 @@ class TestAliasCommand:
         with patch("os.geteuid", return_value=1000, create=True):
             with pytest.raises(SystemExit):
                 cli._alias_command(["2"])
+
+    def test_unset_without_account_errors(self, temp_home, capsys):
+        """`cswap alias --unset` with no target must error, not silently list."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._alias_command(["--unset"])
 
     def test_unset_with_name_errors(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)

@@ -314,7 +314,7 @@ class TestAliasValidation:
 
     def test_invalid_aliases(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
-        for alias in ["123", "dev@work", "dev work", "", "dev/work"]:
+        for alias in ["123", "dev@work", "dev work", "", "dev/work", "-dev"]:
             assert not switcher._validate_alias(alias), f"Expected {alias} to be invalid"
 
 
