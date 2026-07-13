@@ -147,6 +147,7 @@ def account_row(
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     alias: str = "",
+    disabled: bool = False,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
@@ -162,6 +163,10 @@ def account_row(
     }
     if alias:
         row["alias"] = alias
+    # Additive field: present only when the slot is held out of rotation, so
+    # existing consumers keying on the base schema are unaffected.
+    if disabled:
+        row["disabled"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     return row

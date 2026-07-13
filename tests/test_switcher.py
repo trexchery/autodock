@@ -6180,3 +6180,251 @@ class TestAddAccountAlias:
              patch.object(switcher, "_delete_account_credentials"):
             with pytest.raises(ValidationError):
                 switcher.add_account(alias="dev")
+
+
+# ---------------------------------------------------------------------------
+# Disable / enable an account (hold it out of auto-rotation)
+# ---------------------------------------------------------------------------
+
+
+class TestDisableEnableAccount:
+    """`cswap disable`/`cswap enable`: park a managed account out of automatic
+    rotation without removing it. Disabled slots are skipped by the auto-switch
+    engine, bare `switch` rotation, and the usage-aware strategies, but stay
+    valid explicit `switch <num|email>` targets."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        """Add a fully switchable slot (creds + config backups present)."""
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}}),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({"oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email, "uuid": f"uuid-{num}",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        """Point the live login at a seeded account."""
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}
+        }))
+
+    # -- flag storage + accessors ------------------------------------------
+
+    def test_disable_sets_flag_and_excludes_from_rotation(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+
+        s.set_account_disabled("2", True)
+
+        assert s.is_account_disabled("2") is True
+        assert s.disabled_account_numbers() == ["2"]
+        assert s.switchable_account_numbers() == ["1", "3"]
+        data = s._get_sequence_data()
+        assert data["accounts"]["2"]["disabled"] is True
+        assert "Disabled Account-2" in capsys.readouterr().out
+
+    def test_enable_clears_flag_and_restores_position(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+        s.set_account_disabled("2", False)
+
+        assert s.is_account_disabled("2") is False
+        assert s.disabled_account_numbers() == []
+        # Restored in original sequence position, not appended at the end.
+        assert s.switchable_account_numbers() == ["1", "2", "3"]
+        data = s._get_sequence_data()
+        assert "disabled" not in data["accounts"]["2"]
+        assert "Enabled Account-2" in capsys.readouterr().out
+
+    def test_disable_by_email(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("b@example.com", True)
+
+        assert s.is_account_disabled("2") is True
+
+    def test_repeated_disable_is_noop(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+        s.set_account_disabled("2", True)  # already disabled
+
+        assert "already disabled" in capsys.readouterr().out
+        assert s.is_account_disabled("2") is True
+
+    def test_enable_when_not_disabled_is_noop(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        s.set_account_disabled("1", False)
+
+        assert "already enabled" in capsys.readouterr().out
+
+    def test_disable_unknown_account_raises(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        with pytest.raises(AccountNotFoundError):
+            s.set_account_disabled("99", True)
+
+    # -- effect on rotation / strategies -----------------------------------
+
+    def test_rotation_skips_disabled_slot(self, temp_home, capsys):
+        """active=1, slot 2 disabled — bare switch must land on 3."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (disabled)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_best_strategy_ignores_disabled_candidate(self, temp_home):
+        """The only other switchable account is disabled → no candidate."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+
+        target, note = s._select_best_switchable("1")
+
+        assert target is None
+        assert note == "none"
+
+    def test_explicit_switch_to_disabled_still_works(self, temp_home):
+        """Disabling only holds an account out of *automatic* selection;
+        an explicit `switch <num>` must still activate it."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(s, "list_accounts"):
+            s.switch_to("2")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_remove_then_readd_clears_disabled(self, temp_home):
+        """A disabled slot re-added later must not inherit the stale flag."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+
+        data = s._get_sequence_data()
+        del data["accounts"]["2"]
+        data["sequence"] = [n for n in data["sequence"] if n != 2]
+        s._write_json(s.sequence_file, data)
+        self._seed(s, 2, "b@example.com")  # re-add
+
+        assert s.is_account_disabled("2") is False
+
+    # -- warnings ----------------------------------------------------------
+
+    def test_disable_active_account_warns_but_sets_flag(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")  # becomes active
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("1", True)
+
+        out = capsys.readouterr().out
+        assert "active account" in out
+        assert s.is_account_disabled("1") is True
+
+    def test_disable_last_rotation_account_warns(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("1", True)
+        capsys.readouterr()
+        s.set_account_disabled("2", True)  # now nothing left in rotation
+
+        assert "No accounts remain in rotation" in capsys.readouterr().out
+
+    # -- display -----------------------------------------------------------
+
+    def test_list_shows_disabled_marker(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            s.list_accounts()
+
+        out = capsys.readouterr().out
+        assert "(disabled)" in out
+        # Marker attaches to the disabled row, not the enabled one.
+        disabled_line = next(ln for ln in out.splitlines() if ln.strip().startswith("2:"))
+        assert "(disabled)" in disabled_line
+
+    def test_json_list_carries_disabled_field(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            payload = s.list_accounts(json_output=True)
+
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2].get("disabled") is True
+        # Additive: absent (not False) on enabled rows.
+        assert "disabled" not in rows[1]

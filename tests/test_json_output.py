@@ -13,6 +13,7 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    account_row,
     error_envelope,
     usage_fields,
     usage_to_json,
@@ -575,3 +576,15 @@ class TestSwitchJson:
         assert result["switched"] is False
         assert result["reason"] == "unmanaged-account"
         assert result["from"] == {"number": None, "email": "test@example.com"}
+
+
+class TestAccountRowDisabled:
+    """The additive ``disabled`` field on --list rows."""
+
+    def test_disabled_true_included(self):
+        row = account_row(2, "b@example.com", "", "", False, None, disabled=True)
+        assert row["disabled"] is True
+
+    def test_disabled_absent_by_default(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "disabled" not in row

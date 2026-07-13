@@ -1456,3 +1456,38 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
         assert ("run", "2", [], True, True) in calls
+
+
+class TestDisableEnableDispatch:
+    """`cswap disable`/`cswap enable` (and the legacy --disable-account /
+    --enable-account flags) forward to switcher.set_account_disabled."""
+
+    def _run(self, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        return switcher_cls.return_value
+
+    def test_disable_subcommand_forwards(self):
+        switcher = self._run(["disable", "2"])
+        switcher.set_account_disabled.assert_called_once_with("2", True)
+
+    def test_enable_subcommand_forwards(self):
+        switcher = self._run(["enable", "user@example.com"])
+        switcher.set_account_disabled.assert_called_once_with("user@example.com", False)
+
+    def test_legacy_disable_flag_forwards(self):
+        switcher = self._run(["--disable-account", "3"])
+        switcher.set_account_disabled.assert_called_once_with("3", True)
+
+    def test_legacy_enable_flag_forwards(self):
+        switcher = self._run(["--enable-account", "3"])
+        switcher.set_account_disabled.assert_called_once_with("3", False)
+
+    def test_disable_without_target_errors(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "disable"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2

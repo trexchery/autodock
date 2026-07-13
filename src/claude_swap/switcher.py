@@ -812,13 +812,96 @@ class ClaudeAccountSwitcher:
         return inputs
 
     def switchable_account_numbers(self) -> list[str]:
-        """Account numbers in rotation order that have usable stored backups."""
+        """Account numbers in rotation order eligible for automatic selection.
+
+        Excludes slots without usable stored backups and slots the user has
+        disabled (``cswap disable``). Disabled slots stay managed and remain
+        valid explicit ``cswap switch <num|email>`` targets — they are only
+        held out of automatic rotation and the usage-aware strategies.
+        """
         data = self._get_sequence_data() or {}
         return [
             str(num)
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
+            and not self._disabled_from_data(data, str(num))
         ]
+
+    @staticmethod
+    def _disabled_from_data(data: dict, account_num: str) -> bool:
+        """Whether a slot is flagged out of rotation in already-loaded data."""
+        record = data.get("accounts", {}).get(str(account_num))
+        return bool(record and record.get("disabled"))
+
+    def is_account_disabled(self, account_num: str) -> bool:
+        """Whether a slot is currently held out of rotation."""
+        data = self._get_sequence_data() or {}
+        return self._disabled_from_data(data, str(account_num))
+
+    def disabled_account_numbers(self) -> list[str]:
+        """Managed slots the user has disabled, in sequence order."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._disabled_from_data(data, str(num))
+        ]
+
+    def set_account_disabled(self, identifier: str, disabled: bool) -> None:
+        """Hold an account out of rotation (``disabled=True``) or return it.
+
+        Disabling only affects automatic selection — the auto-switch engine,
+        bare ``cswap switch`` rotation, and the ``best`` / ``next-available``
+        strategies all skip disabled slots. The account stays managed and is
+        still a valid explicit ``cswap switch <num|email>`` target, so you can
+        park an account without losing its stored login. Re-enabling restores
+        it to rotation in its original sequence position.
+
+        Raises:
+            ConfigError: no accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        # resolve_account migrates org fields and hard-errors on ambiguity.
+        account_num, email, _ = self.resolve_account(identifier)
+
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+
+        verb = "disabled" if disabled else "enabled"
+        if bool(record.get("disabled")) == disabled:
+            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+            return
+
+        if disabled:
+            record["disabled"] = True
+        else:
+            record.pop("disabled", None)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
+
+        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+
+        if disabled:
+            active = data.get("activeAccountNumber")
+            if str(active) == account_num:
+                print(dimmed(
+                    "  It is the active account — it stays live until you switch "
+                    "away; it just won't be an automatic switch target."
+                ))
+            if not self.switchable_account_numbers():
+                warning(
+                    "  No accounts remain in rotation — auto-switch and bare "
+                    "switch have nothing to pick. Re-enable one with "
+                    "cswap enable <num|email>."
+                )
+        else:
+            print(dimmed("  It is back in the rotation."))
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -2291,7 +2374,9 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         others = [
             str(n) for n in data.get("sequence", [])
-            if str(n) != str(current_num) and self._account_is_switchable(str(n))
+            if str(n) != str(current_num)
+            and self._account_is_switchable(str(n))
+            and not self._disabled_from_data(data, str(n))
         ]
         if not others:
             return None, "none"
@@ -2441,6 +2526,7 @@ class ClaudeAccountSwitcher:
         """Build the ``--list --json`` payload from gathered account + usage data."""
         active_num: int | None = None
         accounts = []
+        seq_data = self._get_sequence_data() or {}
         for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
             if is_active:
                 active_num = num
@@ -2456,6 +2542,7 @@ class ClaudeAccountSwitcher:
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     alias=alias,
+                    disabled=self._disabled_from_data(seq_data, str(num)),
                 )
             )
         payload = {
@@ -2510,15 +2597,21 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_list_payload(accounts_info, entries)
 
+        seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
+            # NOTE: the TUI watch view (tui._watch_account_rows) parses this
+            # output to map rows to accounts for quick-switch: it relies on the
+            # uncolored ``  {num}: `` prefix and the ``(active)`` marker below.
+            # Keep them intact when tweaking this line, or update that parser.
+            markers = ""
             if is_active:
-                marker = f" {bold_accent('(active)')}"
-                print(f"  {num}: {label} {muted(f'[{tag}]')}{marker}")
-            else:
-                print(f"  {num}: {label} {muted(f'[{tag}]')}")
+                markers += f" {bold_accent('(active)')}"
+            if self._disabled_from_data(seq_data, str(num)):
+                markers += f" {muted('(disabled)')}"
+            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
 
@@ -3021,6 +3114,12 @@ class ClaudeAccountSwitcher:
         skipped_exhausted: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
+            if self._disabled_from_data(data, candidate):
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} (disabled)")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} (disabled)")
+                continue
             if not self._account_is_switchable(candidate):
                 if json_output:
                     warnings.append(
