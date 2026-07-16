@@ -647,7 +647,11 @@ class ClaudeAccountSwitcher:
         profile directory (history preserved). Directory mappings key on
         (email, org) and are unaffected. Usage-cache rows key on the slot
         number but carry the account identity, so a swapped row fails the
-        identity check and self-heals on the next poll.
+        identity check and self-heals on the next poll. Auto-switch
+        quarantine entries also key on the slot number and are not moved,
+        but self-heal on the next pass: the stale entry fails its
+        email/fingerprint check and is released, and a dead account under
+        its new number is re-caught by freshen-before-activate.
 
         Returns the two resolved slot numbers ``(first_num, second_num)``.
         """
@@ -734,10 +738,11 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Exchange two slots' session profile directories, best effort.
 
-        A profile that cannot be moved is left behind rather than deleted:
-        setup_session re-bootstraps a missing profile from the (relocated)
-        backups, so the only cost of a skipped move is that slot's session
-        history.
+        A profile that cannot be moved is not rescued: the caller prunes the
+        old slot keys afterwards (``_delete_account_files``, which removes
+        session profiles too), and setup_session re-bootstraps a missing
+        profile from the relocated backups, so a skipped move costs at most
+        that slot's session history.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
@@ -779,7 +784,10 @@ class ClaudeAccountSwitcher:
           vacated slot, so nothing is ever lost.
 
         Slot numbers may be sparse (``remove`` leaves gaps, ``add`` grows from
-        the max), so any positive number is a legal target.
+        the max), so any positive number up to 99 — or the current highest
+        slot, if a table already grew past that — is a legal target. The cap
+        exists because ``add`` numbers from the max: a stray huge target would
+        inflate every future account number.
 
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
@@ -804,6 +812,19 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if not (data or {}).get("accounts", {}).get(num_src):
             raise AccountNotFoundError(f"Account-{num_src} does not exist")
+
+        # `add` numbers new accounts from the highest slot, so a stray huge
+        # target would inflate every future account number.
+        max_slot = max(
+            (int(n) for n in data.get("accounts", {}) if n.isdigit()), default=0
+        )
+        cap = max(99, max_slot)
+        if int(target) > cap:
+            raise ValidationError(
+                f"Target slot {target} is out of range (1-{cap}): new accounts "
+                f"are numbered from the highest slot, so a large target would "
+                f"inflate future account numbers"
+            )
 
         if num_src == target:
             return num_src, target, False
@@ -840,8 +861,9 @@ class ClaudeAccountSwitcher:
         config = self._read_account_config(num_src, email)
 
         # Move the session profile to the account's new slot key, best effort:
-        # a profile that cannot be moved is left behind rather than deleted, and
-        # setup_session re-bootstraps a missing one from the relocated backups.
+        # a profile that cannot be moved is pruned below with the old slot's
+        # backups, and setup_session re-bootstraps a missing one from the
+        # relocated backups — a skipped move costs at most this slot's history.
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
         if src_dir.exists() and not dst_dir.exists():
@@ -850,9 +872,10 @@ class ClaudeAccountSwitcher:
             except OSError as e:
                 self._logger.warning(f"Session profile move skipped during move: {e}")
 
-        # Write under the new key first, then clear the old one. The session
-        # profile is already relocated, so _delete_account_files finds nothing
-        # to prune there and only drops the stale (num_src, email) backups.
+        # Write under the new key first, then clear the old one.
+        # _delete_account_files drops the stale (num_src, email) backups and
+        # whatever session profile is still under the old key (nothing, unless
+        # the move above was skipped).
         if creds:
             self._write_account_credentials(target, email, creds)
         if config:

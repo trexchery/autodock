@@ -200,3 +200,35 @@ class TestMoveAccount:
 
         with pytest.raises(AccountNotFoundError):
             switcher.move_account("nosuch@example.com", "5")
+
+    def test_move_target_above_cap_rejected(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`add` numbers from the max slot, so a huge target is refused."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        with pytest.raises(ValidationError, match="out of range"):
+            switcher.move_account("1", "100")
+
+    def test_move_cap_stretches_to_existing_max_slot(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A table that already grew past 99 keeps its full range usable."""
+        switcher = ClaudeAccountSwitcher()
+        sample_sequence_data["accounts"]["150"] = {
+            "email": "account150@example.com",
+            "uuid": "uuid-150",
+            "added": "2024-01-03T00:00:00Z",
+        }
+        sample_sequence_data["sequence"].append(150)
+        self._write(switcher, sample_sequence_data)
+
+        num_src, num_target, swapped = switcher.move_account("1", "120")
+
+        assert (num_src, num_target, swapped) == ("1", "120", False)
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["120"]["email"] == "account1@example.com"
+
+        with pytest.raises(ValidationError, match="out of range"):
+            switcher.move_account("2", "151")
