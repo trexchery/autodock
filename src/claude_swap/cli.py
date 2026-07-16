@@ -333,6 +333,104 @@ def _unmap_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _swap_command(argv: list[str]) -> None:
+    """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
+
+    Exchanges the two accounts' slot numbers (list order and numeric
+    targets). Pre-dispatched before the main parser for the same reason as
+    `alias` (the main parser's required mutually-exclusive group can't hold
+    a positional subcommand).
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} swap",
+        description=(
+            "Exchange two accounts' slot numbers, so they trade places in "
+            "`cswap list` and as numeric targets. Aliases, backups, and "
+            "session history move with their account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap swap 1 2
+  cswap swap dev user@example.com
+        """,
+    )
+    parser.add_argument("first", metavar="NUM|EMAIL|ALIAS", help="One account")
+    parser.add_argument("second", metavar="NUM|EMAIL|ALIAS", help="The other account")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        num_a, num_b = switcher.swap_accounts(args.first, args.second)
+        print(f"{accent('Swapped')} Account {num_a} and Account {num_b}:")
+        data = switcher._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        for num in sorted((num_a, num_b), key=int):
+            email = accounts.get(num, {}).get("email", "")
+            print(f"  {num}: {email}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _move_command(argv: list[str]) -> None:
+    """Handle `cswap move NUM|EMAIL|ALIAS SLOT`.
+
+    Assigns an account to a specific slot number. If the slot is empty the
+    account is relocated there (its old slot is freed); if it is occupied the
+    two accounts trade places. `swap a b` is exactly `move a <b's slot>`.
+    Pre-dispatched before the main parser for the same reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} move",
+        description=(
+            "Assign an account to a slot number. An empty slot relocates the "
+            "account there and frees its old slot; an occupied slot swaps the "
+            "two. Aliases, backups, and session history move with the account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap move user@example.com 1   move an account onto shortcut 1
+  cswap move dev 1                by alias
+  cswap move 2 1                  by number (swaps if slot 1 is taken)
+        """,
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS", help="Account to move")
+    parser.add_argument("slot", metavar="SLOT", help="Destination slot number")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        num_src, num_target, swapped = switcher.move_account(args.account, args.slot)
+        data = switcher._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        if num_src == num_target:
+            email = accounts.get(num_target, {}).get("email", "")
+            print(f"{dimmed('Already in')} slot {num_target}: {email}")
+        elif swapped:
+            print(f"{accent('Swapped')} Account {num_src} and Account {num_target}:")
+            for num in sorted((num_src, num_target), key=int):
+                email = accounts.get(num, {}).get("email", "")
+                print(f"  {num}: {email}")
+        else:
+            email = accounts.get(num_target, {}).get("email", "")
+            print(f"{accent('Moved')} {email} to slot {num_target}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _alias_command(argv: list[str]) -> None:
     """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
 
@@ -765,6 +863,12 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "swap":
+        _swap_command(argv[1:])
+        return
+    if argv and argv[0] == "move":
+        _move_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -801,6 +905,8 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s swap <a> <b>               exchange two accounts' slot numbers
+  %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
