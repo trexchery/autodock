@@ -5875,6 +5875,164 @@ class TestDirectActivationPreservation:
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
 
 
+class TestSharedOAuthCredentialPreservation:
+    """Activation must not overwrite live machine-shared OAuth state
+    (mcpOAuth et al.) with the destination slot's stale snapshot (#135)."""
+
+    API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    def test_live_siblings_win_over_stale_target_siblings(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+            "targetOnlyOAuth": {"refreshToken": "stale"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+            "designOauth": {"refreshToken": "current"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+            "designOauth": {"refreshToken": "current"},
+        }
+
+    def test_api_key_live_state_activates_target_verbatim(self, temp_home):
+        # While a managed API key is active there is no live OAuth object to
+        # take siblings from; the stored blob activates unchanged (the
+        # pre-existing behavior — the API-key round trip is out of scope).
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+            == target
+        )
+
+    def test_absent_live_state_activates_target_verbatim(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "old"}},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, "") == target
+        )
+        assert (
+            switcher._prepare_credentials_for_activation(target, None)
+            == target
+        )
+
+    def test_api_key_target_is_never_composed(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(self.API_KEY, live)
+            == self.API_KEY
+        )
+
+    def test_opaque_target_credential_activates_verbatim(self, temp_home):
+        # Opaque/legacy JSON shapes without a claudeAiOauth login are
+        # activated byte-for-byte, as before.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "accessToken": "legacy", "refreshToken": "legacy-rt",
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, live)
+            == target
+        )
+
+    def test_normal_switch_preserves_live_shared_state(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        target = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-target-2", "refreshToken": "rt-target-2",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        creds_store[("1", "test@example.com")] = live
+        creds_store[("2", "account2@example.com")] = target
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        activated = json.loads(live_state["creds"])
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["mcpOAuth"] == {
+            "server": {"refreshToken": "current"}
+        }
+
+    def test_direct_activation_preserves_live_shared_state(self, temp_home):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-unmanaged", "refreshToken": "rt-unmanaged",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        live_path.write_text(live)
+        target = json.loads(
+            switcher._read_account_credentials("1", "one@example.com")
+        )
+        target["mcpOAuth"] = {"server": {"refreshToken": "stale"}}
+        switcher._write_account_credentials(
+            "1", "one@example.com", json.dumps(target)
+        )
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        activated = json.loads(live_path.read_text())
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-one"
+        assert activated["mcpOAuth"] == {
+            "server": {"refreshToken": "current"}
+        }
+
+
 class TestUuidConflictClassification:
     """An email+org match with a conflicting uuid is a different account
     wearing a recycled email — never the slot."""

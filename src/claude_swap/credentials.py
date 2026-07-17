@@ -99,6 +99,54 @@ def looks_like_api_key(credentials: str | None) -> bool:
     return text.startswith("sk-ant-api") and not text.startswith("{")
 
 
+def _credential_object(credentials: str | None) -> dict | None:
+    """Parse a JSON credential object, excluding managed API keys."""
+    if not credentials or looks_like_api_key(credentials):
+        return None
+    try:
+        data = json.loads(credentials)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def shared_credential_fields(credentials: str | None) -> dict | None:
+    """Return account-independent fields from a Claude OAuth credential object.
+
+    Claude Code keeps machine-shared OAuth integrations (notably ``mcpOAuth``)
+    as siblings of the slot-owned ``claudeAiOauth`` field in one object.
+    ``None`` means the input is not a JSON credential object (missing,
+    malformed, or a managed API key). A dictionary — including ``{}`` — is
+    authoritative: every sibling of ``claudeAiOauth`` is machine-shared.
+    """
+    data = _credential_object(credentials)
+    if data is None:
+        return None
+    return {
+        key: value
+        for key, value in data.items()
+        if key != "claudeAiOauth"
+    }
+
+
+def merge_shared_credential_fields(
+    target_credentials: str, shared_fields: dict
+) -> str:
+    """Compose a target Claude login with independently-owned shared fields.
+
+    Returns ``target_credentials`` unchanged when it is not a JSON credential
+    object carrying a Claude login (managed API keys and opaque legacy shapes
+    stay activatable verbatim).
+    """
+    target = _credential_object(target_credentials)
+    if target is None or "claudeAiOauth" not in target:
+        return target_credentials
+
+    composed = dict(shared_fields)
+    composed["claudeAiOauth"] = target["claudeAiOauth"]
+    return json.dumps(composed)
+
+
 def approved_form(api_key: str) -> str:
     """The value Claude Code stores in ``customApiKeyResponses.approved``.
 
