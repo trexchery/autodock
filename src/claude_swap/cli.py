@@ -1271,14 +1271,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")
                 sys.exit(1)
-            try:
-                from claude_swap.menubar import run as menubar_run
-            except ImportError:
-                error(
-                    "Menu bar mode requires 'rumps'. "
-                    "Install with: pip install 'claude-swap[menubar]'"
-                )
-                sys.exit(1)
+            # menubar is import-safe without the extra; a missing rumps
+            # surfaces from run() as a ClaudeSwitchError with the install hint.
+            from claude_swap.menubar import run as menubar_run
+
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
