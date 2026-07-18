@@ -367,7 +367,26 @@ def _adapt_snapshot(snap) -> dict:
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    import rumps  # lazy: optional dependency, imported only when launching
+    try:
+        import rumps  # lazy: optional dependency, imported only when launching
+        import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
+    except ImportError as e:
+        # This module is import-safe without rumps by design, so the CLI's
+        # guard around ``from claude_swap.menubar import run`` can never see a
+        # missing extra — the failure lands here at call time. Raise the
+        # error type the CLI already renders cleanly instead of a traceback.
+        raise ClaudeSwitchError(
+            "Menu bar mode requires 'rumps'. "
+            "Install with: pip install 'claude-swap[menubar]'"
+        ) from e
+
+    # rumps never sets an activation policy, so under a framework Python the
+    # process launches as a regular app and parks a "Python" icon in the Dock
+    # for as long as the menu bar runs. Accessory keeps the status item and
+    # dialog windows but stays out of the Dock and the Cmd-Tab switcher.
+    AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+        AppKit.NSApplicationActivationPolicyAccessory
+    )
 
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
