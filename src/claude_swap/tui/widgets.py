@@ -286,7 +286,7 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
         elif key == "seven_day":
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
-                text.append(" (pace)", style=SEV_WARN)
+                text.append(" (ahead)", style=SEV_WARN)
         parts += 1
     maxed = [
         w["name"]

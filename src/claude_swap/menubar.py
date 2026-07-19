@@ -200,7 +200,7 @@ def usage_summary(
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
             if key == "seven_day" and pace_result and pace_result.ahead:
-                seg += " (pace)"
+                seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
@@ -214,7 +214,7 @@ def usage_summary(
             if window["pct"] >= 100:
                 seg += " (!)"  # maxed model — the usual reason to switch
             elif pace_result and pace_result.ahead:
-                seg += " (pace)"
+                seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"
@@ -355,7 +355,6 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
-    "active_usage_fetched_at": None,
 }
 
 
@@ -364,17 +363,15 @@ def _adapt_snapshot(snap) -> dict:
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None, "active_usage_fetched_at": float | None}``. The
-    snapshot itself is produced by ``SnapshotSource`` (the paced read path), so
-    this is a pure transform — no fetching, no I/O. ``fetched_at`` is the
-    underlying measurement's fetch time, used only for the pace marker
-    (issue #125).
+    "active_alias": str | None}``. The snapshot itself is produced by
+    ``SnapshotSource`` (the paced read path), so this is a pure transform — no
+    fetching, no I/O. Per-account ``fetched_at`` is the underlying
+    measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
     active_email = None
     active_usage = None
     active_alias = None
-    active_fetched_at = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append(
@@ -385,13 +382,11 @@ def _adapt_snapshot(snap) -> dict:
         )
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
-            active_fetched_at = acc.usage.fetched_at
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
-        "active_usage_fetched_at": active_fetched_at,
     }
 
 

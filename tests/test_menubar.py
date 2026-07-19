@@ -130,51 +130,51 @@ def test_usage_summary_seven_day_ahead_of_pace_marker():
     # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
     usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert out == "7d 50% (pace) (6d 0h)"
+    assert out == "7d 50% (ahead) (6d 0h)"
 
 
 def test_usage_summary_five_hour_never_shows_pace_marker():
     usage = {"five_hour": {"pct": 90.0, "resets_at": _iso(4 * 3600)}}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert "pace" not in out
+    assert "ahead" not in out
 
 
 def test_usage_summary_scoped_ahead_of_pace_marker():
     usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": _iso(6 * 86400)}]}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert out == "Fable 50% (pace) (6d 0h)"
+    assert out == "Fable 50% (ahead) (6d 0h)"
 
 
 def test_usage_summary_maxed_scoped_marker_wins_over_pace():
-    # At/over the limit shows "(!)" — the more urgent signal — not "(pace)".
+    # At/over the limit shows "(!)" — the more urgent signal — not "(ahead)".
     usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(6 * 86400)}]}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
     assert "(!)" in out
-    assert "pace" not in out
+    assert "ahead" not in out
 
 
 def test_usage_summary_no_pace_marker_without_fetched_at():
     usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
     out = menubar.usage_summary(usage, _NOW)
-    assert "pace" not in out
+    assert "ahead" not in out
 
 
 def test_usage_summary_no_pace_marker_on_window_rolled_to_zero():
     # A weekly window whose resets_at has already passed (stale cache, not
     # refetched since the actual reset) is rolled to a display pct of 0% —
     # pace must be computed against that rolled 0%, not the raw stale pct,
-    # or the display would show "7d 0% (pace)" (a marker paired with a
+    # or the display would show "7d 0% (ahead)" (a marker paired with a
     # percentage it doesn't correspond to).
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-3 * 86400)}}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
-    assert "pace" not in out
+    assert "ahead" not in out
     assert "7d 0%" in out
 
 
 def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
     usage = {"scoped": [{"name": "Fable", "pct": 95.0, "resets_at": _iso(-3 * 86400)}]}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
-    assert "pace" not in out
+    assert "ahead" not in out
     assert "Fable 0%" in out
 
 
@@ -439,7 +439,6 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    assert snap["active_usage_fetched_at"] == 123.0
     # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
     assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through

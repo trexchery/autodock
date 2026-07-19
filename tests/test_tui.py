@@ -486,7 +486,7 @@ class TestMiniAccountText:
             age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "(pace)" in mini_account_text(acc, now).plain
+        assert "(ahead)" in mini_account_text(acc, now).plain
 
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
