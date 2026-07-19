@@ -5885,17 +5885,17 @@ class TestSharedOAuthCredentialPreservation:
         TestPerformSwitchPostDisplay._install_store_patches
     )
 
-    def test_live_siblings_win_over_stale_target_siblings(self, temp_home):
+    def test_live_shared_keys_win_over_stale_target_copies(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         target = json.dumps({
             "claudeAiOauth": {"accessToken": "target"},
             "mcpOAuth": {"server": {"refreshToken": "stale"}},
-            "targetOnlyOAuth": {"refreshToken": "stale"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "stale"}},
         })
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "live"},
             "mcpOAuth": {"server": {"refreshToken": "current"}},
-            "designOauth": {"refreshToken": "current"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         })
 
         composed = json.loads(
@@ -5905,8 +5905,57 @@ class TestSharedOAuthCredentialPreservation:
         assert composed == {
             "claudeAiOauth": {"accessToken": "target"},
             "mcpOAuth": {"server": {"refreshToken": "current"}},
-            "designOauth": {"refreshToken": "current"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
+
+    def test_account_bound_and_unknown_siblings_stay_target_owned(
+        self, temp_home
+    ):
+        # trustedDeviceToken is enrolled per-account, and a field cswap does
+        # not recognize could be too — neither may cross an account switch.
+        # Only the SHARED_CREDENTIAL_KEYS allowlist is taken from live.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "trustedDeviceToken": "device-token-b",
+            "someFutureField": {"value": "target-owned"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "trustedDeviceToken": "device-token-a",
+            "someFutureField": {"value": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "trustedDeviceToken": "device-token-b",
+            "someFutureField": {"value": "target-owned"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_shared_key_absent_from_live_is_not_resurrected(self, temp_home):
+        # Shared keys are live-owned in absence too: if the machine no
+        # longer holds an MCP session, the slot's stale copy must not
+        # reintroduce it.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
 
     def test_api_key_live_state_activates_target_verbatim(self, temp_home):
         # While a managed API key is active there is no live OAuth object to

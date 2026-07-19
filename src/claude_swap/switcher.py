@@ -417,15 +417,18 @@ class ClaudeAccountSwitcher:
     ) -> str:
         """Compose the credential to activate from its two owners.
 
-        The destination slot authoritatively owns only its ``claudeAiOauth``
-        login. Its sibling fields (machine-shared OAuth integrations such as
-        ``mcpOAuth``) are frozen at backup time and may hold rotated-out
-        refresh tokens, while the live credential's siblings are by
-        definition the current generation — so the live siblings win.
+        The machine-shared OAuth integrations (the ``SHARED_CREDENTIAL_KEYS``
+        allowlist, notably ``mcpOAuth``) are frozen in the slot at backup
+        time and may hold rotated-out refresh tokens, while the live
+        credential's copies are by definition the current generation — so
+        for those keys the live credential wins, absence included. Every
+        other field the destination slot stored travels with the slot:
+        account-bound state such as ``trustedDeviceToken`` — and any field
+        cswap does not recognize — must not leak across an account switch.
 
-        When there is no live JSON credential object to take siblings from
-        (fresh machine, or a managed API key is active), the stored blob
-        activates unchanged, exactly as before.
+        When there is no live JSON credential object to take shared fields
+        from (fresh machine, or a managed API key is active), the stored
+        blob activates unchanged, exactly as before.
         """
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:
