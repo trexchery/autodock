@@ -16,7 +16,10 @@ unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 from __future__ import annotations
 
 import json
+import logging
+import plistlib
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -32,6 +35,44 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
+NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+
+
+def ensure_notification_identity(
+    executable: Path | None = None,
+    *,
+    platform: str = sys.platform,
+) -> Path | None:
+    """Ensure rumps can resolve a bundle identifier for notifications.
+
+    Command-line Python tools have no app bundle, so rumps looks for an
+    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
+    environment; repair the tiny plist on every launch when needed.
+    """
+    if platform != "darwin":
+        return None
+    path = (executable or Path(sys.executable)).parent / "Info.plist"
+    data: dict = {}
+    try:
+        if path.exists():
+            loaded = plistlib.loads(path.read_bytes())
+            if isinstance(loaded, dict):
+                data = loaded
+        changed = False
+        if not data.get("CFBundleIdentifier"):
+            data["CFBundleIdentifier"] = NOTIFICATION_BUNDLE_ID
+            changed = True
+        if not data.get("CFBundleName"):
+            data["CFBundleName"] = "claude-swap"
+            changed = True
+        if changed or not path.exists():
+            path.write_bytes(plistlib.dumps(data))
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        logging.getLogger("claude-swap").warning(
+            "Could not prepare menu-bar notification identity: %s", exc
+        )
+        return None
+    return path
 
 
 @dataclass
@@ -392,6 +433,7 @@ def _adapt_snapshot(snap) -> dict:
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
+    ensure_notification_identity()
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
