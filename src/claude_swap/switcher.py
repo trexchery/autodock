@@ -4359,36 +4359,34 @@ class ClaudeAccountSwitcher:
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # Snapshot live state so a mid-operation failure can be undone.
-                # When a live session exists, fail fast if the snapshot is
-                # unreadable rather than proceeding to overwrite without a
-                # safety net.
-                rollback_creds: str | None = None
+                # Snapshot live state so a mid-operation failure can be
+                # undone, config identity or not: a wiped or half-written
+                # ~/.claude.json can orphan a live credential whose
+                # machine-shared MCP state must still reach the composer
+                # below (#135) — and the rollback, should activation fail
+                # partway. Fail fast when the snapshot is unreadable (None:
+                # the credentials file exists but could not be read) rather
+                # than overwrite state that has no safety copy; "" means
+                # absent in every backend and composes/restores nothing.
                 rollback_config_text: str | None = None
-                if current_identity is not None:
-                    rollback_creds = self._read_credentials()
-                    if rollback_creds is None:
-                        raise CredentialReadError(
-                            "Cannot snapshot live credentials before activation"
+                rollback_creds: str | None = self._read_credentials()
+                if rollback_creds is None:
+                    raise CredentialReadError(
+                        "Cannot snapshot live credentials before activation"
+                    )
+                if current_identity is None:
+                    # Fresh machine: normalize "" so the stash, composer, and
+                    # rollback all see "nothing to preserve".
+                    rollback_creds = rollback_creds or None
+                if config_path.exists():
+                    try:
+                        rollback_config_text = config_path.read_text(
+                            encoding="utf-8"
                         )
-                    if config_path.exists():
-                        try:
-                            rollback_config_text = config_path.read_text(
-                                encoding="utf-8"
-                            )
-                        except OSError as e:
-                            raise ConfigError(
-                                f"Cannot snapshot live config before activation: {e}"
-                            )
-                else:
-                    # No config identity does not mean no live credential: a
-                    # wiped or half-written ~/.claude.json can orphan a live
-                    # item whose machine-shared MCP state must still reach
-                    # the composer below (#135) — and the rollback, should
-                    # activation fail partway. Best-effort read: "" (absent)
-                    # and None (read error) both mean nothing to compose or
-                    # restore, exactly the old fresh-machine behavior.
-                    rollback_creds = self._read_credentials() or None
+                    except OSError as e:
+                        raise ConfigError(
+                            f"Cannot snapshot live config before activation: {e}"
+                        )
 
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no

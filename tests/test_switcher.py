@@ -5895,6 +5895,47 @@ class TestDirectActivationPreservation:
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
 
+    def test_unreadable_live_credentials_without_config_identity_abort(
+        self, temp_home
+    ):
+        # None from _read_credentials means the credentials file exists but
+        # could not be read — activation must not blind-overwrite state it
+        # could not snapshot, config identity or not.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        with patch.object(switcher, "_read_credentials", return_value=None):
+            with pytest.raises(CredentialReadError, match="snapshot"):
+                switcher._perform_switch("1", emit_output=False)
+        # Live store untouched.
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert live == orphaned
+
+    def test_mid_failure_restores_identityless_config(self, temp_home):
+        # A settings-bearing ~/.claude.json without oauthAccount (the normal
+        # post-logout state) must be restored when activation fails partway —
+        # previously only an identity-bearing config was snapshotted, so the
+        # credential rollback could leave mismatched halves behind.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        config_path = temp_home / ".claude.json"
+        original_config = json.dumps({"projects": {"/home/x": {"history": []}}})
+        config_path.write_text(original_config)
+
+        real_write_json = switcher._write_json
+
+        def fail_sequence_write(path, data):
+            if path == switcher.sequence_file:
+                raise OSError("disk full")
+            return real_write_json(path, data)
+
+        with patch.object(
+            switcher, "_write_json", side_effect=fail_sequence_write
+        ), pytest.raises(OSError, match="disk full"):
+            switcher._perform_switch("1", emit_output=False)
+
+        # Both halves rolled back: the settings config and the orphaned login.
+        assert config_path.read_text() == original_config
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert live == orphaned
+
 
 class TestSharedOAuthCredentialPreservation:
     """Activation must not overwrite live machine-shared OAuth state
