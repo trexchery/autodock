@@ -42,6 +42,8 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     ActiveCredentials,
     CredentialStore,
     looks_like_api_key,
+    merge_shared_credential_fields,
+    shared_credential_fields,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -412,6 +414,29 @@ class ClaudeAccountSwitcher:
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
+
+    def _prepare_credentials_for_activation(
+        self, target_credentials: str, live_credentials: str | None
+    ) -> str:
+        """Compose the credential to activate from its two owners.
+
+        The machine-shared OAuth integrations (the ``SHARED_CREDENTIAL_KEYS``
+        allowlist, notably ``mcpOAuth``) are frozen in the slot at backup
+        time and may hold rotated-out refresh tokens, while the live
+        credential's copies are by definition the current generation — so
+        for those keys the live credential wins, absence included. Every
+        other field the destination slot stored travels with the slot:
+        account-bound state such as ``trustedDeviceToken`` — and any field
+        cswap does not recognize — must not leak across an account switch.
+
+        When there is no live JSON credential object to take shared fields
+        from (fresh machine, or a managed API key is active), the stored
+        blob activates unchanged, exactly as before.
+        """
+        live_shared = shared_credential_fields(live_credentials)
+        if live_shared is None:
+            return target_credentials
+        return merge_shared_credential_fields(target_credentials, live_shared)
 
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()
@@ -4395,7 +4420,11 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(target_creds)
+                    self._write_credentials(
+                        self._prepare_credentials_for_activation(
+                            target_creds, rollback_creds
+                        )
+                    )
                     creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
@@ -4612,7 +4641,11 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(target_creds)
+                self._write_credentials(
+                    self._prepare_credentials_for_activation(
+                        target_creds, original_creds
+                    )
+                )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 

@@ -203,7 +203,9 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 ## How it works
 
 - Backs up OAuth tokens and config when you add an account
-- Swaps credentials when you switch accounts
+- Swaps only the account-specific Claude login when you switch accounts;
+  live account-independent OAuth state (such as MCP server logins) is
+  preserved instead of being overwritten by a slot's older snapshot
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)

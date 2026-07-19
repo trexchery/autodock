@@ -99,6 +99,76 @@ def looks_like_api_key(credentials: str | None) -> bool:
     return text.startswith("sk-ant-api") and not text.startswith("{")
 
 
+def _credential_object(credentials: str | None) -> dict | None:
+    """Parse a JSON credential object, excluding managed API keys."""
+    if not credentials or looks_like_api_key(credentials):
+        return None
+    try:
+        data = json.loads(credentials)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# The credential object's siblings of claudeAiOauth are not uniformly owned:
+# these keys hold machine-shared OAuth integrations that rotate independently
+# of any account slot, so on activation the live copy is authoritative.
+# Everything else — known (trustedDeviceToken is enrolled per-account and
+# re-enrolled on every login) or unknown — stays with the target slot: a
+# stale restore of an unlisted shared field merely re-prompts for auth,
+# while carrying a live account-bound field across a switch would present
+# one account's credential under another.
+SHARED_CREDENTIAL_KEYS = frozenset({
+    "mcpOAuth",
+    "mcpOAuthClientConfig",
+    "mcpXaaIdp",
+    "mcpXaaIdpConfig",
+    "pluginSecrets",
+})
+
+
+def shared_credential_fields(credentials: str | None) -> dict | None:
+    """Return the machine-shared fields of a Claude OAuth credential object.
+
+    Only the ``SHARED_CREDENTIAL_KEYS`` allowlist is machine-shared; other
+    siblings of ``claudeAiOauth`` are account-scoped or unknown and stay
+    slot-owned. ``None`` means the input is not a JSON credential object
+    (missing, malformed, or a managed API key). A dictionary — including
+    ``{}`` — is authoritative for every allowlisted key: a key absent here
+    is absent from the machine's current shared state.
+    """
+    data = _credential_object(credentials)
+    if data is None:
+        return None
+    return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+
+
+def merge_shared_credential_fields(
+    target_credentials: str, shared_fields: dict
+) -> str:
+    """Compose a target Claude login with the machine's shared fields.
+
+    The allowlisted keys are wholly live-owned, presence and absence alike:
+    the target's copies are discarded and ``shared_fields`` supplies the
+    current generation, so a shared key the machine no longer holds is not
+    resurrected from the slot's snapshot. All other target fields pass
+    through untouched. Returns ``target_credentials`` unchanged when it is
+    not a JSON credential object carrying a Claude login (managed API keys
+    and opaque legacy shapes stay activatable verbatim).
+    """
+    target = _credential_object(target_credentials)
+    if target is None or "claudeAiOauth" not in target:
+        return target_credentials
+
+    composed = {
+        key: value
+        for key, value in target.items()
+        if key not in SHARED_CREDENTIAL_KEYS
+    }
+    composed.update(shared_fields)
+    return json.dumps(composed)
+
+
 def approved_form(api_key: str) -> str:
     """The value Claude Code stores in ``customApiKeyResponses.approved``.
 
