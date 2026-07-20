@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import plistlib
 import re
 import sys
@@ -55,7 +56,10 @@ def ensure_notification_identity(
     data: dict = {}
     try:
         if path.exists():
-            loaded = plistlib.loads(path.read_bytes())
+            try:
+                loaded = plistlib.loads(path.read_bytes())
+            except Exception:
+                loaded = None  # unreadable/corrupt — rebuild from scratch
             if isinstance(loaded, dict):
                 data = loaded
         changed = False
@@ -66,7 +70,10 @@ def ensure_notification_identity(
             data["CFBundleName"] = "claude-swap"
             changed = True
         if changed or not path.exists():
-            path.write_bytes(plistlib.dumps(data))
+            # atomic: an interrupted write must not leave a half-written plist
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(plistlib.dumps(data))
+            os.replace(tmp, path)
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
         logging.getLogger("claude-swap").warning(
             "Could not prepare menu-bar notification identity: %s", exc
