@@ -473,6 +473,10 @@ def run(switcher) -> int:
     _warn = python_support_warning()
     if _warn:
         warning(_warn)
+        # Under launchd stdout is a log file, not a tty, so this would sit in
+        # a block buffer for as long as the process lives — which for a menu
+        # bar is days. Flush it now or it never reaches the log at all.
+        sys.stdout.flush()
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
