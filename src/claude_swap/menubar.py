@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import plistlib
 import re
 import sys
@@ -455,15 +456,36 @@ def _adapt_snapshot(snap) -> dict:
 # The interpreter version is not the variable; the build is.
 
 
-def framework_build_warning(framework=None, install_method=None) -> str | None:
+MIN_AFFECTED_MACOS = 26
+
+
+def _macos_major(mac_ver: str | None = None) -> int | None:
+    """Major version of the running macOS, or None if it cannot be read."""
+    raw = platform.mac_ver()[0] if mac_ver is None else mac_ver
+    head = raw.split(".")[0]
+    return int(head) if head.isdigit() else None
+
+
+def framework_build_warning(
+    framework=None, install_method=None, mac_ver: str | None = None
+) -> str | None:
     """Text to show when this interpreter cannot draw a status item.
 
-    Returns None on builds where the menu bar is known to work. Nothing here
-    can fix the incompatibility — the point is that it fails silently, with a
-    healthy process and empty logs, so it is worth one line up front.
+    Returns None wherever the menu bar is known to work. Both halves of the
+    condition matter: the evidence is a framework build *on macOS 26*, and
+    framework builds draw fine on earlier releases — gating on the build alone
+    would nag every Homebrew user on macOS 14 or 15, on every launch and in
+    the service log on every restart.
+
+    Nothing here can fix the incompatibility. The point is that it fails
+    silently, with a healthy process and empty logs, so it is worth one line.
     """
     fw = getattr(sys, "_framework", "") if framework is None else framework
     if not fw:
+        return None
+
+    major = _macos_major(mac_ver)
+    if major is None or major < MIN_AFFECTED_MACOS:
         return None
 
     if install_method is None:
@@ -488,9 +510,9 @@ def framework_build_warning(framework=None, install_method=None) -> str | None:
         )
 
     return (
-        "This is a framework build of Python, which on macOS 26 does not draw "
-        "the menu bar icon: the process runs and logs nothing, but no status "
-        "item appears.\n" + remedy
+        "This is a framework build of Python, which on macOS 26 has been "
+        "observed not to draw the menu bar icon: the process runs and logs "
+        "nothing, but no status item appears.\n" + remedy
     )
 
 
