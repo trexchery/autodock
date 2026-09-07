@@ -557,7 +557,7 @@ class TestCLI:
         # worst case: it survives reboots and shows nothing. See issue #310.
         self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
         monkeypatch.setattr(
-            "claude_swap.menubar.python_support_warning", lambda *a: "3.14 draws nothing"
+            "claude_swap.menubar.framework_build_warning", lambda *a: "3.14 draws nothing"
         )
 
         with pytest.raises(SystemExit):
@@ -571,7 +571,7 @@ class TestCLI:
     ):
         self._service_harness(monkeypatch, ["cswap", "menubar", "--install-service"])
         monkeypatch.setattr(
-            "claude_swap.menubar.python_support_warning", lambda *a: None
+            "claude_swap.menubar.framework_build_warning", lambda *a: None
         )
 
         with pytest.raises(SystemExit):

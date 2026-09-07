@@ -439,44 +439,71 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
-# Interpreters where rumps draws no status item. Measured on macOS 26.6.2 with
-# rumps 0.4.0: under Python 3.14 the app starts, the event loop runs, nothing is
-# logged and no icon appears; the same app on 3.13 draws it with pyobjc held
-# constant, so the interpreter is the variable. 3.15+ is included because it is
-# untested, not because it is known broken — the point is to stop claiming a
-# working menu bar on interpreters where nobody has seen one.
-STATUS_ITEM_UNTESTED_PYTHON = (3, 14)
+# macOS 26 stopped drawing status items for processes launched through an
+# exec trampoline, and a CPython *framework* build is exactly that: its
+# ``bin/python3.x`` is a stub that posix_spawns into ``Python.app``
+# (Mac/Tools/pythonw.c). Homebrew and python.org ship framework builds;
+# uv-managed and most other interpreters do not.
+#
+# Measured on macOS 26.6.2 with rumps 0.4.0, same bare rumps app throughout:
+#
+#   Homebrew 3.14.6   sys._framework 'Python'   no status item
+#   Homebrew 3.10.21  sys._framework 'Python'   no status item
+#   uv 3.14.7         sys._framework ''         status item drawn
+#   uv 3.13.15        sys._framework ''         status item drawn
+#
+# The interpreter version is not the variable; the build is.
 
 
-def python_support_warning(version_info=None) -> str | None:
-    """Text to show when this interpreter is not known to draw a status item.
+def framework_build_warning(framework=None, install_method=None) -> str | None:
+    """Text to show when this interpreter cannot draw a status item.
 
-    Returns None on interpreters where the menu bar is known to work. Nothing
-    here can fix the incompatibility; the silence is what makes it expensive,
-    so the point is only to say it out loud instead of starting a process that
-    will look healthy and show nothing.
+    Returns None on builds where the menu bar is known to work. Nothing here
+    can fix the incompatibility — the point is that it fails silently, with a
+    healthy process and empty logs, so it is worth one line up front.
     """
-    info = tuple((version_info or sys.version_info)[:2])
-    if info < STATUS_ITEM_UNTESTED_PYTHON:
+    fw = getattr(sys, "_framework", "") if framework is None else framework
+    if not fw:
         return None
+
+    if install_method is None:
+        from claude_swap.update_check import _detect_install_method
+
+        install_method = _detect_install_method()
+
+    if install_method == "uv":
+        remedy = (
+            "  uv tool install --managed-python --force 'claude-swap[menubar]'"
+        )
+    elif install_method == "pipx":
+        remedy = (
+            "  Reinstall against a non-framework interpreter, e.g. one from "
+            "`uv python install 3.13`:\n"
+            "  pipx install --force --python <that python> 'claude-swap[menubar]'"
+        )
+    else:
+        remedy = (
+            "  Reinstall against a non-framework interpreter "
+            "(uv-managed ones are; Homebrew and python.org are not)."
+        )
+
     return (
-        f"Python {info[0]}.{info[1]} is not known to draw the menu bar icon "
-        "on macOS: the process runs and logs nothing, but no status item "
-        "appears. Reinstall on 3.13 to get it back:\n"
-        "  uv tool install --python 3.13 --force 'claude-swap[menubar]'"
+        "This is a framework build of Python, which on macOS 26 does not draw "
+        "the menu bar icon: the process runs and logs nothing, but no status "
+        "item appears.\n" + remedy
     )
 
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
-    _warn = python_support_warning()
+    _warn = framework_build_warning()
     if _warn:
-        warning(_warn)
-        # Under launchd stdout is a log file, not a tty, so this would sit in
-        # a block buffer for as long as the process lives — which for a menu
-        # bar is days. Flush it now or it never reaches the log at all.
-        sys.stdout.flush()
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone

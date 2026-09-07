@@ -242,14 +242,15 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 Needs the `menubar` extra (macOS only):
 
 > [!IMPORTANT]
-> Install it on **Python 3.13**. On Python 3.14 the menu bar starts, runs and logs nothing, but no status item is ever drawn ([#310](https://github.com/realiti4/claude-swap/issues/310)). `uv` picks the newest interpreter by default, so ask for 3.13 explicitly:
->
-> ```bash
-> uv tool install --python 3.13 'claude-swap[menubar]'
-> ```
+> Install it against a **non-framework** interpreter. On macOS 26 a framework build of Python — which is what Homebrew and python.org ship — draws no menu bar icon at all: the process runs, logs nothing, and the menu bar stays empty ([#310](https://github.com/realiti4/claude-swap/issues/310)). uv-managed interpreters are not framework builds, so ask for one explicitly. Check with `python -c "import sys; print(repr(sys._framework))"` — an empty string is what you want.
 
 ```bash
-uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+uv tool install --managed-python 'claude-swap[menubar]'   # or: pipx install --python <a non-framework python> 'claude-swap[menubar]'
+```
+
+The rest of the CLI is unaffected on any interpreter; this is about the status item only.
+
+```bash
 cswap menubar
 ```
 
