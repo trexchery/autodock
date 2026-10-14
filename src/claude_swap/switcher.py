@@ -51,7 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -577,7 +577,9 @@ class ClaudeAccountSwitcher:
         # making callers roll back around committed metadata).
         if sys.platform != "win32":
             os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+        # Not shutil.move: on Windows it falls back to copy-then-delete when
+        # the target exists, rewriting it in place while readers may open it.
+        replace_with_retry(temp_path, path)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
