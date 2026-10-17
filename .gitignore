@@ -11,3 +11,14 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# Claude Dock private runtime files
+.env
+.env.*
+!.env.example
+**/.credentials.json
+**/auth.json
+**/*.cswap
+**/.claude/
+.claude-swap-backup/
+.claude-dock/
