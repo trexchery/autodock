@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from claude_swap import macos_keychain
+from claude_swap import dpapi, macos_keychain
 from claude_swap import oauth
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
@@ -6650,7 +6650,7 @@ class TestMacosKeychainFallback:
 
         # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
         # still return the new creds (no stale shadow).
-        assert base64.b64decode(enc.read_text()).decode() == "NEW-KC"
+        assert dpapi.unseal(enc.read_text()) == "NEW-KC"
         assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
 
     def test_backup_file_mode_writes_enc_and_clears_keychain(
@@ -6906,7 +6906,7 @@ def _read_safety_copy(switcher, entry_id: str) -> str:
     """Decode a preserved credential entry straight from its file (the store
     is write-only by design — no read helper exists in production code)."""
     path = switcher._store._stash_entry_path(entry_id)
-    return base64.b64decode(path.read_text().strip(), validate=True).decode()
+    return dpapi.unseal(path.read_text())
 
 
 class TestProvenanceGuard:
@@ -8489,7 +8489,7 @@ class TestStashStorageHardening:
         assert id_a != id_b
         for entry_id in (id_a, id_b):
             raw = store._stash_entry_path(entry_id).read_text().strip()
-            assert base64.b64decode(raw, validate=True).decode() == "same-bytes"
+            assert dpapi.unseal(raw) == "same-bytes"
 
     def test_corrupt_manifest_is_preserved_not_clobbered(self, temp_home):
         store = self._store(temp_home)
@@ -8509,7 +8509,7 @@ class TestStashStorageHardening:
         assert new_id in entries and entries[new_id]["reason"] == "y"
         assert entry_id in entries
         raw = store._stash_entry_path(entry_id).read_text().strip()
-        assert base64.b64decode(raw, validate=True).decode() == "bytes-1"
+        assert dpapi.unseal(raw) == "bytes-1"
 
 
 class TestStashManifestConcurrentMutation:

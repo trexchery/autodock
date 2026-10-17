@@ -17,7 +17,6 @@ orchestration would re-couple. The store owns only its two pieces of state:
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -27,7 +26,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import dpapi, macos_keychain
 from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
@@ -1126,14 +1125,14 @@ class CredentialStore:
             self._host._logger.warning(f"Failed to delete credentials from Keychain: {e}")
 
     def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
-        """Atomically write a per-account backup ``.enc`` (base64) file."""
+        """Atomically write a per-account backup ``.enc`` (sealed, see dpapi.py) file."""
         self._atomic_b64_write(self._backup_enc_path(account_num, email), credentials)
 
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
-        """Atomically write a base64-encoded credential file (0600)."""
+        """Atomically write a sealed credential file (DPAPI on Windows, 0600 elsewhere)."""
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         enc_file = target
-        encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+        encoded = dpapi.seal(credentials)
         import tempfile
         fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
         try:
@@ -1227,7 +1226,7 @@ class CredentialStore:
                     # validate=True: reject non-alphabet junk (e.g. "!!!!") instead
                     # of silently discarding it to empty bytes, which would let a
                     # corrupt .enc shadow a valid Keychain copy.
-                    decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                    decoded = dpapi.unseal(encoded)
                 except Exception as e:
                     # Corrupt/garbled .enc → on macOS fall through to the Keychain
                     # copy (documented recovery) — content-level, not a read
@@ -1550,7 +1549,7 @@ class CredentialStore:
         if prev_file.exists():
             try:
                 encoded = prev_file.read_text(encoding="utf-8").strip()
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                decoded = dpapi.unseal(encoded)
                 if decoded:
                     return decoded
             except Exception as e:
@@ -1846,7 +1845,7 @@ class CredentialStore:
             )
             return "", True
         try:
-            return base64.b64decode(encoded, validate=True).decode("utf-8"), False
+            return dpapi.unseal(encoded), False
         except Exception as e:
             self._host._logger.warning(
                 f"Failed to decode unclaimed credential {entry_id}: {e}"

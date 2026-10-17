@@ -312,6 +312,34 @@ Examples:
         sys.exit(130)
 
 
+def _enroll_command(argv: list[str]) -> None:
+    """Handle `cswap enroll DIR` — adopt an isolated `claude auth login`."""
+    parser = argparse.ArgumentParser(
+        prog="cswap enroll",
+        description=(
+            "Add the account logged in under a separate Claude Code config "
+            "directory (CLAUDE_CONFIG_DIR=DIR claude auth login) without "
+            "touching the default login. DIR still holds a live credential "
+            "afterwards: delete it."
+        ),
+    )
+    parser.add_argument("config_dir", metavar="DIR", help="Claude Code config directory")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        switcher._refuse_session_shell()
+        from claude_swap.enroll import enroll
+
+        email = enroll(switcher, args.config_dir)
+        print(f"{accent('Enrolled')} {email}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _unmap_command(argv: list[str]) -> None:
     """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
     parser = argparse.ArgumentParser(
@@ -1003,6 +1031,9 @@ def main() -> None:
         return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
+        return
+    if argv and argv[0] == "enroll":
+        _enroll_command(argv[1:])
         return
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])

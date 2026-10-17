@@ -22,3 +22,8 @@ docs/superpowers/
 **/.claude/
 .claude-swap-backup/
 .claude-dock/
+
+# Claude Dock (.NET) build output
+bin/
+obj/
+TestResults/
