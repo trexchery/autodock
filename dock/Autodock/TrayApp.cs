@@ -30,13 +30,21 @@ public sealed class TrayApp : ApplicationContext
         _dash.AutoToggled += on => SetAutoSwitch(on);
         _dash.VisibleChanged += (_, _) => { if (!_dash.Visible) _dashHiddenAt = DateTime.UtcNow; };
         _dash.SetAuto(_settings.AutoSwitch);
+        _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
+        _dash.Moved += SavePinnedPosition;
 
         HardenStores();
         _timer.Interval = _settings.RefreshSeconds * 1000;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
         _timer.Start();
         _ = TickAsync(runAuto: true);
-        if (!minimized) _dash.ShowNearTray();
+        if (_settings.Pinned)
+        {
+            _dash.SetPinned(true);
+            _dash.Render(_snap, _error);
+            _dash.ShowPinnedAt(_settings.PinnedX, _settings.PinnedY);
+        }
+        else if (!minimized) _dash.ShowNearTray();
     }
 
     void HardenStores()
@@ -50,17 +58,31 @@ public sealed class TrayApp : ApplicationContext
 
     void ToggleDashboard()
     {
+        if (_dash.Visible && _dash.Pinned) { _dash.Activate(); return; }
         if (_dash.Visible) { _dash.Hide(); return; }
         // A click on the tray first deactivates (hides) the flyout; don't reopen it.
         if ((DateTime.UtcNow - _dashHiddenAt).TotalMilliseconds < 300) return;
+        ShowDashboard();
+    }
+
+    void ShowDashboard()
+    {
         _dash.Render(_snap, _error);
-        _dash.ShowNearTray();
+        if (_dash.Pinned) { _dash.ShowPinnedAt(_settings.PinnedX, _settings.PinnedY); _dash.Activate(); }
+        else _dash.ShowNearTray();
+    }
+
+    void SavePinnedPosition()
+    {
+        if (_dash.Pinned) (_settings.PinnedX, _settings.PinnedY) = (_dash.Left, _dash.Top);
+        _settings.Save();
     }
 
     async Task TickAsync(bool runAuto)
     {
         if (_busy) return;
         _busy = true;
+        _dash.SetStatus("Refreshing…");
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
@@ -117,7 +139,7 @@ public sealed class TrayApp : ApplicationContext
     void BuildMenu()
     {
         _menu.Items.Clear();
-        _menu.Items.Add("Open dashboard", null, (_, _) => { _dash.Render(_snap, _error); _dash.ShowNearTray(); });
+        _menu.Items.Add("Open dashboard", null, (_, _) => ShowDashboard());
         var sw = new ToolStripMenuItem("Switch to");
         var term = new ToolStripMenuItem("Open terminal as");
         foreach (var a in _snap?.Accounts ?? [])
@@ -135,6 +157,7 @@ public sealed class TrayApp : ApplicationContext
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => ExitThread());
+        MenuRenderer.Apply(_menu);
     }
 
     async Task SwitchAsync(Account a)
@@ -267,7 +290,7 @@ public sealed class TrayApp : ApplicationContext
             var cfg = await _engine.ConfigAsync();
             if (double.TryParse(cfg.GetValueOrDefault("autoswitch.threshold"), System.Globalization.CultureInfo.InvariantCulture, out var t))
                 f.Threshold.Value = Math.Clamp((decimal)t, f.Threshold.Minimum, f.Threshold.Maximum);
-            f.Strategy.SelectedItem = cfg.GetValueOrDefault("autoswitch.strategy") ?? "best";
+            f.StrategyValue = cfg.GetValueOrDefault("autoswitch.strategy") ?? "best";
             f.Models.Text = cfg.GetValueOrDefault("autoswitch.model") ?? "";
         }
         catch (Exception e) { Error("Could not read engine settings", e); return; }
@@ -278,7 +301,7 @@ public sealed class TrayApp : ApplicationContext
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             await _engine.CommandAsync("config", "set", "autoswitch.threshold", f.Threshold.Value.ToString(inv));
-            await _engine.CommandAsync("config", "set", "autoswitch.strategy", (string)f.Strategy.SelectedItem!);
+            await _engine.CommandAsync("config", "set", "autoswitch.strategy", f.StrategyValue);
             var models = f.Models.Text.Trim();
             await _engine.CommandAsync(models.Length == 0
                 ? ["config", "unset", "autoswitch.model"]

@@ -3,61 +3,94 @@ namespace Autodock;
 /// Dock preferences plus the engine's autoswitch.* keys (written via `cswap config set`).
 public sealed class SettingsForm : Form
 {
-    public readonly NumericUpDown Threshold = new() { Minimum = 50, Maximum = 99, Value = 90, Width = 70 };
-    public readonly NumericUpDown RefreshInterval = new() { Minimum = DockSettings.MinRefreshSeconds, Maximum = 3600, Increment = 30, Value = 180, Width = 70 };
-    public readonly TextBox Models = new() { Width = 180, PlaceholderText = "e.g. Opus  (blank = none)" };
-    public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
-    public readonly CheckBox Startup = new() { Text = "Start autodock when I sign in to Windows", AutoSize = true };
+    public readonly NumericUpDown Threshold = new() { Minimum = 50, Maximum = 99, Value = 90 };
+    public readonly NumericUpDown RefreshInterval = new() { Minimum = DockSettings.MinRefreshSeconds, Maximum = 3600, Increment = 30, Value = 180 };
+    public readonly TextBox Models = new() { PlaceholderText = "none" };
+    public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    public readonly Toggle Startup = new("");
+
+    readonly Palette _pal = Palette.Current;
+    int _y;
+    readonly int _w = Ui.S(460), _pad = Ui.S(24);
 
     public SettingsForm()
     {
         Text = "autodock settings";
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        Font = new Font("Segoe UI", 9f);
+        Font = Ui.Font(9f);
         Icon = TrayIcons.App;
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(16);
-        Strategy.Items.AddRange(["best", "consume-first"]);
+        Strategy.Items.AddRange(["Most quota left", "Use soonest reset first"]);
         Strategy.SelectedIndex = 0;
+        _y = Ui.S(20);
 
-        var grid = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
-        void Row(string label, Control c, string? hint = null)
-        {
-            grid.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 8, 12, 0) });
-            grid.Controls.Add(c);
-            if (hint != null)
-            {
-                grid.Controls.Add(new Label());
-                grid.Controls.Add(new Label { Text = hint, AutoSize = true, ForeColor = SystemColors.GrayText, MaximumSize = new Size(300, 0) });
-            }
-        }
-        Row("Switch at (% used)", Threshold, "Auto-switch moves off the active account when its 5-hour or weekly window reaches this.");
-        Row("Strategy", Strategy, "best: most quota left.  consume-first: use the soonest-resetting weekly quota first.");
-        Row("Also watch models", Models, "Per-model weekly limits to include (comma-separated, or 'all').");
-        Row("Refresh every (s)", RefreshInterval, "Dashboard/auto-switch tick. The engine still rate-limits real API calls per account.");
-        grid.Controls.Add(Startup);
-        grid.SetColumnSpan(Startup, 2);
+        Section("Auto-switch");
+        Row("Switch at", "When the active account's 5-hour or weekly usage reaches this percentage.", Threshold, Ui.S(80), "%");
+        Row("Pick next account by", "Most quota left, or the account whose weekly quota resets soonest.", Strategy, Ui.S(190));
+        Row("Also watch models", "Per-model weekly limits to include, e.g. Opus. Comma-separated, or 'all'.", Models, Ui.S(190));
+        _y += Ui.S(12);
+        Section("General");
+        Row("Start with Windows", "Launch autodock in the tray when you sign in.", Startup, Ui.S(44));
+        Row("Refresh every", "Seconds between dashboard updates. The engine still spaces out real API calls.", RefreshInterval, Ui.S(80), "s");
 
-        var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, AutoSize = true };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
-        var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Dock = DockStyle.Bottom, Padding = new Padding(0, 12, 0, 0) };
-        buttons.Controls.AddRange([cancel, ok]);
-        AcceptButton = ok;
-        CancelButton = cancel;
-        Controls.Add(grid);
-        Controls.Add(buttons);
-        Controls.Add(new Label
+        _y += Ui.S(8);
+        var about = new Label
         {
             Text = "autodock is an independent open-source project, not affiliated with or endorsed by Anthropic. " +
                    "Built on claude-swap by Onur Cetinkol (MIT).",
-            ForeColor = SystemColors.GrayText,
+            Tag = "muted",
+            Font = Ui.Font(8f),
+            Location = new Point(_pad, _y),
+            MaximumSize = new Size(_w - 2 * _pad, 0),
             AutoSize = true,
-            MaximumSize = new Size(440, 0),
-            Dock = DockStyle.Bottom,
-            Padding = new Padding(0, 10, 0, 0),
-        });
+        };
+        Controls.Add(about);
+        _y += about.PreferredHeight + Ui.S(20);
+
+        var cancel = new Pill("Cancel") { DialogResult = DialogResult.Cancel };
+        var save = new Pill("Save", PillStyle.Primary) { DialogResult = DialogResult.OK, Width = Math.Max(cancel.Width, Ui.S(88)) };
+        cancel.Width = save.Width;
+        save.Location = new Point(_w - _pad - save.Width, _y);
+        cancel.Location = new Point(save.Left - Ui.S(8) - cancel.Width, _y);
+        Controls.AddRange([cancel, save]);
+        AcceptButton = save;
+        CancelButton = cancel;
+        ClientSize = new Size(_w, _y + save.Height + Ui.S(20));
+        Ui.ThemeDialog(this, _pal);
+    }
+
+    void Section(string title)
+    {
+        Controls.Add(new Label { Text = title, Font = Ui.Font(10.5f, semibold: true), AutoSize = true, Location = new Point(_pad, _y) });
+        _y += Ui.S(32);
+    }
+
+    void Row(string label, string hint, Control input, int inputWidth, string? suffix = null)
+    {
+        var textWidth = _w - 2 * _pad - inputWidth - Ui.S(40);
+        Controls.Add(new Label { Text = label, AutoSize = true, Location = new Point(_pad, _y) });
+        var h = new Label { Text = hint, Tag = "muted", Font = Ui.Font(8f), AutoSize = true, MaximumSize = new Size(textWidth, 0), Location = new Point(_pad, _y + Ui.S(20)) };
+        Controls.Add(h);
+        var right = _w - _pad - (suffix != null ? Ui.S(20) : 0);
+        input.Width = inputWidth;
+        input.Location = new Point(right - inputWidth, _y);
+        Controls.Add(input);
+        if (suffix != null)
+            Controls.Add(new Label { Text = suffix, Tag = "muted", AutoSize = true, Location = new Point(right + Ui.S(6), _y + Ui.S(3)) });
+        _y += Math.Max(Ui.S(20) + h.PreferredHeight, input.Height) + Ui.S(16);
+    }
+
+    /// Engine values for the strategy picker.
+    public string StrategyValue
+    {
+        get => Strategy.SelectedIndex == 1 ? "consume-first" : "best";
+        set => Strategy.SelectedIndex = value == "consume-first" ? 1 : 0;
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Ui.ThemeWindow(this, _pal);
     }
 }

@@ -4,7 +4,7 @@ A Windows 11 tray app for people who use several of their own Claude Code accoun
 It shows every account's usage at a glance, switches in one click, opens terminals
 pinned to one account, and can optionally move you to another account before you hit a limit.
 
-<img src="assets/autodock.png" width="390" alt="autodock dashboard: three accounts with 5-hour, weekly and per-model usage bars and reset times">
+<img src="assets/autodock.png" width="376" alt="autodock dashboard: three accounts with 5-hour, weekly and per-model usage bars and reset times">
 
 > autodock is an independent open-source project. It is not affiliated with, endorsed by,
 > or supported by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic.
@@ -35,6 +35,7 @@ To uninstall, untick start-up, exit the app, and delete the folder. Your account
 | Add an account | **+ Add account**. A console runs the official `claude auth login` in a temporary profile. Open the login link in a **private browser window** so you don't approve the account you're already signed in with. If a code is shown, paste it into the console (nothing appears while you paste) and press Enter. Your current login and running sessions are not touched. On first use, the login already on this PC is added too. |
 | See usage | Left-click the tray icon. Each account shows its 5-hour, weekly and per-model windows with reset times. The tray dot shows the active account's highest window: green below 70 %, amber below 90 %, red above. A white centre means auto-switch is on. |
 | Switch | **Switch** on a card, or right-click the tray → *Switch to*. |
+| Keep it on screen | Click the pin icon in the header. The dashboard stays open as a movable window (drag it by the header) and reopens there after a restart. Click it again to go back to a tray flyout. |
 | Pinned terminal | **Terminal** opens a console running Claude Code as that account in its own profile. Switches never affect it. *••• → Pin a folder* binds a folder to an account. |
 | Auto-switch | Tick *Auto-switch near limit* (off by default). Threshold, strategy and per-model limits are in Settings. |
 | Exclude an account | *••• → Exclude from auto-switch*. |

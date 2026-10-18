@@ -10,6 +10,9 @@ public sealed class DockSettings
     public bool AutoSwitch { get; set; }
     public bool AutoSwitchPolicyAccepted { get; set; }
     public int RefreshSeconds { get; set; } = 180;
+    public bool Pinned { get; set; }
+    public int? PinnedX { get; set; }
+    public int? PinnedY { get; set; }
 
     public const int MinRefreshSeconds = 60;
 

@@ -1,128 +1,144 @@
 namespace Autodock;
 
-public sealed class AccountCard : Panel
+/// One account: identity row, usage meters, actions. Laid out top-down by hand.
+public sealed class AccountCard : Surface
 {
     public event Action<Account>? SwitchClicked;
     public event Action<Account>? TerminalClicked;
     public event Action<Account, string>? MenuAction;
 
+    public const int BaseWidth = 344;
+
     public AccountCard(Account a, Palette pal, DateTimeOffset now)
     {
-        BackColor = pal.Card;
-        Padding = new Padding(14, 10, 14, 10);
-        Margin = new Padding(0, 0, 0, 8);
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        Fill = pal.Card;
+        Outline = a.Active ? pal.Accent : null;
+        BackColor = pal.Back;
+        Width = Ui.S(BaseWidth);
+        Margin = new Padding(0, 0, 0, Ui.S(8));
+        int pad = Ui.S(16), inner = Width - 2 * pad, y = Ui.S(14);
 
-        var stack = new FlowLayoutPanel
-        {
-            FlowDirection = FlowDirection.TopDown,
-            WrapContents = false,
-            AutoSize = true,
-            Dock = DockStyle.Fill,
-            BackColor = pal.Card,
-        };
-        Controls.Add(stack);
-        const int W = 330;
-
-        var header = new Panel { Width = W, Height = 22, BackColor = pal.Card, Margin = Padding.Empty };
-        var name = new Label
-        {
-            Text = $"#{a.Number}  {a.DisplayName}",
-            AutoEllipsis = true,
-            Font = new Font("Segoe UI Semibold", 10f),
-            ForeColor = pal.Text,
-            Location = new Point(0, 0),
-            Size = new Size(W - 78, 22),
-        };
-        header.Controls.Add(name);
-        var badgeText = a.Active ? "ACTIVE" : a.Disabled ? "EXCLUDED" : "";
-        if (badgeText.Length > 0)
-        {
-            header.Controls.Add(new Label
-            {
-                Text = badgeText,
-                Font = new Font("Segoe UI Semibold", 7.5f),
-                ForeColor = a.Active ? Color.White : pal.Muted,
-                BackColor = a.Active ? pal.Accent : pal.Track,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Size = new Size(64, 18),
-                Location = new Point(W - 64, 2),
-            });
-        }
-        stack.Controls.Add(header);
+        var hasAlias = !string.IsNullOrEmpty(a.Alias);
+        var avatar = new Avatar(hasAlias ? a.Alias! : a.Email, a.Email) { Location = new Point(pad, y) };
+        Controls.Add(avatar);
+        int tx = pad + avatar.Width + Ui.S(12);
+        var badgeW = a.Active || a.Disabled ? Ui.S(72) : 0;
+        Controls.Add(MakeLabel(hasAlias ? a.Alias! : a.Email, Ui.Font(10.5f, semibold: true), pal.Text, tx, y - Ui.S(1), inner - (tx - pad) - badgeW));
+        Controls.Add(MakeLabel(hasAlias ? a.Email : $"Account {a.Number}", Ui.Font(8.5f), pal.Muted, tx, y + Ui.S(19), inner - (tx - pad) - badgeW));
+        if (badgeW > 0)
+            Controls.Add(new Badge(a.Active ? "Active" : "Excluded", a.Active ? pal.Accent : pal.Muted)
+            { Location = new Point(Width - pad - Ui.S(68), y + Ui.S(8)), Size = new Size(Ui.S(68), Ui.S(20)) });
+        y += avatar.Height + Ui.S(12);
 
         var notes = new List<string>();
-        if (a.StatusNote is { } sn) notes.Add(sn);
+        if (a.StatusNote is { } sn) notes.Add(char.ToUpper(sn[0]) + sn[1..]);
         if (a.Usage == null && a.LastGoodUsage != null) notes.Add("showing last known usage");
         if (a.LoginExpiresAt is { } exp && exp - now < TimeSpan.FromDays(5))
-            notes.Add($"login expires {Format.When(exp, now)} — re-enroll soon");
+            notes.Add($"login expires {Format.When(exp, now)}, re-enroll soon");
         if (notes.Count > 0)
-            stack.Controls.Add(new Label
+        {
+            var note = new Label
             {
                 Text = string.Join(" · ", notes),
+                Font = Ui.Font(8.5f),
                 ForeColor = pal.Muted,
-                Font = new Font("Segoe UI", 8.25f),
+                BackColor = pal.Card,
+                Location = new Point(pad, y),
+                MaximumSize = new Size(inner, 0),
                 AutoSize = true,
-                MaximumSize = new Size(W, 0),
-                Margin = new Padding(0, 2, 0, 2),
-            });
+            };
+            Controls.Add(note);
+            y += note.PreferredHeight + Ui.S(8);
+        }
 
         var u = a.ShownUsage;
         var stale = a.Usage == null;
-        if (u?.FiveHour is { } fh) stack.Controls.Add(Bar("5-hour", fh, stale, now, W));
-        if (u?.SevenDay is { } sd) stack.Controls.Add(Bar("Weekly", sd, stale, now, W));
-        foreach (var m in u?.Scoped ?? []) stack.Controls.Add(Bar($"{m.Name} weekly", m, stale, now, W));
-        if (u?.Spend is { } sp)
-            stack.Controls.Add(Bar("Extra usage", new Window(sp.Pct, sp.ResetsAt), stale, now, W,
-                $"{sp.Used:0.00}/{sp.Limit:0.00} {sp.Currency}"));
+        void AddBar(string label, Window w, string? extra = null)
+        {
+            var detail = w.ResetsAt is { } r ? "resets " + Format.When(r, now) : "";
+            if (w.AheadOfPace == true) detail = "ahead of pace · " + detail;
+            if (extra != null) detail = extra + (detail.Length > 0 ? " · " + detail : "");
+            Controls.Add(new UsageBar { Label = label, Pct = w.Pct, Detail = detail, Stale = stale, BackColor = pal.Card, Location = new Point(pad, y), Width = inner });
+            y += Ui.S(38);
+        }
+        if (u?.FiveHour is { } fh) AddBar("5-hour", fh);
+        if (u?.SevenDay is { } sd) AddBar("Weekly", sd);
+        foreach (var m in u?.Scoped ?? []) AddBar($"{m.Name} weekly", m);
+        if (u?.Spend is { } sp) AddBar("Extra usage", new Window(sp.Pct, sp.ResetsAt), $"{sp.Used:0.00} / {sp.Limit:0.00} {sp.Currency}");
+        if (u == null && notes.Count == 0)
+        {
+            Controls.Add(MakeLabel("No usage reading yet", Ui.Font(8.5f), pal.Muted, pad, y, inner));
+            y += Ui.S(24);
+        }
 
-        var buttons = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 6, 0, 0), BackColor = pal.Card, WrapContents = false };
-        var sw = MakeButton(a.Active ? "Active" : "Switch", pal, primary: !a.Active);
-        sw.Enabled = !a.Active;
-        sw.Click += (_, _) => SwitchClicked?.Invoke(a);
-        var term = MakeButton("Terminal", pal);
+        y += Ui.S(4);
+        var more = new Pill("", PillStyle.Icon, Ui.More) { Location = new Point(Width - pad - Ui.S(32), y) };
+        var term = new Pill("", PillStyle.Icon, Ui.Terminal) { Location = new Point(more.Left - Ui.S(36), y) };
+        var tips = new ToolTip();
+        tips.SetToolTip(term, "Open Claude Code as this account (pinned terminal)");
+        tips.SetToolTip(more, "More");
         term.Click += (_, _) => TerminalClicked?.Invoke(a);
-        var more = MakeButton("•••", pal);
-        more.Width = 44;
+        Controls.AddRange([term, more]);
+        if (!a.Active)
+        {
+            var sw = new Pill("Switch", PillStyle.Primary) { Location = new Point(pad, y) };
+            sw.Click += (_, _) => SwitchClicked?.Invoke(a);
+            Controls.Add(sw);
+        }
+        else
+        {
+            Controls.Add(MakeLabel("In use by Claude Code", Ui.Font(8.5f), pal.Muted, pad, y + Ui.S(8), inner - Ui.S(80)));
+        }
+
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open terminal in folder…", null, (_, _) => MenuAction?.Invoke(a, "terminal-folder"));
         menu.Items.Add("Pin a folder to this account…", null, (_, _) => MenuAction?.Invoke(a, "map"));
         menu.Items.Add(a.Disabled ? "Include in auto-switch" : "Exclude from auto-switch", null,
             (_, _) => MenuAction?.Invoke(a, a.Disabled ? "enable" : "disable"));
-        menu.Items.Add("Set alias…", null, (_, _) => MenuAction?.Invoke(a, "alias"));
-        menu.Items.Add("Re-enroll (log in again)…", null, (_, _) => MenuAction?.Invoke(a, "reenroll"));
+        menu.Items.Add("Rename…", null, (_, _) => MenuAction?.Invoke(a, "alias"));
+        menu.Items.Add("Log in again…", null, (_, _) => MenuAction?.Invoke(a, "reenroll"));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Remove account…", null, (_, _) => MenuAction?.Invoke(a, "remove"));
-        more.Click += (_, _) => menu.Show(more, new Point(0, more.Height));
-        buttons.Controls.AddRange([sw, term, more]);
-        stack.Controls.Add(buttons);
+        menu.Items.Add("Remove…", null, (_, _) => MenuAction?.Invoke(a, "remove"));
+        MenuRenderer.Apply(menu);
+        more.Click += (_, _) => menu.Show(more, new Point(0, more.Height + Ui.S(2)));
+
+        Height = y + Ui.S(32) + Ui.S(14);
     }
 
-    static UsageBar Bar(string label, Window w, bool stale, DateTimeOffset now, int width, string? extra = null)
+    Label MakeLabel(string text, Font font, Color color, int x, int y, int width) => new()
     {
-        var reset = w.ResetsAt is { } r ? "resets " + Format.When(r, now) : "";
-        if (w.AheadOfPace == true) reset = "ahead of pace · " + reset;
-        if (extra != null) reset = extra + (reset.Length > 0 ? " · " + reset : "");
-        return new UsageBar { Label = label, Pct = w.Pct, Detail = reset, Stale = stale, Width = width, Margin = new Padding(0, 4, 0, 0) };
-    }
+        Text = text,
+        Font = font,
+        ForeColor = color,
+        BackColor = Fill,
+        AutoEllipsis = true,
+        Location = new Point(x, y),
+        Size = new Size(width, font.Height + Ui.S(2)),
+    };
 
-    static Button MakeButton(string text, Palette pal, bool primary = false)
+    sealed class Badge : Control
     {
-        var b = new Button
+        readonly Color _color;
+
+        public Badge(string text, Color color)
         {
-            Text = text,
-            FlatStyle = FlatStyle.Flat,
-            Height = 28,
-            Width = 86,
-            Font = new Font("Segoe UI", 9f),
-            BackColor = primary ? pal.Accent : pal.Track,
-            ForeColor = primary ? Color.White : pal.Text,
-            Margin = new Padding(0, 0, 6, 0),
-            Cursor = Cursors.Hand,
-        };
-        b.FlatAppearance.BorderSize = 0;
-        return b;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            Text = text;
+            _color = color;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Palette.Current.Card);
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = Ui.Round(new RectangleF(0.5f, 0.5f, Width - 1, Height - 1), Height / 2f);
+            using var bg = new SolidBrush(Color.FromArgb(40, _color));
+            g.FillPath(bg, path);
+            using var f = Ui.Font(8f, semibold: true);
+            TextRenderer.DrawText(g, Text, f, ClientRectangle, _color,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
     }
 }
 

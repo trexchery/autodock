@@ -2,20 +2,24 @@ using System.Runtime.InteropServices;
 
 namespace Autodock;
 
-/// Flyout anchored above the tray: every account, its windows, and actions.
+/// Tray flyout. Pinned, it becomes a movable window that stays on the desktop.
 public sealed class DashboardForm : Form
 {
     readonly FlowLayoutPanel _list;
-    readonly Label _status;
-    readonly CheckBox _auto;
+    readonly Label _status, _subtitle;
+    readonly Toggle _auto;
     readonly Panel _header, _footer;
+    readonly Pill _pin, _close;
     bool _syncing;
+    int _accounts;
+
+    public bool Pinned { get; private set; }
 
     public event Action<Account>? SwitchRequested;
     public event Action<Account>? TerminalRequested;
     public event Action<Account, string>? AccountAction;
-    public event Action? RefreshRequested, SettingsRequested, AddRequested;
-    public event Action<bool>? AutoToggled;
+    public event Action? RefreshRequested, SettingsRequested, AddRequested, Moved;
+    public event Action<bool>? AutoToggled, PinToggled;
 
     public DashboardForm()
     {
@@ -25,19 +29,25 @@ public sealed class DashboardForm : Form
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
         KeyPreview = true;
-        Width = 390;
-        Font = new Font("Segoe UI", 9f);
+        DoubleBuffered = true;
+        Width = Ui.S(AccountCard.BaseWidth + 32);
         Icon = TrayIcons.App;
+        Padding = new Padding(1);
 
-        _header = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(16, 0, 10, 0) };
-        var title = new Label { Text = "autodock", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(16, 13) };
-        var settings = IconButton("⚙", "Settings");
+        _header = new Panel { Dock = DockStyle.Top, Height = Ui.S(64) };
+        var title = new Label { Text = "autodock", Font = Ui.Display(13f), AutoSize = true, Location = new Point(Ui.S(16), Ui.S(12)) };
+        _subtitle = new Label { Font = Ui.Font(8.5f), AutoSize = true, Location = new Point(Ui.S(17), Ui.S(38)) };
+        var settings = HeaderIcon(Ui.Settings, "Settings", 0);
+        var refresh = HeaderIcon(Ui.Refresh, "Refresh now", 1);
+        _pin = HeaderIcon(Ui.Pin, "Pin to desktop", 2);
+        _close = HeaderIcon(Ui.Close, "Hide", 3);
+        _close.Visible = false;
         settings.Click += (_, _) => SettingsRequested?.Invoke();
-        var refresh = IconButton("⟳", "Refresh now");
         refresh.Click += (_, _) => RefreshRequested?.Invoke();
-        settings.Location = new Point(Width - 46, 9);
-        refresh.Location = new Point(Width - 84, 9);
-        _header.Controls.AddRange([title, refresh, settings]);
+        _pin.Click += (_, _) => { SetPinned(!Pinned); PinToggled?.Invoke(Pinned); };
+        _close.Click += (_, _) => Hide();
+        _header.Controls.AddRange([title, _subtitle, settings, refresh, _pin, _close]);
+        foreach (var c in new Control[] { _header, title, _subtitle }) c.MouseDown += DragWindow;
 
         _list = new FlowLayoutPanel
         {
@@ -45,49 +55,68 @@ public sealed class DashboardForm : Form
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             AutoScroll = true,
-            Padding = new Padding(12, 0, 0, 4),
+            Padding = new Padding(Ui.S(16), Ui.S(2), 0, Ui.S(8)),
         };
 
-        _footer = new Panel { Dock = DockStyle.Bottom, Height = 62, Padding = new Padding(16, 6, 16, 6) };
-        _auto = new CheckBox { Text = "Auto-switch near limit", AutoSize = true, Location = new Point(16, 8) };
+        _footer = new Panel { Dock = DockStyle.Bottom, Height = Ui.S(76) };
+        _footer.Paint += (_, e) =>
+        {
+            using var pen = new Pen(Palette.Current.Border);
+            e.Graphics.DrawLine(pen, 0, 0, _footer.Width, 0);
+        };
+        _auto = new Toggle("Auto-switch near limit") { Location = new Point(Ui.S(16), Ui.S(14)) };
         _auto.CheckedChanged += (_, _) => { if (!_syncing) AutoToggled?.Invoke(_auto.Checked); };
-        var add = new Button { Text = "+ Add account", FlatStyle = FlatStyle.Flat, Size = new Size(116, 28), Location = new Point(Width - 132, 5), Cursor = Cursors.Hand };
-        add.FlatAppearance.BorderSize = 0;
+        var add = new Pill("Add account", PillStyle.Subtle, Ui.Add);
+        add.Location = new Point(Width - Ui.S(16) - add.Width - 2, Ui.S(10));
         add.Click += (_, _) => AddRequested?.Invoke();
-        _status = new Label { AutoSize = false, Size = new Size(Width - 32, 18), Location = new Point(16, 38), Font = new Font("Segoe UI", 8f), AutoEllipsis = true };
+        _status = new Label { AutoSize = false, Size = new Size(Width - Ui.S(32), Ui.S(18)), Location = new Point(Ui.S(16), Ui.S(50)), Font = Ui.Font(8f), AutoEllipsis = true };
         _footer.Controls.AddRange([_auto, add, _status]);
 
         Controls.Add(_list);
         Controls.Add(_header);
         Controls.Add(_footer);
         ApplyTheme();
-        Deactivate += (_, _) => Hide();
+        Deactivate += (_, _) => { if (!Pinned) Hide(); };
         KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) Hide(); };
+        ResizeEnd += (_, _) => { if (Pinned) Moved?.Invoke(); };
     }
 
-    Button IconButton(string glyph, string tip)
+    Pill HeaderIcon(string glyph, string tip, int slot)
     {
-        var b = new Button { Text = glyph, FlatStyle = FlatStyle.Flat, Size = new Size(34, 30), Font = new Font("Segoe UI Symbol", 11f), Cursor = Cursors.Hand, TabStop = false };
-        b.FlatAppearance.BorderSize = 0;
+        var b = new Pill("", PillStyle.Icon, glyph) { TabStop = false };
+        b.Location = new Point(Width - Ui.S(12) - (slot + 1) * Ui.S(34), Ui.S(16));
         new ToolTip().SetToolTip(b, tip);
         return b;
+    }
+
+    void DragWindow(object? sender, MouseEventArgs e)
+    {
+        if (!Pinned || e.Button != MouseButtons.Left) return;
+        ReleaseCapture();
+        SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, 2 /* HTCAPTION */, 0);
+        Moved?.Invoke();
+    }
+
+    public void SetPinned(bool pinned)
+    {
+        Pinned = pinned;
+        TopMost = !pinned; // a pinned window behaves like a normal desktop window
+        _pin.Glyph = pinned ? Ui.Unpin : Ui.Pin;
+        new ToolTip().SetToolTip(_pin, pinned ? "Unpin" : "Pin to desktop");
+        _close.Visible = pinned;
+        _pin.Invalidate();
+        _header.Cursor = pinned ? Cursors.SizeAll : Cursors.Default;
     }
 
     void ApplyTheme()
     {
         var pal = Palette.Current;
-        BackColor = _list.BackColor = pal.Back;
-        foreach (Control c in new Control[] { _header, _footer })
-        {
-            c.BackColor = pal.Back;
-            foreach (Control child in c.Controls)
-            {
-                child.ForeColor = pal.Text;
-                if (child is Button b) b.BackColor = b.Text.StartsWith('+') ? pal.Accent : pal.Back;
-                if (child is Button { Text: ['+', ..] } addBtn) addBtn.ForeColor = Color.White;
-            }
-        }
-        _status.ForeColor = pal.Muted;
+        BackColor = _list.BackColor = _header.BackColor = _footer.BackColor = pal.Back;
+        foreach (Control c in _header.Controls) c.ForeColor = pal.Text;
+        _subtitle.ForeColor = _status.ForeColor = pal.Muted;
+        _auto.ForeColor = pal.Text;
+        if (IsHandleCreated) Ui.ThemeWindow(_list, pal);
+        Invalidate(true);
     }
 
     public void SetStatus(string text) => _status.Text = text;
@@ -97,28 +126,24 @@ public sealed class DashboardForm : Form
         _syncing = true;
         _auto.Checked = on;
         _syncing = false;
+        UpdateSubtitle();
     }
+
+    void UpdateSubtitle() =>
+        _subtitle.Text = (_accounts == 1 ? "1 account" : $"{_accounts} accounts") + (_auto.Checked ? " · auto-switch on" : "");
 
     public void Render(Snapshot? snap, string? error)
     {
         var pal = Palette.Current;
         ApplyTheme();
+        _accounts = snap?.Accounts.Count ?? 0;
+        UpdateSubtitle();
         _list.SuspendLayout();
         foreach (Control c in _list.Controls) c.Dispose();
         _list.Controls.Clear();
-        if (snap == null || snap.Accounts.Count == 0)
-        {
-            _list.Controls.Add(new Label
-            {
-                Text = error ?? "No accounts yet.\n\nClick “+ Add account” to sign in with Claude Code. " +
-                       "Your current login is added too, so nothing is lost.",
-                ForeColor = pal.Muted,
-                AutoSize = true,
-                MaximumSize = new Size(340, 0),
-                Margin = new Padding(4, 16, 0, 16),
-            });
-        }
-        else
+        if (error != null)
+            _list.Controls.Add(Message("Couldn't refresh: " + error, pal.Muted));
+        if (snap is { Accounts.Count: > 0 })
         {
             var now = DateTimeOffset.Now;
             foreach (var a in snap.Accounts.OrderByDescending(a => a.Active).ThenBy(a => a.Number))
@@ -130,32 +155,69 @@ public sealed class DashboardForm : Form
                 _list.Controls.Add(card);
             }
         }
+        else if (snap == null && error == null)
+            _list.Controls.Add(Message("Loading accounts…", pal.Muted));
+        else if (error == null)
+        {
+            _list.Controls.Add(Message("No accounts yet. Add the account you use with Claude Code; " +
+                                       "the login already on this PC is kept too.", pal.Muted));
+            var add = new Pill("Add account", PillStyle.Primary, Ui.Add) { Margin = new Padding(0, Ui.S(4), 0, Ui.S(16)) };
+            add.Click += (_, _) => AddRequested?.Invoke();
+            _list.Controls.Add(add);
+        }
         _list.ResumeLayout();
-        Resize();
+        FitHeight();
     }
 
-    new void Resize()
+    Label Message(string text, Color color) => new()
     {
-        var content = _list.Controls.Cast<Control>().Sum(c => c.PreferredSize.Height + c.Margin.Vertical) + _list.Padding.Vertical;
-        var screen = Screen.FromPoint(Cursor.Position).WorkingArea;
-        Height = Math.Min(_header.Height + _footer.Height + content + 4, (int)(screen.Height * 0.85));
+        Text = text,
+        ForeColor = color,
+        Font = Ui.Font(9f),
+        AutoSize = true,
+        MaximumSize = new Size(Ui.S(AccountCard.BaseWidth), 0),
+        Margin = new Padding(0, Ui.S(8), 0, Ui.S(12)),
+    };
+
+    void FitHeight()
+    {
+        var content = _list.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical) + _list.Padding.Vertical;
+        var screen = Screen.FromPoint(Pinned ? Location : Cursor.Position).WorkingArea;
+        Height = Math.Min(_header.Height + _footer.Height + content + Padding.Vertical, (int)(screen.Height * 0.85));
     }
 
     public void ShowNearTray()
     {
-        Resize();
+        FitHeight();
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
-        Location = new Point(wa.Right - Width - 12, wa.Bottom - Height - 12);
+        Location = new Point(wa.Right - Width - Ui.S(12), wa.Bottom - Height - Ui.S(12));
         Show();
         Activate();
+    }
+
+    /// Shows the pinned window at a saved spot, pulled back on-screen if a monitor went away.
+    public void ShowPinnedAt(int? x, int? y)
+    {
+        FitHeight();
+        var wa = Screen.FromPoint(new Point(x ?? 0, y ?? 0)).WorkingArea;
+        var px = Math.Clamp(x ?? wa.Right - Width - Ui.S(12), wa.Left, Math.Max(wa.Left, wa.Right - Width));
+        var py = Math.Clamp(y ?? wa.Top + Ui.S(12), wa.Top, Math.Max(wa.Top, wa.Bottom - Height));
+        Location = new Point(px, py);
+        Show();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using var pen = new Pen(Palette.Current.Border);
+        e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
     }
 
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        // Windows 11 rounded corners + dark title-less frame; harmless no-op on Windows 10.
-        int round = 2;
-        _ = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+        Ui.RoundCorners(Handle);
+        Ui.ThemeWindow(_list, Palette.Current);
     }
 
     protected override CreateParams CreateParams
@@ -168,6 +230,6 @@ public sealed class DashboardForm : Form
         }
     }
 
-    [DllImport("dwmapi.dll")]
-    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
 }
