@@ -410,4 +410,43 @@ public class RenderTests
         t.Join();
         if (failure != null) throw failure;
     }
+
+    /// Regression: a refresh re-renders (disposing every row) while a row's menu is open.
+    /// Clicking an item then closed the menu through the disposed row, which threw before the click ran.
+    [Fact]
+    public void MenuOfDisposedRowStillClicksAndIsDisposed()
+    {
+        var snap = new Snapshot(1, 1,
+        [
+            new Account(1, "a@example.com", true, "ok", null),
+            new Account(2, "b@example.com", false, "ok", null),
+        ]);
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm { Location = new Point(-10000, -10000) };
+                Account? opened = null;
+                form.TerminalRequested += a => opened = a;
+                form.Render(snap, null);
+                form.Show();
+                Application.DoEvents();
+                var rows = FindRows(form).ToList();
+                var menu = rows[0].ShowMenu(Point.Empty);
+                form.Render(snap, null);
+                Assert.All(rows, r => Assert.True(r.IsDisposed));
+
+                menu.Items.Cast<ToolStripItem>().First(i => i.Text == "Open terminal").PerformClick();
+                Application.DoEvents();
+                Assert.Equal(1, opened?.Number); // still reaches the dashboard's handler
+                Assert.True(menu.IsDisposed);
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        if (failure != null) throw failure;
+    }
 }

@@ -102,7 +102,7 @@ public static class ClaudeCli
         try
         {
             var psi = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
-                ? new ProcessStartInfo("cmd.exe") { ArgumentList = { "/c", exe } }
+                ? new ProcessStartInfo(Engine.Cmd) { ArgumentList = { "/c", exe } }
                 : new ProcessStartInfo(exe);
             foreach (var a in args) psi.ArgumentList.Add(a);
             psi.UseShellExecute = false;

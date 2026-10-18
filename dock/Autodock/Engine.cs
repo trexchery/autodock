@@ -34,6 +34,9 @@ public sealed partial class Engine(string exe)
             .Select(d => Path.Combine(d.Trim('"'), file))
             .FirstOrDefault(File.Exists);
 
+    /// Absolute, so cmd is never resolved through the current directory or PATH.
+    internal static string Cmd => Path.Combine(Environment.SystemDirectory, "cmd.exe");
+
     public async Task<EngineResult> RunAsync(IEnumerable<string> args, TimeSpan? timeout = null, string? input = null, CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct);
@@ -153,13 +156,13 @@ public sealed partial class Engine(string exe)
         var wt = FindOnPath("wt.exe");
         var psi = wt != null
             ? new ProcessStartInfo(wt) { UseShellExecute = false }
-            : new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = false };
+            : new ProcessStartInfo(Cmd) { UseShellExecute = false, CreateNoWindow = false };
         if (wt != null)
         {
             // One argv item per token: wt re-joins them for cmd.exe, quoting only
             // what needs it. wt may hand the tab to an already-running Terminal process, which
             // ignores our WorkingDirectory: pass it explicitly.
-            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", "cmd.exe", "/k", Exe }.Concat(args))
+            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", Cmd, "/k", Exe }.Concat(args))
                 psi.ArgumentList.Add(a.Replace(";", "\\;")); // wt splits subcommands on a bare ';'
         }
         else
