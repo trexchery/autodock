@@ -210,8 +210,11 @@ public sealed class TrayApp : ApplicationContext
     {
         if (MessageBox.Show(
                 (existing == null ? "Add a Claude account.\n\n" : $"Log in again as {existing.Email}.\n\n") +
-                "A console opens with the official Claude Code login (`claude auth login`). Sign in with the " +
-                "account in your browser; the console closes when done.\n\n" +
+                "A console opens with the official Claude Code login (`claude auth login`).\n\n" +
+                "1. Open the login link in a private browser window, so you don't approve the account you're already signed in with.\n" +
+                "2. Sign in and authorize.\n" +
+                "3. If a code is shown, paste it into the console and press Enter. Nothing appears while you paste; that is normal.\n\n" +
+                "The console closes when done. Your password is only ever entered in the browser, never in the console.\n\n" +
                 "This uses a separate, temporary profile: your current login and running sessions are not affected.",
                 "Claude Dock", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
         try
