@@ -25,7 +25,7 @@ active login without stopping anything that is running. Everything stays on your
 ## Quickstart
 
 1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and check that `claude` runs in a terminal.
-2. Download `autodock-win-x64.zip` from [Releases](../../releases) and unzip it to, for example, `%LOCALAPPDATA%\Programs\autodock`.
+2. Download `autodock-win-x64.zip` from [Releases](../../releases) and unzip it into a folder you keep, for example `%LOCALAPPDATA%\Programs` (it creates `autodock\`).
 3. Run `autodock.exe`.
 
 The icon appears in the tray and your current login is added automatically. No admin rights or .NET

@@ -33,7 +33,8 @@ jobs:
         run: |
           $zip = 'dist/autodock-win-x64.zip'
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  autodock-win-x64.zip" | Set-Content dist/autodock-win-x64.zip.sha256
+          # LF line ending so `sha256sum -c` works on Linux/macOS too
+          [IO.File]::WriteAllText("$PWD/dist/autodock-win-x64.zip.sha256", "$hash  autodock-win-x64.zip`n")
           gh release create $env:GITHUB_REF_NAME $zip dist/autodock-win-x64.zip.sha256 `
             --title "autodock $env:GITHUB_REF_NAME" `
             --notes "Portable build. Unzip and run autodock.exe. SHA-256: $hash"
