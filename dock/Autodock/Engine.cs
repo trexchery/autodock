@@ -22,11 +22,10 @@ public sealed partial class Engine(string exe)
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
         var bundled = Path.Combine(AppContext.BaseDirectory, "engine", "cswap.exe");
         if (File.Exists(bundled)) return new Engine(bundled);
-        var onPath = FindOnPath("cswap.exe");
-        if (onPath != null) return new Engine(onPath);
+        // No PATH fallback: an upstream claude-swap there lacks DPAPI sealing and providers.
         throw new EngineException(
-            "Engine not found. Expected engine\\cswap.exe next to autodock.exe " +
-            "(or set AUTODOCK_ENGINE).");
+            "Engine not found. Expected engine\\cswap.exe next to autodock.exe; " +
+            "reinstall autodock (developers: set AUTODOCK_ENGINE).");
     }
 
     internal static string? FindOnPath(string file) =>
@@ -181,7 +180,19 @@ public sealed partial class Engine(string exe)
 
     // Defense in depth: the engine never prints tokens, but anything we surface
     // (balloons, dialogs, the dock log) goes through this first.
-    [GeneratedRegex(@"sk-ant-[A-Za-z0-9_\-]{6,}|(?i:bearer)\s+[A-Za-z0-9._\-]{12,}|(?i:""(access|refresh)_?token""\s*:\s*""[^""]*"")")]
+    [GeneratedRegex(@"sk-ant-[A-Za-z0-9_\-]{6,}"
+        + @"|(?i:bearer)\s+[A-Za-z0-9._\-]{12,}"
+        + @"|(?i:""(access|refresh|id)_?token""\s*:\s*""[^""]*"")"
+        + @"|(?i:(access|refresh|id)_?token[""']?\s*[=:]\s*(?:""[^""]*""|'[^']*'|[^\s""',;]+))"
+        + @"|(?i:(api_?key|secret|password)\w*[""']?\s*[=:]\s*(?:""[^""]*""|'[^']*'|[^\s""',;]+))"
+        + @"|\b(sk|xai)-[A-Za-z0-9_\-]{16,}"
+        + @"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"
+        + @"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"
+        + @"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+        + @"|xox[abprs]-[A-Za-z0-9-]{10,}"
+        + @"|AIza[0-9A-Za-z_\-]{30,}"
+        + @"|\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"
+        + @"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)")]
     private static partial Regex SecretPattern();
 
     public static string Redact(string s) => SecretPattern().Replace(s, "[redacted]");

@@ -725,8 +725,14 @@ class SessionManager:
         # valid, and claude refreshes on its own at runtime. Setup-token
         # accounts (--add-token) have no refresh token by design — skip
         # silently instead of warning about a flow that can't happen.
+        # Never under a live claude: the profile may still hold the grant this
+        # would spend, and the locked checks below refuse to hand it G+1.
         pre_creds = self.switcher.read_account_credentials(account_num, email)
-        if pre_creds and self._has_refresh_token(pre_creds):
+        if (
+            pre_creds
+            and self._has_refresh_token(pre_creds)
+            and profile_is_quiescent(session_dir)
+        ):
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
@@ -818,6 +824,14 @@ class SessionManager:
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
+            # Unverifiable ("unreachable") or drifted is still a running
+            # claude's live login: never re-seed or delete it from under it.
+            if not profile_is_quiescent(session_dir):
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) is in "
+                    f"use by a running Claude Code session and could not be "
+                    f"verified. Retry after that session exits."
+                )
             self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
@@ -846,7 +860,9 @@ class SessionManager:
                     f"`claude` is on PATH, then retry."
                 )
             if verdict != "valid":
-                self._cleanup_failed_session(session_dir)
+                # A peer's fast-path launch may have joined since the seed.
+                if profile_is_quiescent(session_dir):
+                    self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "

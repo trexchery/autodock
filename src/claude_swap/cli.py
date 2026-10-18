@@ -1005,6 +1005,9 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    if sys.platform == "win32":
+        # shutil.which must not pick up a claude/codex/grok planted in the cwd.
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]

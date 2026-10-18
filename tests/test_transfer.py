@@ -660,6 +660,8 @@ class TestPipeMode:
         assert env["accounts"][0]["email"] == "alice@example.com"
         # Summary suppressed in stdout mode (no "Exported" line on stderr either)
         assert "Exported" not in captured.err
+        # ...but the plaintext-token warning always goes to stderr.
+        assert "plain text" in captured.err
 
     def test_import_from_stdin(self, temp_home: Path):
         # Build an envelope and feed it through stdin

@@ -795,6 +795,16 @@ class TestRunCommand:
                 cli.main()
         assert excinfo.value.code == 2
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows exe search order")
+    def test_main_disables_cwd_exe_search(self, monkeypatch, capsys):
+        # setenv first so teardown removes the value main() sets.
+        monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "")
+        monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath")
+        with patch.object(sys, "argv", ["claude-swap", "run", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert os.environ["NoDefaultCurrentDirectoryInExePath"] == "1"
+
     def test_run_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "--help"]):
             with pytest.raises(SystemExit) as excinfo:

@@ -33,6 +33,7 @@ from claude_swap.exceptions import (
     CredentialWriteError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -1151,6 +1152,39 @@ class CredentialStore:
                 pass
             raise
 
+    def _reseal_legacy(self, target: Path, encoded: str, decoded: str) -> None:
+        """Best-effort: rewrite a legacy plain-base64 file DPAPI-sealed (Windows).
+
+        Runs only if the store lock is free right now, which excludes every
+        writer that holds it (refresh/consume, switch). A caller already holding
+        it (FileLock is non-reentrant) skips; the next unlocked read or any write
+        seals it. Never raises and never changes what the caller read.
+
+        ponytail: NOT excluded: add_account, add_account_from_token,
+        import_accounts and remove_account write/delete the .enc without the
+        store lock. If one lands between the re-read below and the replace,
+        this can roll that write back to the legacy generation or resurrect a
+        just-removed file. Accepted: a few-ms window, at most once per legacy
+        file. Close it by taking the store lock in those writers.
+        """
+        if sys.platform != "win32" or encoded.startswith(dpapi.PREFIX):
+            return
+        lock_file = getattr(self._host, "lock_file", None)
+        if lock_file is None:
+            return
+        lock = FileLock(lock_file)
+        try:
+            if not lock.acquire(timeout=0):
+                return
+            try:
+                # Unchanged since our unlocked read → sealing it loses nothing.
+                if target.read_text(encoding="utf-8").strip() == encoded:
+                    self._atomic_b64_write(target, decoded)
+            finally:
+                lock.release()
+        except Exception as e:
+            self._host._logger.debug(f"Could not re-seal legacy credential file: {e}")
+
     def _reconcile_enc_after_keychain_write(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -1234,6 +1268,7 @@ class CredentialStore:
                     self._host._logger.warning(f"Failed to read credentials file: {e}")
                 else:
                     if decoded:
+                        self._reseal_legacy(enc_file, encoded, decoded)
                         return decoded
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
         if self._host.platform == Platform.MACOS:

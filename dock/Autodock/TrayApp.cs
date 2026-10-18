@@ -56,6 +56,7 @@ public sealed class TrayApp : ApplicationContext
             try { if (!Directory.Exists(dir) || !StoreSecurity.IsHardened(dir)) StoreSecurity.Harden(dir); }
             catch (Exception e) { Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning); }
         }
+        ClaudeCli.PurgeEnrollLeftovers(ClaudeCli.EnrollRoot);
     }
 
     void ToggleDashboard()
@@ -261,7 +262,8 @@ public sealed class TrayApp : ApplicationContext
     }
 
     /// Starts a new session in `target` with notes from the interrupted `source` session.
-    /// Not a resume: the notes are built locally and nothing is sent anywhere.
+    /// Not a resume: the notes are built locally and autodock sends nothing; the
+    /// target agent reads them like any prompt.
     async Task ContinueAsync(string source, string target)
     {
         if (PickFolder($"Folder of the interrupted {ProviderCli.Title(source)} work") is not { } folder) return;

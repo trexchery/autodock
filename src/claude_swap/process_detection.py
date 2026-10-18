@@ -90,12 +90,13 @@ def _is_pid_alive_windows(pid: int) -> bool:
         import ctypes
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if handle:
             kernel32.CloseHandle(handle)
             return True
-        return False
+        # ERROR_ACCESS_DENIED: it exists but we may not open it, like EPERM.
+        return ctypes.get_last_error() == 5  # type: ignore[attr-defined]
     except Exception:
         return False
 

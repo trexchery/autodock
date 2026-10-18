@@ -304,6 +304,10 @@ def export_accounts(
     }
 
     serialized = json.dumps(envelope, indent=2)
+    _eprint(
+        "Warning: this export contains live login tokens in plain text. Keep it "
+        "out of synced folders (OneDrive) and delete it after importing."
+    )
 
     if destination == "-":
         sys.stdout.write(serialized)

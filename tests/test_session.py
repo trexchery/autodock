@@ -10,6 +10,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -551,6 +552,50 @@ class TestBootstrap:
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
         assert session_mod.is_session_stale(session_dir)
+
+    @pytest.mark.parametrize("verdict", ["unreachable", "invalid"])
+    def test_live_profile_never_reseeded_or_deleted(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, verdict: str,
+    ):
+        """A second `cswap run` that cannot verify a live profile (claude
+        unreachable) or sees drift (an in-session /login) must refuse, not
+        overwrite the running claude's credentials or delete the profile."""
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        (session_dir / ".credentials.json").write_text("live lineage")
+        make_live(session_dir)
+        monkeypatch.setattr(SessionManager, "_session_validity", lambda *a: verdict)
+        consume = MagicMock(wraps=seeded_switcher.consume_backup_grant)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant", consume)
+
+        with pytest.raises(SessionError, match="in\\s+use"):
+            manager.setup_session("2", share=False)
+
+        assert (session_dir / ".credentials.json").read_text() == "live lineage"
+        consume.assert_not_called()
+
+    def test_validation_failure_keeps_profile_a_peer_joined(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates, block_real_keychain
+    ):
+        """A peer claude that joined between the seed and the post-bootstrap
+        probe keeps its profile; the run still fails validation."""
+        def peer_joins_then_invalid(cmd, env=None, **kwargs):
+            make_live(Path(env["CLAUDE_CONFIG_DIR"]))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", peer_joins_then_invalid)
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session("2", share=False)
+
+        assert session_dir.exists()
 
     def test_rebootstrap_preserves_profile_history(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
