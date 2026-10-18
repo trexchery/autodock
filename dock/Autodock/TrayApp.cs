@@ -39,7 +39,7 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.AgentsRequested += (anchor, menu) => { if (menu) ShowAgentsMenu(anchor); else LaunchAgents(); };
 
         HardenStores();
-        if (AgentStore.HasWork(AgentStore.DefaultRoot)) EnsureAgents(); // authorized earlier: carry on
+        if (AgentStore.HasWork(AgentStore.DefaultRoot)) EnsureAgents(); // authorized earlier: open terminals link up, other runs stop
         _timer.Interval = _settings.RefreshSeconds * 1000;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
         _timer.Start();
@@ -574,7 +574,7 @@ public sealed partial class TrayApp : ApplicationContext
     {
         _timer.Stop();
         _link?.Dispose();
-        _agents?.Dispose(); // workers keep running; the next start re-attaches
+        _agents?.Dispose(); // workers keep running; the next start re-attaches them, or stops them without their terminal
         _tray.Visible = false;
         _tray.Dispose();
         _dash.Dispose();

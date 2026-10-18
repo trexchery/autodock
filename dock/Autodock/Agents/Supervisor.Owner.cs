@@ -74,7 +74,7 @@ public sealed partial class Supervisor
         Pump();
         return $"Started. Agents now work through the actionable open issues of {repo.Leaf}, one at a time against {repo.Base}" +
                (repo.Verify is { } v ? $", gated by `{v}`" : " (no verification command, so pull requests rely on CI)") +
-               $", with at most {MaxOpenPrs} pull requests waiting for review, and keep going after restarts until paused or stopped.";
+               $", with at most {MaxOpenPrs} pull requests waiting for review. They work while this terminal is open: closing it pauses them, and reopening it continues.";
     }
 
     async Task<string> DefaultBranchAsync(string path)

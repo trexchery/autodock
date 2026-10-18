@@ -7,7 +7,8 @@ namespace Autodock;
 
 /// How the agents terminal reaches the tray. Claude Code starts `autodock.exe agents-mcp --repo <path>`
 /// as a stdio MCP server; it relays every tool call over a named pipe that only the current user can
-/// open to the running tray, which answers from the supervisor. The bridge holds no state.
+/// open to the running tray, which answers from the supervisor. It also holds one connection open for
+/// as long as it runs: that is how the tray knows the terminal is open. The bridge holds no state.
 public static class AgentsLink
 {
     static string PipeName => PipeNameFor(DockSettings.Dir);
@@ -16,17 +17,20 @@ public static class AgentsLink
 
     static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
 
-    /// Tray side: answers one request per connection, on the tray's thread. Idle, it is one pending
-    /// asynchronous accept: no thread and no CPU.
+    /// Tray side: answers one request per connection, on the tray's thread, and reports each terminal's
+    /// held connection to `presence` (repository, open). Idle, it is pending asynchronous I/O: no thread
+    /// and no CPU.
     public sealed class Server : IDisposable
     {
         readonly Func<string, JsonElement, string, Task<string>> _handle;
+        readonly Action<string, bool>? _presence;
         readonly CancellationTokenSource _cts = new();
         readonly string _name;
 
-        public Server(Func<string, JsonElement, string, Task<string>> handle, string? pipeName = null)
+        public Server(Func<string, JsonElement, string, Task<string>> handle, string? pipeName = null, Action<string, bool>? presence = null)
         {
             _handle = handle;
+            _presence = presence;
             _name = pipeName ?? PipeName;
             _ = AcceptAsync();
         }
@@ -61,7 +65,16 @@ public static class AgentsLink
                     if (await reader.ReadLineAsync(timeout.Token) is not { } line) return;
                     using var doc = JsonDocument.Parse(line);
                     var root = doc.RootElement;
-                    var text = await _handle(root.GetProperty("tool").GetString() ?? "", root.GetProperty("args").Clone(), root.GetProperty("repo").GetString() ?? "");
+                    var (tool, repo) = (root.GetProperty("tool").GetString() ?? "", root.GetProperty("repo").GetString() ?? "");
+                    if (tool == Attach)
+                    {
+                        // Held until the terminal's bridge exits (or the tray does): the terminal is open meanwhile.
+                        _presence?.Invoke(repo, true);
+                        try { while (await reader.ReadLineAsync(_cts.Token) != null) { } }
+                        finally { _presence?.Invoke(repo, false); }
+                        return;
+                    }
+                    var text = await _handle(tool, root.GetProperty("args").Clone(), repo);
                     await writer.WriteLineAsync(JsonSerializer.Serialize(new { text }));
                 }
                 catch (Exception e) when (e is IOException or JsonException or OperationCanceledException or KeyNotFoundException or InvalidOperationException)
@@ -72,6 +85,29 @@ public static class AgentsLink
         }
 
         public void Dispose() => _cts.Cancel();
+    }
+
+    /// Not an MCP tool: the bridge's own presence connection.
+    const string Attach = "attach";
+
+    /// Bridge side: one connection held for as long as the terminal is open, made again when the tray
+    /// restarts. Without a tray it tries every few seconds.
+    internal static async Task HoldAsync(string repo, string? pipeName = null, CancellationToken ct = default)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await using var pipe = new NamedPipeClientStream(".", pipeName ?? PipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                await pipe.ConnectAsync(500, ct);
+                var writer = new StreamWriter(pipe, Utf8) { AutoFlush = true, NewLine = "\n" };
+                await writer.WriteLineAsync(JsonSerializer.Serialize(new { tool = Attach, args = new { }, repo }));
+                await new StreamReader(pipe, Utf8).ReadLineAsync(ct); // returns when the tray goes away
+            }
+            catch (Exception e) when (e is TimeoutException or IOException or OperationCanceledException or UnauthorizedAccessException) { }
+            try { await Task.Delay(TimeSpan.FromSeconds(2), ct); }
+            catch (OperationCanceledException) { }
+        }
     }
 
     /// Client side of one tool call; null when the tray is not running.
@@ -91,7 +127,7 @@ public static class AgentsLink
 
     internal const string Instructions =
         """
-        This terminal is the owner's line to autodock agents. Once the owner starts them for this repository, autodock works through its actionable open GitHub issues in the background without supervision: each item gets its own headless Claude Code session in its own git worktree, on one of the owner's other Claude accounts. autodock verifies the work, pushes a branch, opens a pull request, follows up on failing checks, conflicts and review comments, and moves on. It never merges and pauses only for real decisions, missing permissions or exhausted accounts.
+        This terminal is the owner's line to autodock agents. Once the owner starts them for this repository, autodock works through its actionable open GitHub issues while this terminal is open (closing it pauses them; reopening it continues), without supervision: each item gets its own headless Claude Code session in its own git worktree, on one of the owner's other Claude accounts. autodock verifies the work, pushes a branch, opens a pull request, follows up on failing checks, conflicts and review comments, and moves on. It never merges and pauses only for real decisions, missing permissions or exhausted accounts.
 
         Talk to the owner naturally and keep the machinery out of view: report outcomes (what is being worked on, which pull requests are open, what needs their decision) rather than workers, accounts, attempts, sessions or worktrees, unless they ask for details (then use detail=true or agents_details).
         - Use agents_status to answer any question about progress.
@@ -146,6 +182,7 @@ public static class AgentsLink
         var repo = at >= 0 && at + 1 < args.Length ? args[at + 1] : Environment.CurrentDirectory;
         using var input = new StreamReader(Console.OpenStandardInput(), Utf8);
         using var output = new StreamWriter(Console.OpenStandardOutput(), Utf8) { AutoFlush = true, NewLine = "\n" };
+        _ = Task.Run(() => HoldAsync(repo)); // ends with this process, when Claude Code ends the terminal's session
         while (input.ReadLine() is { } line)
             if (Respond(line, repo) is { } reply) output.WriteLine(reply);
         return 0;

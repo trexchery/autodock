@@ -6,11 +6,11 @@ autodock agents work through a repository's actionable GitHub issues on their ow
 
 1. click the agents button (bottom right of the autodock flyout, next to refresh) and pick the repository. a normal Claude Code terminal opens there, with a rainbow `autodock · agents` line above its footer that shifts every few seconds and says when agents are working, need you, are paused or off.
 2. ask in plain words: *"work through the open issues; `npm test` must pass"*, *"start with #36, then #21 and #33"*.
-3. confirm the autodock dialog. it shows the branch pull requests target and the exact verification command autodock will run; changing either asks again. the confirmation is remembered: agents keep going after restarts until you pause or stop them.
+3. confirm the autodock dialog. it shows the branch pull requests target and the exact verification command autodock will run; changing either asks again. the confirmation is remembered, but agents only work while that repository's agents terminal is open: close it and they pause where they are, reopen it and they continue. nothing runs in the background.
 
 ask the same terminal what's going on, to reorder or skip issues, to add your own requests, or to answer a question. it reports outcomes; ask for details when you want the machinery. only its read-only tools run without asking.
 
-right-click the agents button (or use **Agents** in the tray menu) to pause, resume or stop without opening a terminal. closing the terminal changes nothing.
+right-click the agents button (or use **Agents** in the tray menu) to pause or stop. the agents button gets a yellow dot only when something is broken that you need to fix (repeated failures, a push or pull request error, gh not signed in, a failing verification command, no usable account); questions and approvals wait in the terminal.
 
 ## what happens
 
@@ -45,7 +45,7 @@ the verification command runs the agents' code as you, with the same environment
 
 ## resilience
 
-state lives in `%LOCALAPPDATA%\autodock\agents` (private to your user). each session runs as a native process in its own job object with files for input and output, so it keeps going if autodock exits; autodock re-attaches when it starts again, and a session ended by a restart, sign-out or shutdown continues without counting as a failure. a verification run ends with autodock and runs again on start. a session that writes nothing and uses no CPU for 15 minutes is stopped and resumed; one that keeps failing is parked with the reason.
+state lives in `%LOCALAPPDATA%\autodock\agents` (private to your user). each session runs as a native process in its own job object with files for input and output, so a restart of autodock doesn't lose it: autodock re-attaches when it starts again and lets it carry on if its terminal is still open (otherwise it stops, as a pause). a session ended by a restart, sign-out or shutdown continues without counting as a failure. a verification run ends with autodock, or with the terminal, and runs again later. a session that writes nothing and uses no CPU for 15 minutes is stopped and resumed; one that keeps failing is parked with the reason.
 
 ## cost
 
