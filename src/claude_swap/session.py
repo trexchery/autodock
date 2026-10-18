@@ -926,7 +926,18 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
+        # Atomic: a crash mid-write must never leave a torn credential file.
+        fd, tmp_path = tempfile.mkstemp(dir=str(session_dir), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(creds)
+            replace_with_retry(tmp_path, str(creds_path))
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         if sys.platform != "win32":
             os.chmod(creds_path, 0o600)
 
@@ -944,9 +955,7 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        atomic_write_json(config_path, existing)
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"

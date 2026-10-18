@@ -312,6 +312,34 @@ Examples:
         sys.exit(130)
 
 
+def _enroll_command(argv: list[str]) -> None:
+    """Handle `cswap enroll DIR` — adopt an isolated `claude auth login`."""
+    parser = argparse.ArgumentParser(
+        prog="cswap enroll",
+        description=(
+            "Add the account logged in under a separate Claude Code config "
+            "directory (CLAUDE_CONFIG_DIR=DIR claude auth login) without "
+            "touching the default login. DIR still holds a live credential "
+            "afterwards: delete it."
+        ),
+    )
+    parser.add_argument("config_dir", metavar="DIR", help="Claude Code config directory")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        switcher._refuse_session_shell()
+        from claude_swap.enroll import enroll
+
+        email = enroll(switcher, args.config_dir)
+        print(f"{accent('Enrolled')} {email}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _unmap_command(argv: list[str]) -> None:
     """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
     parser = argparse.ArgumentParser(
@@ -1004,6 +1032,9 @@ def main() -> None:
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
+    if argv and argv[0] == "enroll":
+        _enroll_command(argv[1:])
+        return
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])
         return
@@ -1104,6 +1135,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--token-status",
         action="store_true",
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="With 'list': re-read usage for every account whose reading is "
+        "older than the 3-minute serve floor, ignoring the idle back-off "
+        "schedule (failure backoff and 429 holds still apply)",
     )
     parser.add_argument(
         "--json",
@@ -1422,6 +1460,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
+            switcher.force_usage_refresh = args.refresh
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
@@ -1511,7 +1550,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # Never in the frozen autodock bundle: it only talks to Anthropic, and
+    # an upstream PyPI release cannot upgrade a bundled engine anyway.
+    if not args.purge and not args.upgrade and not args.json and not getattr(sys, "frozen", False):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

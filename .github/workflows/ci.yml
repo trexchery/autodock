@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/windows-tray]
   pull_request:
     branches: [main]
 
@@ -45,6 +45,15 @@ jobs:
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build engine + autodock and run all tests (synthetic credentials only)
+        shell: pwsh
+        run: ./dock/build.ps1
 
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the

@@ -320,6 +320,7 @@ def import_accounts(
     switcher: ClaudeAccountSwitcher,
     source: str,
     force: bool = False,
+    text: str | None = None,
 ) -> None:
     """Import accounts from a JSON file or stdin.
 
@@ -334,7 +335,9 @@ def import_accounts(
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
     """
-    if source == "-":
+    if text is not None:
+        pass  # in-memory envelope (enroll.py); never touches disk
+    elif source == "-":
         text = sys.stdin.read()
     else:
         in_path = Path(source).expanduser()
