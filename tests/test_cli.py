@@ -743,6 +743,7 @@ class TestRunCommand:
                 share=True,
                 share_history=False,
                 require_session=False,
+                restore_rc=False,
             ):
                 calls.append((
                     "run", identifier, claude_args, share, share_history,
@@ -844,6 +845,7 @@ class TestRunCommand:
                 share=True,
                 share_history=False,
                 require_session=False,
+                restore_rc=False,
             ):
                 from claude_swap.exceptions import SessionError
 
@@ -953,6 +955,7 @@ class TestSubcommandAliases:
                 share=True,
                 share_history=False,
                 require_session=False,
+                restore_rc=False,
             ):
                 calls.append((identifier, claude_args, share))
 
@@ -1580,10 +1583,11 @@ class TestRunAutoResolve:
                 share=True,
                 share_history=False,
                 require_session=False,
+                restore_rc=False,
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
-            def exec_default(self, claude_args):
+            def exec_default(self, claude_args, restore_rc=False):
                 calls.append(("exec_default", claude_args))
 
         return FakeSessionManager
@@ -1854,3 +1858,47 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestRunRestoreRc:
+    """`cswap run --restore-rc` reaches the SessionManager; it is never parsed after `--`."""
+
+    def _dispatch(self, argv: list[str], tmp_path, monkeypatch):
+        calls = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, restore_rc=False, **kwargs):
+                calls.append(("run", identifier, claude_args, restore_rc))
+
+            def exec_default(self, claude_args, restore_rc=False):
+                calls.append(("exec_default", claude_args, restore_rc))
+
+        sw = MagicMock()
+        sw.slot_for_directory.return_value = (None, None)
+        monkeypatch.chdir(tmp_path)
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=sw), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls
+
+    def test_off_by_default(self, tmp_path, monkeypatch):
+        assert self._dispatch(["run", "2"], tmp_path, monkeypatch) == [("run", "2", [], False)]
+
+    def test_flag_with_account_and_tail(self, tmp_path, monkeypatch):
+        calls = self._dispatch(
+            ["run", "2", "--restore-rc", "--", "--resume"], tmp_path, monkeypatch
+        )
+        assert calls == [("run", "2", ["--resume"], True)]
+
+    def test_flag_without_account_reaches_exec_default(self, tmp_path, monkeypatch):
+        calls = self._dispatch(["run", "--restore-rc"], tmp_path, monkeypatch)
+        assert calls == [("exec_default", [], True)]
+
+    def test_flag_after_double_dash_is_claude_arg(self, tmp_path, monkeypatch):
+        calls = self._dispatch(["run", "2", "--", "--restore-rc"], tmp_path, monkeypatch)
+        assert calls == [("run", "2", ["--restore-rc"], False)]

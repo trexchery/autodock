@@ -134,7 +134,9 @@ public sealed class DashboardForm : Form
     }
 
     /// `others`: Codex/Grok snapshots (or their error), drawn below Claude's rows.
-    public void Render(Snapshot? snap, string? error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? others = null)
+    /// `projects`: folder assignments; each Claude row shows its own.
+    public void Render(Snapshot? snap, string? error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? others = null,
+        IReadOnlyList<ProjectMapping>? projects = null)
     {
         ApplyTheme();
         _list.SuspendLayout();
@@ -151,7 +153,7 @@ public sealed class DashboardForm : Form
             if (err != null) _list.Controls.Add(Message("Couldn't refresh · " + err));
             foreach (var a in (s?.Accounts ?? []).OrderByDescending(a => a.Active).ThenBy(a => a.Number))
             {
-                var row = new AccountRow(a, now);
+                var row = new AccountRow(a, now, projects?.Where(m => m.Matches(a)).ToList());
                 row.SwitchClicked += x => SwitchRequested?.Invoke(x);
                 row.TerminalClicked += x => TerminalRequested?.Invoke(x);
                 row.MenuAction += (x, act) => AccountAction?.Invoke(x, act);

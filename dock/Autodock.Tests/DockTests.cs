@@ -262,6 +262,280 @@ public class StorageTests
     }
 }
 
+public class SettingsDefaultsTests
+{
+    [Fact]
+    public void KeysAbsentFromAnOlderFileKeepTheirDefaults()
+    {
+        using var t = new TempDir();
+        var file = Path.Combine(t.Path, "settings.json");
+        File.WriteAllText(file, """{ "AutoSwitch": true, "RefreshSeconds": 300 }""");
+        var s = DockSettings.Load(file);
+        Assert.True(s.AutoSwitch);
+        Assert.True(s.PreserveRemoteControl); // on unless the user turns it off
+        Assert.False(s.AutoProjectAccount);
+        Assert.False(s.QuotaNotifications);
+
+        var fresh = new DockSettings();
+        Assert.True(fresh.PreserveRemoteControl);
+        Assert.False(fresh.AutoProjectAccount);
+        Assert.False(fresh.QuotaNotifications);
+    }
+
+    [Fact]
+    public void ExplicitValuesRoundTrip()
+    {
+        using var t = new TempDir();
+        var file = Path.Combine(t.Path, "settings.json");
+        new DockSettings { PreserveRemoteControl = false, AutoProjectAccount = true, QuotaNotifications = true }.Save(file);
+        var s = DockSettings.Load(file);
+        Assert.False(s.PreserveRemoteControl);
+        Assert.True(s.AutoProjectAccount);
+        Assert.True(s.QuotaNotifications);
+    }
+}
+
+public class QuotaAlertTests
+{
+    static Account A(string email, double? fiveHour = null, double? weekly = null, string status = "ok", string? org = null, List<Window>? scoped = null) =>
+        new(1, email, false, status,
+            status == "ok" ? new Usage(fiveHour is { } f ? new Window(f, null) : null, weekly is { } w ? new Window(w, null) : null, scoped, null) : null,
+            // Last-known readings exist but must never be read as live ones.
+            LastGoodUsage: status == "ok" ? null : new Usage(new Window(5, null), new Window(5, null), null, null),
+            OrganizationUuid: org);
+
+    static List<QuotaAlert> Seen(QuotaAlerts q, params Account[] accounts) => q.Observe("claude", accounts);
+
+    [Fact]
+    public void FirstReadingIsASilentBaseline()
+    {
+        var q = new QuotaAlerts();
+        Assert.Empty(Seen(q, A("a@example.com", 95, 100)));
+        Assert.Empty(Seen(q, A("a@example.com", 95, 100)));
+    }
+
+    [Fact]
+    public void AlertsOnNearExhaustedAndResetOnlyOnce()
+    {
+        var q = new QuotaAlerts();
+        Seen(q, A("a@example.com", 10));
+        Assert.Empty(Seen(q, A("a@example.com", Palette.WarnPct - 0.1)));
+
+        var near = Assert.Single(Seen(q, A("a@example.com", Palette.WarnPct)));
+        Assert.Equal((QuotaState.Near, "5-hour"), (near.State, near.Window));
+        Assert.Equal("a@example.com · 5-hour at 80%", near.Line);
+        Assert.Empty(Seen(q, A("a@example.com", 90))); // still near: no repeat
+
+        var spent = Assert.Single(Seen(q, A("a@example.com", 100)));
+        Assert.Equal(QuotaState.Exhausted, spent.State);
+        Assert.Equal("a@example.com · 5-hour limit reached", spent.Line);
+        Assert.Empty(Seen(q, A("a@example.com", 100)));
+
+        var reset = Assert.Single(Seen(q, A("a@example.com", 3)));
+        Assert.Equal(QuotaState.Normal, reset.State);
+        Assert.Equal("a@example.com · 5-hour limit reset", reset.Line);
+        Assert.Empty(Seen(q, A("a@example.com", 4)));
+    }
+
+    [Fact]
+    public void SkippingNearStillAlertsExhausted()
+    {
+        var q = new QuotaAlerts();
+        Seen(q, A("a@example.com", 10));
+        Assert.Equal(QuotaState.Exhausted, Assert.Single(Seen(q, A("a@example.com", 100))).State);
+    }
+
+    [Fact]
+    public void EasingDownIsSilentButAnExhaustedWindowCanAlertAgain()
+    {
+        var q = new QuotaAlerts();
+        Seen(q, A("a@example.com", 85)); // baseline: already near
+        Assert.Empty(Seen(q, A("a@example.com", 10))); // Near -> Normal
+        Seen(q, A("a@example.com", 100));
+        Assert.Empty(Seen(q, A("a@example.com", 85))); // Exhausted -> Near
+        Assert.Equal(QuotaState.Exhausted, Assert.Single(Seen(q, A("a@example.com", 100))).State);
+    }
+
+    [Fact]
+    public void UnavailableDataNeverChangesStateOrCountsAsZero()
+    {
+        var q = new QuotaAlerts();
+        Seen(q, A("a@example.com", 100)); // baseline: exhausted
+        foreach (var bad in new[] { "unavailable", "token_expired", "relogin_required", "api_key", "something_new" })
+            Assert.Empty(Seen(q, A("a@example.com", status: bad)));
+        Assert.Empty(Seen(q, new Account(1, "a@example.com", false, "ok", null))); // ok but no reading
+        Assert.Empty(Seen(q, A("a@example.com", 100))); // were an outage read as 0 %, this would re-alert
+        Assert.Equal(QuotaState.Normal, Assert.Single(Seen(q, A("a@example.com", 10))).State);
+
+        Seen(q, A("b@example.com", 10));
+        Assert.Empty(Seen(q, A("b@example.com", status: "unavailable")));
+        Assert.Equal(QuotaState.Near, Assert.Single(Seen(q, A("b@example.com", 85))).State);
+
+        // A missing window is unknown, not 0 %.
+        Seen(q, A("c@example.com", 100, 100));
+        Assert.Empty(Seen(q, A("c@example.com", fiveHour: null, weekly: 100)));
+        Assert.Empty(Seen(q, A("c@example.com", 100, 100)));
+    }
+
+    [Fact]
+    public void WindowsAccountsAndProvidersAreTrackedSeparately()
+    {
+        var q = new QuotaAlerts();
+        var opus = new List<Window> { new(10, null, "Opus") };
+        Seen(q, A("a@example.com", 10, 10, scoped: opus), A("b@example.com", 10, 10, org: "org-1"));
+        q.Observe("codex", [A("a@example.com", 10, 10)]);
+
+        var alerts = Seen(q,
+            A("a@example.com", 10, 90, scoped: [new(100, null, "Opus")]),
+            A("b@example.com", 10, 10, org: "org-1"));
+        Assert.Equal(["a@example.com · weekly at 90%", "a@example.com · Opus limit reached"], alerts.Select(a => a.Line));
+
+        // Same email, other provider: its own baseline, named with the provider.
+        var codex = Assert.Single(q.Observe("codex", [A("a@example.com", 85, 10)]));
+        Assert.Equal("Codex a@example.com · 5-hour at 85%", codex.Line);
+        // Same email, other organization: a different account.
+        Assert.Empty(Seen(q, A("b@example.com", 10, 10, org: "org-2")));
+    }
+
+    [Fact]
+    public void AliasNamesTheAccount()
+    {
+        var q = new QuotaAlerts();
+        Seen(q, A("a@example.com", 10) with { Alias = "work" });
+        Assert.Equal("work · 5-hour at 85%", Assert.Single(Seen(q, A("a@example.com", 85) with { Alias = "work" })).Line);
+    }
+
+    [Fact]
+    public void OneRefreshBecomesOneBalloon()
+    {
+        Assert.Null(QuotaAlerts.Balloon([]));
+
+        var q = new QuotaAlerts();
+        var accounts = Enumerable.Range(1, 5).Select(i => A($"u{i}@example.com", 10)).ToArray();
+        Seen(q, accounts);
+        var alerts = Seen(q, accounts.Select(a => A(a.Email, 90)).ToArray());
+        Assert.Equal(5, alerts.Count);
+
+        var (title, text) = QuotaAlerts.Balloon(alerts)!.Value;
+        Assert.Equal("Quota update", title);
+        Assert.Equal("u1@example.com · 5-hour at 90%\nu2@example.com · 5-hour at 90%\nu3@example.com · 5-hour at 90%\n+2 more", text);
+        Assert.Equal("u1@example.com · 5-hour at 90%", QuotaAlerts.Balloon(alerts.Take(1).ToList())!.Value.Text);
+    }
+}
+
+public class ProjectMapTests
+{
+    const string MappingsJson = """
+    { "schemaVersion": 1, "mappings": {
+        "c:\\work\\client": { "email": "b@example.com", "organizationUuid": "org-1", "added": "2026-01-01T00:00:00Z" },
+        "c:\\work": { "email": "a@example.com", "organizationUuid": "" },
+        "c:\\no-email": { "organizationUuid": "x" },
+        "c:\\junk": "nope" } }
+    """;
+
+    static string Write(TempDir t, string text)
+    {
+        var file = Path.Combine(t.Path, "mappings.json");
+        File.WriteAllText(file, text);
+        return file;
+    }
+
+    static readonly Account A = new(1, "a@example.com", true, "ok", null);
+    static readonly Account B = new(2, "b@example.com", false, "ok", null, OrganizationUuid: "org-1");
+
+    [Fact]
+    public void MissingCorruptAndMisshapenFilesReadAsEmpty()
+    {
+        using var t = new TempDir();
+        Assert.Empty(ProjectMap.Load(Path.Combine(t.Path, "mappings.json")));
+        Assert.Empty(ProjectMap.Load(Write(t, "{ not json")));
+        Assert.Empty(ProjectMap.Load(Write(t, "[]")));
+        Assert.Empty(ProjectMap.Load(Write(t, """{ "mappings": [] }""")));
+        Assert.Empty(ProjectMap.Load(Write(t, """{ "schemaVersion": 1 }""")));
+    }
+
+    [Fact]
+    public void ParsesEntriesAndSkipsMalformedOnes()
+    {
+        using var t = new TempDir();
+        var maps = ProjectMap.Load(Write(t, MappingsJson));
+        Assert.Equal([@"c:\work", @"c:\work\client"], maps.Select(m => m.Folder));
+        Assert.Equal(["work", "client"], maps.Select(m => m.Leaf));
+        Assert.Equal(("a@example.com", ""), (maps[0].Email, maps[0].Org));
+        Assert.Equal(("b@example.com", "org-1"), (maps[1].Email, maps[1].Org));
+        Assert.Equal(@"c:\", new ProjectMapping(@"c:\", "a@example.com", "").Leaf);
+    }
+
+    [Fact]
+    public void MatchesByEmailAndOrganization()
+    {
+        var personal = new ProjectMapping(@"c:\work", "a@example.com", "");
+        var team = new ProjectMapping(@"c:\work\client", "b@example.com", "org-1");
+        Assert.True(personal.Matches(A));
+        Assert.False(personal.Matches(B));
+        Assert.True(team.Matches(B));
+        Assert.False(team.Matches(B with { OrganizationUuid = "org-2" })); // same email, other organization
+        Assert.False(team.Matches(B with { OrganizationUuid = null }));
+        Assert.False(personal.Matches(A with { Provider = "codex" }));
+    }
+
+    [Fact]
+    public void NearestMappedAncestorDecidesTheAccount()
+    {
+        using var t = new TempDir();
+        var maps = ProjectMap.Load(Write(t, MappingsJson));
+        string Pick(params string[] folders) => string.Join(" ", folders.Select(f => ProjectMap.AccountFor(f, [A, B], maps)?.Email ?? "-"));
+
+        Assert.Equal("a@example.com b@example.com b@example.com a@example.com",
+            Pick(@"C:\Work", @"C:\Work\Client", @"C:\WORK\client\src\deep", @"C:\work\other"));
+        Assert.Equal("- -", Pick(@"C:\Work2", @"D:\work")); // a shared prefix is not an ancestor
+        Assert.Null(ProjectMap.AccountFor(@"C:\work\client", [A], maps)); // its account is gone: no guess
+        Assert.Null(ProjectMap.AccountFor(@"C:\work", [A], []));
+    }
+}
+
+public class LaunchTests
+{
+    [Fact]
+    public void RestoreRcComesBeforeTheDoubleDash()
+    {
+        Assert.Equal(["run", "2", "--restore-rc"], Launch.Run(2, true));
+        Assert.Equal(["run", "2", "--restore-rc", "--", "Read notes.md and continue"], Launch.Run(2, true, "Read notes.md and continue"));
+        var args = Launch.Run(null, true, "--resume");
+        Assert.Equal(["run", "--restore-rc", "--", "--resume"], args);
+        Assert.True(Array.IndexOf(args, "--restore-rc") < Array.IndexOf(args, "--"));
+    }
+
+    [Fact]
+    public void RestoreRcIsOmittedWhenTurnedOff()
+    {
+        Assert.Equal(["run", "2"], Launch.Run(2, false));
+        Assert.Equal(["run", "2", "--", "prompt"], Launch.Run(2, false, "prompt"));
+        Assert.Equal(["run", "--", "prompt"], Launch.Run(null, false, "prompt"));
+    }
+
+    [Fact]
+    public void ContinueInClaudePicksTheAccountToRunAs()
+    {
+        Account mapped = new(1, "m@example.com", false, "ok", null), active = new(2, "a@example.com", true, "ok", null);
+        // Mapped folder: the engine resolves the mapping itself, so no NUM (passing the active one would pin the wrong account).
+        Assert.Equal(["run", "--restore-rc", "--", "p"], Launch.Continue(mapped, active, true, "p")!);
+        Assert.Equal(["run", "--restore-rc", "--", "p"], Launch.Continue(mapped, null, true, "p")!);
+        Assert.Equal(["run", "2", "--restore-rc", "--", "p"], Launch.Continue(null, active, true, "p")!);
+        Assert.Null(Launch.Continue(null, null, true, "p")); // no known account: launch claude directly
+        Assert.Equal(["run", "2", "--", "p"], Launch.Continue(null, active, false, "p")!);
+        Assert.Equal(["run", "--", "p"], Launch.Continue(mapped, active, false, "p")!);
+    }
+
+    [Fact]
+    public void SwitchBalloonNamesBothAccounts()
+    {
+        Assert.Equal("a@example.com autodocked · b@example.com active",
+            Format.SwitchNotice(new AccountRef(1, "a@example.com"), new AccountRef(2, "b@example.com")));
+        Assert.Equal("autodocked · b@example.com active", Format.SwitchNotice(null, new AccountRef(2, "b@example.com")));
+    }
+}
+
 /// Drives the real engine end to end against a synthetic home directory.
 /// Set AUTODOCK_TEST_ENGINE to a cswap.exe (build.ps1 does); skipped otherwise.
 [Collection("engine")]
@@ -402,6 +676,63 @@ public class RenderTests
                     settings.DrawToBitmap(sb, new Rectangle(0, 0, settings.Width, settings.Height));
                     sb.Save(sOut);
                 }
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        if (failure != null) throw failure;
+    }
+
+    /// A row lists its account's project folders in the expanded view when they fit on a line,
+    /// and always in its context menu (open a pinned terminal there, or remove the assignment).
+    [Fact]
+    public void RowShowsProjectFoldersAndOffersThemInItsMenu()
+    {
+        var snap = new Snapshot(1, 1,
+        [
+            new Account(1, "a@example.com", true, "ok", null),
+            new Account(2, "b@example.com", false, "ok", null),
+        ]);
+        var long1 = @"c:\work\" + new string('x', 40);
+        var maps = new List<ProjectMapping> { new(@"c:\work\client", "a@example.com", ""), new(@"c:\work\app", "a@example.com", "") };
+        var wide = new List<ProjectMapping> { new(long1, "b@example.com", ""), new(long1 + "2", "b@example.com", "") };
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm { Location = new Point(-10000, -10000) };
+                var actions = new List<string>();
+                form.AccountAction += (_, act) => actions.Add(act);
+                form.Render(snap, null, null, [.. maps, .. wide]);
+                form.Show();
+                Application.DoEvents();
+                var rows = FindRows(form).ToList();
+                foreach (var r in rows) r.SetExpanded(true, animate: false);
+                var plain = new AccountRow(snap.Accounts[1], DateTimeOffset.Now);
+                plain.SetExpanded(true, animate: false);
+                Assert.Equal(plain.Height + Ui.S(22), rows[0].Height); // "Projects · client, app" fits: one more line
+                Assert.Equal(plain.Height, rows[1].Height); // two 40-character folders don't: menu only
+
+                var menu = rows[0].ShowMenu(Point.Empty);
+                var projects = menu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects");
+                Assert.Contains(menu.Items.Cast<ToolStripItem>(), i => i.Text == "Assign project folder…");
+                Assert.Equal(["client", "app"], projects.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text));
+                var client = projects.DropDownItems.OfType<ToolStripMenuItem>().First(i => i.Text == "client");
+                Assert.Equal(@"c:\work\client", client.ToolTipText);
+                Assert.Equal(["Open terminal", "Remove"], client.DropDownItems.Cast<ToolStripItem>().Select(i => i.Text));
+                client.DropDownItems.Cast<ToolStripItem>().First(i => i.Text == "Remove").PerformClick();
+                Application.DoEvents();
+                Assert.Equal([@"project-remove:c:\work\client"], actions);
+
+                var wideMenu = rows[1].ShowMenu(Point.Empty);
+                Assert.Equal(2, wideMenu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Projects").DropDownItems.Count);
+                wideMenu.Close();
+                if (!menu.IsDisposed) menu.Close();
+                Application.DoEvents();
+                plain.Dispose();
             }
             catch (Exception e) { failure = e; }
         });

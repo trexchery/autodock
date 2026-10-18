@@ -56,9 +56,10 @@ from claude_swap.exceptions import (
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.handoff import _newest, project_dir_name
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_default_global_config_path
+from claude_swap.paths import get_claude_config_home, get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, is_pid_alive, scan_sessions
 from claude_swap.settings import atomic_write_json
@@ -577,6 +578,65 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+_RC_SCAN_BYTES = 2 * 1024 * 1024  # per window; bounds the read of a huge transcript
+
+
+def last_session_used_remote_control(config_dir: Path | str, cwd: Path | str) -> bool:
+    """Did the profile's most recent session have Remote Control connected?
+
+    Claude logs a ``bridge-session`` transcript record while RC is connected.
+    Looks at ``cwd``'s project folder first, else the newest transcript in the
+    profile. False when settings.json already has ``remoteControlAtStartup``
+    (Claude starts RC itself) and on any I/O error.
+    """
+    root = Path(config_dir)
+    try:
+        try:
+            settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, RecursionError):
+            settings = None
+        if isinstance(settings, dict) and settings.get("remoteControlAtStartup") is True:
+            return False
+        projects = root / "projects"
+        newest = _newest((projects / project_dir_name(cwd)).glob("*.jsonl")) or _newest(
+            projects.glob("*/*.jsonl")
+        )
+        if newest is None:
+            return False
+        with open(newest, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            # Head and tail: RC connects at launch or mid-session.
+            for start in {0, max(0, size - _RC_SCAN_BYTES)}:
+                f.seek(start)
+                for line in f.read(_RC_SCAN_BYTES).splitlines():
+                    if b"bridge-session" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(rec, dict) and rec.get("type") == "bridge-session":
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+def with_restored_rc(
+    claude_args: list[str], config_dir: Path | str, restore_rc: bool
+) -> list[str]:
+    """``claude_args`` plus ``--remote-control`` when ``restore_rc`` and the
+    profile at ``config_dir`` last used it (unless the args already ask)."""
+    if not restore_rc or any(
+        a in ("--remote-control", "--rc") or a.startswith(("--remote-control=", "--rc="))
+        for a in claude_args
+    ):
+        return claude_args
+    if last_session_used_remote_control(config_dir, os.getcwd()):
+        return [*claude_args, "--remote-control"]
+    return claude_args
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -594,6 +654,7 @@ class SessionManager:
         share: bool = True,
         share_history: bool = False,
         require_session: bool = False,
+        restore_rc: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
 
@@ -602,6 +663,10 @@ class SessionManager:
         terminal to one account per session needs the isolation guaranteed,
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
+
+        ``restore_rc`` adds ``--remote-control`` when the profile that will run
+        (the session profile, or the default config dir on the fast path) last
+        used Remote Control.
         """
         claude_bin = shutil.which("claude")
         if not claude_bin:
@@ -651,7 +716,11 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                self._exec(
+                    claude_bin,
+                    with_restored_rc(claude_args, get_claude_config_home(), restore_rc),
+                    env=dict(os.environ),
+                )
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -703,9 +772,14 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env, on_exit=on_exit)
+        self._exec(
+            claude_bin,
+            with_restored_rc(claude_args, session_dir, restore_rc),
+            env=env,
+            on_exit=on_exit,
+        )
 
-    def exec_default(self, claude_args: list[str]) -> NoReturn:
+    def exec_default(self, claude_args: list[str], restore_rc: bool = False) -> NoReturn:
         """Launch plain Claude Code with the current default login.
 
         Used by `cswap run` (no account) when the cwd has no mapping, or its
@@ -719,7 +793,11 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        self._exec(
+            claude_bin,
+            with_restored_rc(claude_args, get_claude_config_home(), restore_rc),
+            env=dict(os.environ),
+        )
 
     def _exec(
         self,

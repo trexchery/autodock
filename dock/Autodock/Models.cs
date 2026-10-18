@@ -29,12 +29,16 @@ public sealed record Account(
     bool Disabled = false,
     DateTimeOffset? LoginExpiresAt = null,
     string? UsageError = null,
-    string? UsageNote = null)
+    string? UsageNote = null,
+    string? OrganizationUuid = null)
 {
     /// "claude", "codex" or "grok"; set by Engine.ListAsync, not part of the payload.
     [JsonIgnore] public string Provider { get; init; } = "claude";
 
     public string DisplayName => string.IsNullOrEmpty(Alias) ? Email : $"{Alias}  ·  {Email}";
+
+    /// Alias or email: how titles and balloons name the account.
+    public string ShortName => string.IsNullOrEmpty(Alias) ? Email : Alias;
 
     /// Usage to draw: live if trusted, else last-known (shown as stale).
     public Usage? ShownUsage => Usage ?? LastGoodUsage;

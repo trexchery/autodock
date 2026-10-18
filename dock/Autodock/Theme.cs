@@ -30,13 +30,16 @@ public sealed record Palette(
 
     public static readonly Color Warn = Color.FromArgb(214, 162, 67), Critical = Color.FromArgb(218, 106, 94);
 
+    /// Where meters turn amber; quota notifications use the same line.
+    public const double WarnPct = 80;
+
     /// Meter fill: quiet foreground until a window is nearly spent.
     public Color Meter(double pct) =>
-        pct >= 95 ? Critical : pct >= 80 ? Warn : Color.FromArgb(IsDark ? 200 : 170, Text);
+        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Color.FromArgb(IsDark ? 200 : 170, Text);
 
     /// Tray dot (needs to read on any taskbar).
     public static Color ForPct(double pct) =>
-        pct >= 95 ? Critical : pct >= 80 ? Warn : Color.FromArgb(98, 196, 140);
+        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Color.FromArgb(98, 196, 140);
 }
 
 /// Fonts, DPI scaling, glyphs and Win32 cosmetics shared by every surface.

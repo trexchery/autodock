@@ -39,6 +39,12 @@ and encrypted credential storage.
   including per-model limits, and when it resets. Meters turn amber at 80 % and red at 95 %.
 - **One-click switching.** Changes the account Claude Code uses without interrupting running sessions.
 - **Pinned terminals.** Open Claude Code locked to one account in its own profile. Switching never affects it.
+- **Project folders.** Assign a folder to an account. Terminals opened there, or from *Project terminals* in the tray
+  menu, run as that account; your login never changes.
+- **Preserve Remote Control.** On by default. Claude stops Remote Control when the signed-in account changes; pinned
+  terminals keep their account, so their Remote Control is unaffected. A new terminal turns it back on only if its last
+  session used it. autodock never reconnects a running session.
+- **Quota notifications.** Off by default. One balloon when a limit gets near (80 %), runs out or resets.
 - **Safe enrollment.** New accounts sign in through the official `claude auth login` in a throwaway profile,
   so your current login is never touched.
 - **Codex and Grok Build too.** Detected automatically and shown in their own section: Codex 5-hour and weekly
@@ -95,6 +101,7 @@ to remove everything.
 | Work on one account | Click **Terminal** in an expanded row. That window stays on its account until you close it. |
 | Keep it on screen | Click the pin icon. The dashboard becomes a movable window and reopens where you left it. |
 | Pick up interrupted work | Right-click a row → *Continue in*, or right-click the tray icon → *Continue interrupted work*. Choose the project folder; a new session opens there with hand-off notes (`cswap handoff --from claude --dir .` writes them by hand). Reading Grok sessions isn't supported yet. |
+| Pin a folder to an account | Right-click a row → *Assign project folder…*. Its *Projects* submenu opens a terminal there or removes the assignment. *Use project accounts automatically* in ⚙ Settings makes *Open terminal in folder…* and *Continue in* use the folder's account. |
 | Everything else | Right-click a row: open a terminal in a folder, rename, exclude from auto-switch, sign in again, remove. |
 
 ### Auto-switch

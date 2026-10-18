@@ -134,6 +134,7 @@ Examples:
   cswap run 2 --no-share
   cswap run 2 --share-history
   cswap run 2 --require-session
+  cswap run 2 --restore-rc
   cswap run 2 -- --resume
         """,
     )
@@ -175,6 +176,14 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--restore-rc",
+        action="store_true",
+        help=(
+            "Add --remote-control when this profile's most recent session "
+            "used Remote Control; used by autodock"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -196,6 +205,7 @@ Examples:
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                restore_rc=args.restore_rc,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -208,6 +218,7 @@ Examples:
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                restore_rc=args.restore_rc,
             )
             return  # only reachable in tests
         if email is not None:
@@ -222,7 +233,7 @@ Examples:
                     "launching the default account."
                 )
             )
-        manager.exec_default(tail)
+        manager.exec_default(tail, restore_rc=args.restore_rc)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

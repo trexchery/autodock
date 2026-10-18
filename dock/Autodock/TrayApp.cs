@@ -16,6 +16,7 @@ public sealed class TrayApp : ApplicationContext
     bool? _pending; // a request made during a busy pass: null none, else whether it forces a refresh
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
+    QuotaAlerts _quota = new();
 
     public TrayApp(Engine engine, bool minimized)
     {
@@ -92,10 +93,12 @@ public sealed class TrayApp : ApplicationContext
         }
         _busy = true;
         _dash.SetStatus("updating…");
+        var fresh = new List<(string Provider, Snapshot Snap)>(); // this pass's readings only; a failed poll never feeds the quota alerts
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
             _snap = await _engine.ListAsync(refresh);
+            fresh.Add(("claude", _snap));
             _error = null;
             _dash.SetStatus($"{DateTime.Now:HH:mm}");
         }
@@ -104,11 +107,14 @@ public sealed class TrayApp : ApplicationContext
             _error = Engine.Redact(e.Message);
             _dash.SetStatus("offline");
         }
-        try { await PollProvidersAsync(refresh); }
+        try { await PollProvidersAsync(refresh, fresh); }
         finally
         {
             _busy = false;
         }
+        if (_settings.QuotaNotifications
+            && QuotaAlerts.Balloon(fresh.SelectMany(f => _quota.Observe(f.Provider, f.Snap.Accounts)).ToList()) is { } balloon)
+            Notify(balloon.Title, balloon.Text);
         // Tray dot and tooltip follow Claude, unless Claude is unused and exactly one other provider is.
         var withAccounts = _others.Values.Where(o => o.Snap is { Accounts.Count: > 0 }).ToList();
         var basis = _snap is not { Accounts.Count: > 0 } && withAccounts.Count == 1 ? withAccounts[0].Snap : _snap;
@@ -125,18 +131,23 @@ public sealed class TrayApp : ApplicationContext
         }
     }
 
-    async Task PollProvidersAsync(bool refresh)
+    async Task PollProvidersAsync(bool refresh, List<(string Provider, Snapshot Snap)> fresh)
     {
         foreach (var p in ProviderCli.All)
         {
             if (!ProviderCli.Present(p)) { _others.Remove(p); continue; }
-            try { _others[p] = (await _engine.ListAsync(refresh, p), null); }
+            try
+            {
+                var s = await _engine.ListAsync(refresh, p);
+                _others[p] = (s, null);
+                fresh.Add((p, s));
+            }
             catch (Exception e) { _others[p] = (_others.GetValueOrDefault(p).Snap, Engine.Redact(e.Message)); }
         }
     }
 
     void RenderDash() =>
-        _dash.Render(_snap, _error, ProviderCli.All.Where(_others.ContainsKey).Select(p => (p, _others[p].Snap, _others[p].Error)).ToList());
+        _dash.Render(_snap, _error, ProviderCli.All.Where(_others.ContainsKey).Select(p => (p, _others[p].Snap, _others[p].Error)).ToList(), ProjectMap.Load());
 
     /// "+" with several CLIs installed: a small themed menu picks which provider to add.
     void PickProviderToAdd()
@@ -159,8 +170,7 @@ public sealed class TrayApp : ApplicationContext
             switch (e.Event)
             {
                 case "switch" when !e.DryRun:
-                    Notify("Switched account",
-                        $"{Name(e.From)} → {Name(e.To)} ({e.Trigger}). Running sessions continue; new messages use the new account.");
+                    Notify("", Format.SwitchNotice(e.From, e.To), ToolTipIcon.None);
                     break;
                 case "account-quarantined":
                     Notify("Account needs re-enrollment", $"{e.Email}: {e.Reason}", ToolTipIcon.Warning);
@@ -195,6 +205,10 @@ public sealed class TrayApp : ApplicationContext
         sw.Enabled = term.Enabled = sw.DropDownItems.Count > 0;
         _menu.Items.Add(sw);
         _menu.Items.Add(term);
+        var proj = new ToolStripMenuItem("Project terminals");
+        foreach (var m in ProjectMap.Load())
+            proj.DropDownItems.Add(new ToolStripMenuItem($"{m.Leaf} · {m.Email}", null, (_, _) => OpenProjectTerminal(m)) { ToolTipText = m.Folder });
+        if (proj.HasDropDownItems) _menu.Items.Add(proj);
         var cont = new ToolStripMenuItem("Continue interrupted work");
         foreach (var src in ProviderCli.Every)
             foreach (var t in ProviderCli.HandoffTargets(src))
@@ -238,7 +252,8 @@ public sealed class TrayApp : ApplicationContext
         try
         {
             var r = await _engine.SwitchAsync(a.Number);
-            Notify(r.Switched ? "Switched account" : "No switch", r.Switched ? $"Now using {Name(r.To)}" : r.Reason ?? "Already active");
+            if (r.Switched) Notify("", Format.SwitchNotice(r.From, r.To), ToolTipIcon.None);
+            else Notify("No switch", r.Reason ?? "Already active");
         }
         catch (Exception e) { Error("Switch failed", e); }
         await TickAsync(runAuto: false);
@@ -259,8 +274,20 @@ public sealed class TrayApp : ApplicationContext
             // `cswap run N` pins this console to account N via an isolated profile; global switches
             // and auto-switch never touch it. When N is the active login, the engine runs plain `claude`
             // instead (no second copy of the refresh token), which follows later switches.
-            _engine.LaunchConsole($"Claude · {(string.IsNullOrEmpty(a.Alias) ? a.Email : a.Alias)}", folder, "run", a.Number.ToString());
+            _engine.LaunchConsole($"Claude · {a.ShortName}", folder, Launch.Run(a.Number, _settings.PreserveRemoteControl));
         }
+        catch (Exception e) { Error("Could not open terminal", e); }
+    }
+
+    /// With "Use project accounts automatically", the account assigned to `folder` (else null).
+    Account? MappedAccount(string folder) =>
+        _settings.AutoProjectAccount ? ProjectMap.AccountFor(folder, _snap?.Accounts ?? [], ProjectMap.Load()) : null;
+
+    /// `cswap run` with no account in the folder: the engine resolves the assignment itself.
+    void OpenProjectTerminal(ProjectMapping m)
+    {
+        if (!Directory.Exists(m.Folder)) { Notify("Folder not found", m.Folder, ToolTipIcon.Warning); return; }
+        try { _engine.LaunchConsole($"Claude · {m.Leaf} · {m.Email}", m.Folder, Launch.Run(null, _settings.PreserveRemoteControl)); }
         catch (Exception e) { Error("Could not open terminal", e); }
     }
 
@@ -275,7 +302,9 @@ public sealed class TrayApp : ApplicationContext
             var exe = ProviderCli.FindAny(target) ?? throw new EngineException($"{ProviderCli.Title(target)} CLI not found.");
             var h = await _engine.HandoffAsync(source, folder);
             var prompt = $"Read the hand-off notes in {h.Path} and continue the interrupted task.";
-            var title = $"{ProviderCli.Title(target)} · continue";
+            var mapped = target == "claude" ? MappedAccount(folder) : null;
+            var who = mapped ?? (target == "claude" ? _snap : _others.GetValueOrDefault(target).Snap)?.Accounts.FirstOrDefault(a => a.Active);
+            var title = $"{ProviderCli.Title(target)} · continue" + (who == null ? "" : " · " + who.ShortName);
             if (target == "grok")
             {
                 // ponytail: no known initial-prompt argument for grok; pass it as an arg once one exists.
@@ -284,7 +313,11 @@ public sealed class TrayApp : ApplicationContext
                 Notify("Hand-off ready", "Paste the copied line into Grok to start with the notes.");
                 return;
             }
-            Engine.LaunchConsoleWith(exe, title, folder, prompt);
+            // Claude goes through `cswap run` so Remote Control can be restored. In a folder assigned to an
+            // account the engine picks it itself; else the active account, which runs plain claude. No known account: direct.
+            if (target == "claude" && Launch.Continue(mapped, who, _settings.PreserveRemoteControl, prompt) is { } run)
+                _engine.LaunchConsole(title, folder, run);
+            else Engine.LaunchConsoleWith(exe, title, folder, prompt);
             Notify("Hand-off ready", $"New {ProviderCli.Title(target)} session started with notes from the interrupted one.");
         }
         catch (Exception e) { Error("Could not continue", e); }
@@ -300,12 +333,21 @@ public sealed class TrayApp : ApplicationContext
                     await ContinueAsync(a.Provider, action["continue:".Length..]);
                     return;
                 case "terminal-folder":
-                    if (PickFolder($"Open a terminal as #{a.Number} in…") is { } f) OpenTerminal(a, f);
+                    if (PickFolder($"Open a terminal as #{a.Number} in…") is { } f)
+                        OpenTerminal(a.Provider == "claude" ? MappedAccount(f) ?? a : a, f);
                     return;
                 case "map":
-                    if (PickFolder($"Folder to pin to #{a.Number} (`cswap run` there uses this account)") is { } m)
-                        Notify("Folder pinned", await _engine.CommandAsync("map", a.Number.ToString(), m));
+                    if (PickFolder($"Project folder for #{a.Number} (`cswap run` there uses this account)") is not { } m) return;
+                    Notify("Project folder assigned", await _engine.CommandAsync("map", a.Number.ToString(), m));
+                    break;
+                case not null when action.StartsWith("project-open:"):
+                    var dir = action["project-open:".Length..];
+                    if (Directory.Exists(dir)) OpenTerminal(a, dir);
+                    else Notify("Folder not found", dir, ToolTipIcon.Warning);
                     return;
+                case not null when action.StartsWith("project-remove:"):
+                    Notify("Project folder removed", await _engine.CommandAsync("unmap", action["project-remove:".Length..]));
+                    break;
                 case "enable" or "disable":
                     await _engine.CommandAsync(action, a.Number.ToString());
                     break;
@@ -426,6 +468,9 @@ public sealed class TrayApp : ApplicationContext
         catch (Exception e) { Error("Could not read engine settings", e); return; }
         f.RefreshInterval.Value = _settings.RefreshSeconds;
         f.Startup.Checked = Startup.IsEnabled();
+        f.PreserveRc.Checked = _settings.PreserveRemoteControl;
+        f.AutoProject.Checked = _settings.AutoProjectAccount;
+        f.QuotaNotify.Checked = _settings.QuotaNotifications;
         if (f.ShowDialog() != DialogResult.OK) return;
         try
         {
@@ -438,6 +483,10 @@ public sealed class TrayApp : ApplicationContext
                 : ["config", "set", "autoswitch.model", models]);
             Startup.Set(f.Startup.Checked);
             _settings.RefreshSeconds = (int)f.RefreshInterval.Value;
+            _settings.PreserveRemoteControl = f.PreserveRc.Checked;
+            _settings.AutoProjectAccount = f.AutoProject.Checked;
+            if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
+            _settings.QuotaNotifications = f.QuotaNotify.Checked;
             _settings.Save();
             _timer.Interval = _settings.RefreshSeconds * 1000;
         }
