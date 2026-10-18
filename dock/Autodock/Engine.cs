@@ -89,11 +89,18 @@ public sealed partial class Engine(string exe)
 
     /// `refresh`: someone is looking, so re-read readings older than the
     /// engine's 3-minute floor instead of waiting out the idle back-off.
-    public Task<Snapshot> ListAsync(bool refresh = false) =>
-        refresh ? RunJsonAsync<Snapshot>("list", "--json", "--refresh") : RunJsonAsync<Snapshot>("list", "--json");
+    public async Task<Snapshot> ListAsync(bool refresh = false, string provider = "claude")
+    {
+        var s = await RunJsonAsync<Snapshot>(Args(provider, refresh ? ["list", "--json", "--refresh"] : ["list", "--json"]));
+        return s with { Accounts = s.Accounts.Select(a => a with { Provider = provider }).ToList() };
+    }
 
-    public Task<SwitchResult> SwitchAsync(int number) =>
-        RunJsonAsync<SwitchResult>("switch", number.ToString(), "--json");
+    public Task<SwitchResult> SwitchAsync(int number, string provider = "claude") =>
+        RunJsonAsync<SwitchResult>(Args(provider, ["switch", number.ToString(), "--json"]));
+
+    /// `cswap codex …` / `cswap grok …` route to the provider engines; Claude is the bare CLI.
+    internal static string[] Args(string provider, params string[] args) =>
+        provider == "claude" ? args : [provider, .. args];
 
     /// One auto-switch tick. The engine owns thresholds, cooldown, hysteresis,
     /// quarantine and the disabled/API-key exclusions; exit 0=switched 2=no-op 3=blocked.
@@ -134,7 +141,10 @@ public sealed partial class Engine(string exe)
 
     /// Opens a visible console running the engine with `args` (e.g. `run 2`).
     /// Windows Terminal when installed, plain conhost otherwise.
-    public void LaunchConsole(string title, string? workDir, params string[] args)
+    public void LaunchConsole(string title, string? workDir, params string[] args) => LaunchConsoleWith(Exe, title, workDir, args);
+
+    /// Same console, running `exe` (e.g. the provider's own CLI) instead of the engine.
+    public static void LaunchConsoleWith(string Exe, string title, string? workDir, params string[] args)
     {
         var cmdline = string.Join(' ', new[] { Exe }.Concat(args).Select(QuoteArg));
         var wt = FindOnPath("wt.exe");

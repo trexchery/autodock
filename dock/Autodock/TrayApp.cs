@@ -10,6 +10,8 @@ public sealed class TrayApp : ApplicationContext
     readonly ContextMenuStrip _menu = new();
     Snapshot? _snap;
     string? _error;
+    // Codex / Grok: polled on the same tick, each failure kept to its own section.
+    readonly Dictionary<string, (Snapshot? Snap, string? Error)> _others = [];
     bool _busy, _refreshPending;
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
@@ -26,7 +28,7 @@ public sealed class TrayApp : ApplicationContext
         _dash.AccountAction += (a, act) => _ = AccountActionAsync(a, act);
         _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
         _dash.SettingsRequested += () => _ = ShowSettingsAsync();
-        _dash.AddRequested += () => _ = EnrollAsync(null);
+        _dash.AddRequested += PickProviderToAdd;
         _dash.AutoToggled += on => SetAutoSwitch(on);
         _dash.VisibleChanged += (_, _) => { if (!_dash.Visible) _dashHiddenAt = DateTime.UtcNow; };
         _dash.SetAuto(_settings.AutoSwitch);
@@ -41,7 +43,7 @@ public sealed class TrayApp : ApplicationContext
         if (_settings.Pinned)
         {
             _dash.SetPinned(true);
-            _dash.Render(_snap, _error);
+            RenderDash();
             _dash.ShowPinnedAt(_settings.PinnedX, _settings.PinnedY);
         }
         else if (!minimized) _dash.ShowNearTray();
@@ -68,7 +70,7 @@ public sealed class TrayApp : ApplicationContext
     void ShowDashboard()
     {
         _ = TickAsync(runAuto: false, refresh: true); // opening it is when freshness matters
-        _dash.Render(_snap, _error);
+        RenderDash();
         if (_dash.Pinned) { _dash.ShowPinnedAt(_settings.PinnedX, _settings.PinnedY); _dash.Activate(); }
         else _dash.ShowNearTray();
     }
@@ -100,21 +102,51 @@ public sealed class TrayApp : ApplicationContext
             _error = Engine.Redact(e.Message);
             _dash.SetStatus("offline");
         }
+        try { await PollProvidersAsync(refresh); }
         finally
         {
             _busy = false;
         }
-        var active = _snap?.Accounts.FirstOrDefault(a => a.Active);
+        // Tray dot and tooltip follow Claude, unless Claude is unused and exactly one other provider is.
+        var withAccounts = _others.Values.Where(o => o.Snap is { Accounts.Count: > 0 }).ToList();
+        var basis = _snap is not { Accounts.Count: > 0 } && withAccounts.Count == 1 ? withAccounts[0].Snap : _snap;
+        var active = basis?.Accounts.FirstOrDefault(a => a.Active);
         var old = _tray.Icon;
         _tray.Icon = TrayIcons.WithDot(active?.ShownUsage == null ? null : Format.Peak(active), _settings.AutoSwitch);
         if (old != TrayIcons.App) old?.Dispose();
-        _tray.Text = Format.Tooltip(_snap, _settings.AutoSwitch);
-        if (_dash.Visible) _dash.Render(_snap, _error);
+        _tray.Text = Format.Tooltip(basis, _settings.AutoSwitch);
+        if (_dash.Visible) RenderDash();
         if (_refreshPending)
         {
             _refreshPending = false;
             _ = TickAsync(runAuto: false, refresh: true);
         }
+    }
+
+    async Task PollProvidersAsync(bool refresh)
+    {
+        foreach (var p in ProviderCli.All)
+        {
+            if (!ProviderCli.Present(p)) { _others.Remove(p); continue; }
+            try { _others[p] = (await _engine.ListAsync(refresh, p), null); }
+            catch (Exception e) { _others[p] = (_others.GetValueOrDefault(p).Snap, Engine.Redact(e.Message)); }
+        }
+    }
+
+    void RenderDash() =>
+        _dash.Render(_snap, _error, ProviderCli.All.Where(_others.ContainsKey).Select(p => (p, _others[p].Snap, _others[p].Error)).ToList());
+
+    /// "+" with several CLIs installed: a small themed menu picks which provider to add.
+    void PickProviderToAdd()
+    {
+        var installed = ProviderCli.All.Where(p => ProviderCli.Find(p) != null).ToList();
+        if (installed.Count == 0) { _ = EnrollAsync(null); return; }
+        var menu = new ContextMenuStrip();
+        foreach (var p in installed.Prepend("claude"))
+            menu.Items.Add(ProviderCli.Title(p) + " account…", null, (_, _) => _ = EnrollAsync(null, p));
+        MenuRenderer.Apply(menu);
+        menu.Closed += (_, _) => _dash.BeginInvoke(menu.Dispose);
+        menu.Show(Cursor.Position);
     }
 
     async Task AutoTickAsync()
@@ -172,6 +204,19 @@ public sealed class TrayApp : ApplicationContext
 
     async Task SwitchAsync(Account a)
     {
+        if (a.Provider != "claude")
+        {
+            // Only the login file is rewritten atomically; running sessions are never touched.
+            try
+            {
+                var pr = await _engine.SwitchAsync(a.Number, a.Provider);
+                Notify(pr.Switched ? $"Switched {ProviderCli.Title(a.Provider)} account" : "No switch",
+                    pr.Switched ? $"Now using {Name(pr.To)}. {pr.Note}" : pr.Reason ?? "Already active");
+            }
+            catch (Exception e) { Error("Switch failed", e); }
+            await TickAsync(runAuto: false);
+            return;
+        }
         var running = ClaudeCli.RunningCount();
         if (running > 0 && MessageBox.Show(
                 $"{running} Claude Code process(es) are running.\n\n" +
@@ -194,6 +239,14 @@ public sealed class TrayApp : ApplicationContext
     {
         try
         {
+            if (a.Provider != "claude")
+            {
+                var title = $"{ProviderCli.Title(a.Provider)} · {a.Email}";
+                // The live login runs the plain CLI: `run` refuses it, since two copies would share a single-use refresh token.
+                if (a.Active && ProviderCli.Find(a.Provider) is { } cli) Engine.LaunchConsoleWith(cli, title, folder);
+                else _engine.LaunchConsole(title, folder, a.Provider, "run", a.Number.ToString());
+                return;
+            }
             // `cswap run N` pins this console to account N via an isolated profile;
             // global switches and auto-switch never touch it.
             _engine.LaunchConsole($"Claude · {(string.IsNullOrEmpty(a.Alias) ? a.Email : a.Alias)}", folder, "run", a.Number.ToString());
@@ -225,8 +278,14 @@ public sealed class TrayApp : ApplicationContext
                         : ["alias", a.Number.ToString(), alias]);
                     break;
                 case "reenroll":
-                    await EnrollAsync(a);
+                    await EnrollAsync(a, a.Provider);
                     return;
+                case "remove" when a.Provider != "claude":
+                    if (MessageBox.Show($"Remove {ProviderCli.Title(a.Provider)} #{a.Number} {a.Email} from autodock?\n\n" +
+                                        "Its stored login is deleted. The current login is not logged out.",
+                            "autodock", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                    await _engine.CommandAsync(a.Provider, "remove", a.Number.ToString(), "--json");
+                    break;
                 case "remove":
                     if (MessageBox.Show($"Remove #{a.Number} {a.Email} from autodock?\n\nIts stored backup is deleted. " +
                                         "Your current Claude Code login is not logged out.",
@@ -239,8 +298,29 @@ public sealed class TrayApp : ApplicationContext
         await TickAsync(runAuto: false);
     }
 
-    async Task EnrollAsync(Account? existing)
+    async Task EnrollAsync(Account? existing, string provider = "claude")
     {
+        if (provider != "claude")
+        {
+            var title = ProviderCli.Title(provider);
+            if (MessageBox.Show(
+                    (existing == null ? $"Add a {title} account.\n\n" : $"Log in again as {existing.Email}.\n\n") +
+                    $"A console opens with the official login (`{provider} login`). Sign in in the browser " +
+                    "(a private window avoids approving the account you're already signed in with).\n\n" +
+                    "This uses a separate, temporary profile: your current login and running sessions are not affected.",
+                    "autodock", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+            try
+            {
+                // First account: keep the login already on this machine too (errors when there is none).
+                if (_others.GetValueOrDefault(provider).Snap is not { Accounts.Count: > 0 })
+                    try { await _engine.CommandAsync(provider, "add-current", "--json"); } catch (EngineException) { }
+                await ProviderCli.EnrollAsync(_engine, provider);
+                Notify("Account enrolled", $"{title} account added.");
+            }
+            catch (Exception e) { Error("Enrollment failed", e); }
+            await TickAsync(runAuto: false);
+            return;
+        }
         if (MessageBox.Show(
                 (existing == null ? "Add a Claude account.\n\n" : $"Log in again as {existing.Email}.\n\n") +
                 "A console opens with the official Claude Code login (`claude auth login`).\n\n" +

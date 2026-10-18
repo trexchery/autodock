@@ -26,6 +26,8 @@ public sealed class SettingsForm : Form
         _y = Ui.S(20);
 
         Section("Auto-switch");
+        Controls.Add(new Label { Text = "Claude accounts only; Codex and Grok switch manually.", Tag = "muted", Font = Ui.Font(8f), AutoSize = true, Location = new Point(_pad, _y - Ui.S(4)) });
+        _y += Ui.S(20);
         Row("Switch at", "of the 5-hour or weekly limit", Threshold, Ui.S(72), "%");
         Row("Next account", null, Strategy, Ui.S(170));
         Row("Also watch models", "e.g. Opus, or 'all'", Models, Ui.S(170));

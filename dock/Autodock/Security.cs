@@ -74,27 +74,37 @@ public static class ClaudeCli
 
     /// Official `claude auth login` against a throwaway CLAUDE_CONFIG_DIR, then
     /// `cswap enroll` imports it. The default login is never touched.
-    public static async Task<string> EnrollAsync(Engine engine)
+    public static Task<string> EnrollAsync(Engine engine)
     {
         var claude = Find() ?? throw new EngineException("Claude Code (claude.exe) not found on PATH.");
+        return LoginInTempHomeAsync(engine, claude, ["auth", "login"], "CLAUDE_CONFIG_DIR", ".credentials.json", ["enroll"], null);
+    }
+
+    /// Runs `exe args` in a visible console with `homeVar` pointing at a fresh,
+    /// hardened temp dir, then `cswap <enrollArgs> <dir>`; the dir is always deleted.
+    internal static async Task<string> LoginInTempHomeAsync(Engine engine, string exe, string[] args, string homeVar,
+        string expectedFile, string[] enrollArgs, Action<string, ProcessStartInfo>? prepare)
+    {
         var root = Path.Combine(DockSettings.Dir, "enroll");
         StoreSecurity.Harden(root);
         var dir = Path.Combine(root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
         {
-            var psi = claude.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
-                ? new ProcessStartInfo("cmd.exe") { ArgumentList = { "/c", claude, "auth", "login" } }
-                : new ProcessStartInfo(claude) { ArgumentList = { "auth", "login" } };
+            var psi = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
+                ? new ProcessStartInfo("cmd.exe") { ArgumentList = { "/c", exe } }
+                : new ProcessStartInfo(exe);
+            foreach (var a in args) psi.ArgumentList.Add(a);
             psi.UseShellExecute = false;
             psi.CreateNoWindow = false; // visible console: the user completes the official login there
             psi.WorkingDirectory = dir;
-            psi.Environment["CLAUDE_CONFIG_DIR"] = dir;
-            using (var p = Process.Start(psi) ?? throw new EngineException("could not start Claude Code"))
+            psi.Environment[homeVar] = dir;
+            prepare?.Invoke(dir, psi);
+            using (var p = Process.Start(psi) ?? throw new EngineException($"could not start {Path.GetFileName(exe)}"))
                 await p.WaitForExitAsync();
-            if (!File.Exists(Path.Combine(dir, ".credentials.json")))
+            if (!File.Exists(Path.Combine(dir, expectedFile)))
                 throw new EngineException("Login was not completed.");
-            var output = await engine.CommandAsync("enroll", dir);
+            var output = await engine.CommandAsync([.. enrollArgs, dir]);
             return output.Trim();
         }
         finally
@@ -102,5 +112,46 @@ public static class ClaudeCli
             // The directory holds a live credential; never leave it behind.
             try { Directory.Delete(dir, recursive: true); } catch { }
         }
+    }
+}
+
+/// Codex CLI and Grok Build: detection and enrollment. Their engines live in
+/// src/claude_swap/providers; autodock only starts the official login.
+public static class ProviderCli
+{
+    public static readonly string[] All = ["codex", "grok"];
+
+    public static string Title(string provider) => provider switch { "codex" => "Codex", "grok" => "Grok", _ => "Claude" };
+
+    public static string? Find(string provider)
+    {
+        var home = StoreSecurity.UserProfile;
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return Engine.FindOnPath(provider + ".exe")
+            ?? new[]
+            {
+                Path.Combine(home, ".local", "bin", provider + ".exe"),
+                Path.Combine(home, "." + provider, "bin", provider + ".exe"),
+            }.FirstOrDefault(File.Exists)
+            ?? Engine.FindOnPath(provider + ".cmd")
+            ?? new[] { Path.Combine(appData, "npm", provider + ".cmd") }.FirstOrDefault(File.Exists);
+    }
+
+    /// Worth polling: the CLI is installed or accounts were enrolled earlier.
+    public static bool Present(string provider) =>
+        Find(provider) != null || File.Exists(Path.Combine(StoreSecurity.BackupRoot, "providers", provider, "accounts.json"));
+
+    public static Task<string> EnrollAsync(Engine engine, string provider)
+    {
+        var exe = Find(provider) ?? throw new EngineException($"{Title(provider)} CLI ({provider}) not found on PATH.");
+        var homeVar = provider == "codex" ? "CODEX_HOME" : "GROK_HOME";
+        return ClaudeCli.LoginInTempHomeAsync(engine, exe, ["login"], homeVar, "auth.json", [provider, "enroll"], (dir, psi) =>
+        {
+            // Codex may otherwise pick the OS keyring; the engine imports auth.json.
+            if (provider == "codex") File.WriteAllText(Path.Combine(dir, "config.toml"), "cli_auth_credentials_store = \"file\"\n");
+            // An inline or relocated grok credential would bypass the temp home.
+            psi.Environment.Remove("GROK_AUTH");
+            psi.Environment.Remove("GROK_AUTH_PATH");
+        });
     }
 }
