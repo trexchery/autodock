@@ -23,7 +23,7 @@ public sealed partial class TrayApp
         _agents.Authorize = AuthorizeAgents;
         _agents.Notify = (title, text) => Notify(title, text);
         _agents.Changed += OnAgentsChanged;
-        _link = new AgentsLink.Server(_agents.HandleAsync);
+        _link = new AgentsLink.Server(_agents.HandleAsync, presence: (repo, open) => { if (open) _agents.Attach(repo); else _agents.Detach(repo); });
         _agents.Start();
         _ = ReadEngineThresholdAsync();
         if (_snap != null) _agents.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
@@ -53,10 +53,11 @@ public sealed partial class TrayApp
                 AgentsTerminal.SetState(AgentStore.DefaultRoot, repo.Path, state);
                 _labels[repo.Path] = state;
             }
-        var needs = _agents.NeedsOwner;
+        // The dot only for a real problem: questions and approvals wait in the agents terminal.
+        var problem = _agents.HasProblem;
         var working = _agents.Working;
-        _dash.SetAgents(needs ? Palette.Warn : working > 0 ? Palette.Current.Live : null,
-            needs ? "Agents terminal · something needs you" : working > 0 ? "Agents terminal · working" : "Agents terminal");
+        _dash.SetAgents(problem ? Palette.Warn : working > 0 ? Palette.Current.Live : null,
+            problem ? "Agents terminal · something needs fixing" : working > 0 ? "Agents terminal · working" : "Agents terminal");
     }
 
     /// The launcher: the agents terminal for the last repository (a folder picker the first time).
@@ -86,12 +87,14 @@ public sealed partial class TrayApp
     {
         foreach (var repo in _agents?.Repos.Where(r => r.Authorized) ?? [])
         {
-            var item = new ToolStripMenuItem($"{repo.Leaf} · {Glance(repo)}") { ToolTipText = repo.Path };
+            var open = _agents!.TerminalOpen(repo);
+            var item = new ToolStripMenuItem($"{repo.Leaf} · {Glance(repo, open)}") { ToolTipText = repo.Path };
             item.DropDownItems.Add("Open agents terminal", null, (_, _) => OpenAgentsTerminal(repo.Path));
             item.DropDownItems.Add(repo.Paused ? "Resume" : "Pause", null, (_, _) =>
             {
-                if (repo.Paused) _agents!.Resume(repo);
-                else _ = _agents!.PauseAsync(repo);
+                if (!repo.Paused) { _ = _agents!.PauseAsync(repo); return; }
+                _agents!.Resume(repo);
+                if (!_agents.TerminalOpen(repo)) OpenAgentsTerminal(repo.Path); // agents work only while it is open
             });
             item.DropDownItems.Add("Stop", null, (_, _) => _ = _agents!.StopAsync(repo));
             items.Add(item);
@@ -101,9 +104,10 @@ public sealed partial class TrayApp
         else if (_agents?.Repos.Any(r => r.Authorized && r.Paused) == true) items.Add("Resume all agents", null, (_, _) => _agents.Resume());
     }
 
-    static string Glance(RepoAgents repo)
+    static string Glance(RepoAgents repo, bool open)
     {
         if (repo.Paused) return "paused";
+        if (!open) return "waits for its terminal";
         var parts = new List<string>();
         if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking)) parts.Add("working");
         if (repo.Items.Count(i => i.State == ItemState.NeedsOwner) is > 0 and var needs) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
@@ -140,15 +144,16 @@ public sealed partial class TrayApp
         using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
         owner.Show();
         var ok = MessageBox.Show(owner,
-            $"Let autodock agents work on {repo.Leaf} continuously?\n\n" +
+            $"Let autodock agents work on {repo.Leaf} while its agents terminal is open?\n\n" +
             "• They take on its actionable open GitHub issues one at a time (and requests you make in the agents terminal), " +
             "each in its own git worktree, using your other Claude accounts: never the account you're signed in with, " +
             "which is never switched.\n" +
             "• Each change is reviewed and checked, then autodock pushes a branch and opens a pull request, with at most two " +
             "waiting for your review. Nothing is merged, no issue is closed, and branch protections are never bypassed.\n" +
             "• When an issue needs your decision, the question is posted on the issue and work moves to the next one.\n" +
-            "• They keep going after restarts until you pause or stop them (in the agents terminal, or by right-clicking " +
-            "the agents button in the autodock flyout).\n" +
+            "• They work only while this repository's agents terminal is open: closing it pauses them, and reopening it " +
+            "continues where they were. Pause or stop them in the agents terminal, or by right-clicking the agents button " +
+            "in the autodock flyout.\n" +
             "• You're responsible for following Anthropic's terms (anthropic.com/legal) for the accounts you use.\n\n" +
             $"Pull requests target {baseBranch}. " +
             (verify is { Length: > 0 } v ? $"Before each one, autodock runs this command in the change's worktree:\n    {v}\n\n" : "No verification command: pull requests rely on CI.\n\n") +
@@ -161,13 +166,10 @@ public sealed partial class TrayApp
     {
         if (_agents is { Working: > 0 } agents)
         {
-            var answer = MessageBox.Show(
-                "An agent is working.\n\n" +
-                "Yes: stop it now. It continues from where it was the next time autodock starts.\n" +
-                "No: leave it running. autodock picks it up again when it starts.",
-                "autodock", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-            if (answer == DialogResult.Cancel) return;
-            if (answer == DialogResult.Yes) await agents.StopAllAsync();
+            if (MessageBox.Show(
+                    "An agent is working. Exiting stops it; it continues from where it was the next time its agents terminal is open.",
+                    "autodock", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            await agents.StopAllAsync();
         }
         ExitThread();
     }

@@ -23,15 +23,16 @@ public static class AccountPicker
 
     /// The account for the next worker, or null with the reason nothing fits.
     /// `busy`: workers running per email+org. `prefer`: the account a resumable session lives on.
+    /// Why nothing can ever start until the owner acts (not a limit or busy accounts, which pass).
+    internal const string OnlyYours = "agents need a Claude account besides the one you are signed in with (they never run on, or switch, your own login)",
+        NoneUsable = "no usable Claude account";
+
     public static (Account? Pick, string? Why) Pick(IReadOnlyList<Account> accounts, double threshold,
         IReadOnlyDictionary<string, int> busy, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now,
         int perAccount = 2, string? prefer = null, bool consumeFirst = false)
     {
         var usable = accounts.Where(Usable).ToList();
-        if (usable.Count == 0)
-            return (null, accounts.Any(a => a.Active)
-                ? "agents need a Claude account besides the one you are signed in with (they never run on, or switch, your own login)"
-                : "no usable Claude account");
+        if (usable.Count == 0) return (null, accounts.Any(a => a.Active) ? OnlyYours : NoneUsable);
         var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now)).ToList();
         var headroom = open.Where(a => Peak(a) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();

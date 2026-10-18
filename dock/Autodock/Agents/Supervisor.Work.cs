@@ -94,7 +94,7 @@ public sealed partial class Supervisor
     async Task CheckAsync(RepoAgents repo, WorkItem item)
     {
         // Paused or stopped: the check waits (in Checking) and runs again on resume.
-        if (_disposed || item.State != ItemState.Checking || !repo.Running || !_checks.Add(item)) return;
+        if (_disposed || item.State != ItemState.Checking || !Active(repo) || !_checks.Add(item)) return;
         var summary = item.Summary ?? item.Title;
         try
         {
@@ -108,11 +108,13 @@ public sealed partial class Supervisor
             var start = await StartPointAsync(repo);
             if ((await GitAsync(wt, "rev-list", "--count", start + "..HEAD")).Out.Trim() == "0")
             {
-                Park(repo, item, "finished without changing anything: " + summary);
+                Park(repo, item, NoChange + ": " + summary);
                 return;
             }
+            if (!Active(repo)) return; // closed meanwhile: checked again on the next open
             var verified = repo.Verify is { Length: > 0 } verify ? await VerifyAsync(repo, item, wt, verify) : null;
             if (Dropped(repo, item)) return; // skipped during verification
+            if (_interrupted.Remove(item)) return; // its terminal closed: verified again on the next open
             if (verified is { } failure)
             {
                 item.Followup = $"autodock ran `{repo.Verify}` in this worktree and it failed:\n{failure}";
@@ -150,7 +152,7 @@ public sealed partial class Supervisor
                 item.Note = $"ready on branch {item.Branch} (no remote to push to)";
                 return;
             }
-            if (!repo.Running || Dropped(repo, item)) return; // paused, stopped or skipped during verification
+            if (!Active(repo) || Dropped(repo, item)) return; // paused, stopped, closed or skipped during verification
             var push = await GitAsync(wt, "push", "--quiet", "-u", "origin", item.Branch!);
             if (!push.Ok)
             {
@@ -163,7 +165,7 @@ public sealed partial class Supervisor
                 throw new AgentsException("could not push: " + push.Why);
             }
             // Pushing is idempotent: a pause now leaves it in Checking, and resuming opens the pull request.
-            if (!repo.Running || Dropped(repo, item)) return;
+            if (!Active(repo) || Dropped(repo, item)) return;
             if (item.Pr == null) await OpenPullRequestAsync(repo, item, wt, summary);
             item.State = ItemState.Open;
             item.Followup = null;
@@ -198,7 +200,9 @@ public sealed partial class Supervisor
         File.WriteAllText(log, "");
         using var proc = AgentProcess.StartShell(verify, wt, $@"Local\autodock-verify-{repo.Key}-{item.Id}-{Guid.NewGuid().ToString("N")[..6]}", empty, log,
             new Dictionary<string, string?>(WorkerEnvironment(Path.Combine(_store.Root, "no-gh"))) { ["CI"] = "1" });
-        await Task.WhenAny(proc.WaitForExitAsync(), Task.Delay(Config.VerifyTimeout));
+        _verifying[item] = (repo, proc);
+        try { await Task.WhenAny(proc.WaitForExitAsync(), Task.Delay(Config.VerifyTimeout)); }
+        finally { _verifying.Remove(item); }
         if (!proc.HasExited)
         {
             await proc.StopAsync(TimeSpan.Zero);
@@ -246,6 +250,9 @@ public sealed partial class Supervisor
         Park(repo, item, why);
         item.HoldFor = kind;
     }
+
+    /// A finished run that changed nothing: the owner's call (close the issue or retry), not a failure.
+    const string NoChange = "finished without changing anything";
 
     void Park(RepoAgents repo, WorkItem item, string why)
     {
@@ -361,7 +368,7 @@ public sealed partial class Supervisor
         var r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author,blockedBy");
         if (!r.Ok) r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author");
         if (!r.Ok) { repo.Note = "could not read issues: " + r.Why; Save(); return; }
-        if (repo.Note?.StartsWith("could not read issues") == true) repo.Note = null;
+        if (repo.Note?.StartsWith("could not") == true) repo.Note = null; // issues read, or a one-off baseline hiccup
         if (IssueInfo.ParseList(r.Out) is not { } issues) { repo.Note = "could not read issues: gh printed something unexpected"; Save(); return; }
         var open = issues.Select(i => i.Number).ToHashSet();
         // Issues an open pull request already resolves are someone's work in progress.
@@ -433,6 +440,7 @@ public sealed partial class Supervisor
     async Task VerifyBaselineAsync(RepoAgents repo)
     {
         if (repo.Verify is not { Length: > 0 } verify) return;
+        if (!Active(repo)) { _rebaseline.Add(repo); return; } // its terminal closed first: on the next open
         _baseline.Add(repo);
         var probe = new WorkItem { Id = "baseline", Title = "baseline" };
         var wt = _store.Worktree(repo, probe);
@@ -442,7 +450,10 @@ public sealed partial class Supervisor
             await GitAsync(repo.Path, "worktree", "prune");
             var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
             if (!add.Ok) { repo.Note = "could not check the verification command: " + add.Why; return; }
-            if (await VerifyAsync(repo, probe, wt, verify) is { } failure)
+            if (!Active(repo)) { _rebaseline.Add(repo); return; } // closed meanwhile
+            var result = await VerifyAsync(repo, probe, wt, verify);
+            if (_interrupted.Remove(probe)) _rebaseline.Add(repo); // its terminal closed: on the next open
+            else if (result is { } failure)
             {
                 repo.Paused = true;
                 repo.Note = $"`{verify}` fails on {repo.Base} before any change, so agents are paused. Fix it or change the command, then resume.\n{failure}";

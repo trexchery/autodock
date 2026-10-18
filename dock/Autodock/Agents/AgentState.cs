@@ -140,7 +140,8 @@ public sealed class AgentStore(string root)
 
     public void Save(AgentsState s) => AtomicFile.WriteAllText(StatePath, JsonSerializer.Serialize(s, Options));
 
-    /// A repository was left running, or a worker may still be: the tray carries on at start.
+    /// A repository was left running, or a worker may still be: the tray starts agents, so open terminals link up
+    /// and runs without one stop.
     public static bool HasWork(string root) =>
         new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }));
 

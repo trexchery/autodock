@@ -14,6 +14,8 @@ public sealed class AgentsConfig
     public TimeSpan StopGrace { get; set; } = TimeSpan.FromSeconds(60);
     public TimeSpan VerifyTimeout { get; set; } = TimeSpan.FromMinutes(30);
     public TimeSpan LaunchBackoff { get; set; } = TimeSpan.FromMinutes(2);
+    /// After a start, how long open agents terminals get to link up again before other runs stop.
+    public TimeSpan Relink { get; set; } = TimeSpan.FromSeconds(15);
 }
 
 public sealed class AgentsException(string message) : Exception(message);
@@ -24,7 +26,7 @@ public sealed class AgentsException(string message) : Exception(message);
 /// a pull request, which it watches for failing checks, conflicts and review comments. A question
 /// for the owner parks its item and work moves on; at most two pull requests wait for review.
 /// No model supervises any of this, and it does nothing while nothing needs doing: one timer, armed
-/// only for the next real deadline.
+/// only for the next real deadline. A repository works only while its agents terminal is open.
 ///
 /// Single-threaded: every member runs on the SynchronizationContext it was created on (the tray's
 /// UI thread); awaits are the only interleaving points.
@@ -47,6 +49,12 @@ public sealed partial class Supervisor : IDisposable
     readonly Dictionary<RepoAgents, DateTimeOffset> _prPolled = [], _fetched = [];
     readonly HashSet<RepoAgents> _baseline = [];
     readonly HashSet<WorkItem> _checks = [];
+    /// Open agents terminals per repository key, and the verifications under way (stopped with them).
+    readonly Dictionary<string, int> _terminals = [];
+    readonly Dictionary<WorkItem, (RepoAgents Repo, AgentProcess Proc)> _verifying = [];
+    readonly HashSet<WorkItem> _interrupted = [];
+    readonly HashSet<RepoAgents> _rebaseline = [];
+    DateTimeOffset _started = DateTimeOffset.Now;
     readonly SemaphoreSlim _gitGate = new(1, 1);
     readonly System.Threading.Timer _timer;
     IReadOnlyList<Account>? _accounts;
@@ -58,7 +66,15 @@ public sealed partial class Supervisor : IDisposable
     public string? Waiting { get; private set; }
     public IReadOnlyList<RepoAgents> Repos => _state.Repos;
     public int Working => _workers.Count;
-    public bool NeedsOwner => _state.Repos.Any(r => r.Authorized && r.Items.Any(i => i.State == ItemState.NeedsOwner));
+    /// Something stopped that only the owner can fix. Questions and approvals are not: those are
+    /// answered in the agents terminal, the only place agents work.
+    public bool HasProblem => _state.Repos.Any(Problem) || Waiting is AccountPicker.OnlyYours or AccountPicker.NoneUsable;
+
+    internal static bool Problem(RepoAgents r) => r.Authorized && (r.Note != null || r.Items.Any(Problem));
+
+    /// Parked after retries ran out or a check, push or pull request failed; not a hold, a question or a no-op.
+    internal static bool Problem(WorkItem i) =>
+        i is { State: ItemState.NeedsOwner, HoldFor: null, AskedAt: null } && i.Note?.StartsWith(NoChange) != true;
 
     /// Anything the tray shows may have changed.
     public event Action? Changed;
@@ -92,6 +108,7 @@ public sealed partial class Supervisor : IDisposable
     /// Re-attaches to runs that outlived the last session, finishes interrupted checks, then pumps.
     public void Start()
     {
+        _started = DateTimeOffset.Now;
         foreach (var repo in _state.Repos)
             foreach (var item in repo.Items)
             {
@@ -148,9 +165,11 @@ public sealed partial class Supervisor : IDisposable
                 {
                     _pumpAgain = false;
                     CheckStalls();
-                    foreach (var repo in _state.Repos.Where(r => r.Running).ToList())
+                    StopUnwatched();
+                    foreach (var repo in _state.Repos.Where(Active).ToList())
                     {
-                        if (Due(repo.LastScan, Config.ScanEvery)) await ScanAsync(repo);
+                        if (_rebaseline.Remove(repo)) Fire(() => VerifyBaselineAsync(repo)); // interrupted by a closed terminal
+                        if (Due(repo.LastScan, ScanEvery(repo))) await ScanAsync(repo);
                         if (repo.Items.Any(Watched) && Due(_prPolled.GetValueOrDefault(repo), Config.PrEvery))
                             await WatchPullRequestsAsync(repo);
                         // Checks interrupted by a restart or a pause pick up where they were.
@@ -183,14 +202,18 @@ public sealed partial class Supervisor : IDisposable
         void Min(TimeSpan t) { if (next is not { } n || t < n) next = t < TimeSpan.Zero ? TimeSpan.Zero : t; }
         if (retry) Min(TimeSpan.FromSeconds(30));
         if (_workers.Count > 0) Min(TimeSpan.FromSeconds(Math.Clamp(Config.Stall.TotalSeconds / 4, 1, 60)));
-        foreach (var repo in _state.Repos.Where(r => r.Running))
+        if ((_workers.Count > 0 || _verifying.Count > 0) && DateTimeOffset.Now - _started < Config.Relink) Min(_started + Config.Relink - DateTimeOffset.Now);
+        foreach (var repo in _state.Repos.Where(Active))
         {
-            Min(Until(repo.LastScan, Config.ScanEvery));
+            Min(Until(repo.LastScan, ScanEvery(repo)));
             if (repo.Items.Any(Watched)) Min(Until(_prPolled.GetValueOrDefault(repo), Config.PrEvery));
         }
         foreach (var t in _notBefore.Values) Min(t - DateTimeOffset.Now);
         _timer.Change(next is { } d ? (long)Math.Max(d.TotalMilliseconds, 250) : Timeout.Infinite, Timeout.Infinite);
     }
+
+    /// A problem note (gh signed out, issues unreadable) is checked again within a minute, so its dot clears soon after the fix.
+    TimeSpan ScanEvery(RepoAgents repo) => repo.Note != null ? TimeSpan.FromMinutes(1) : Config.ScanEvery;
 
     static bool Due(DateTimeOffset? last, TimeSpan every) => last is not { } t || DateTimeOffset.Now - t >= every;
     static TimeSpan Until(DateTimeOffset? last, TimeSpan every) => last is { } t ? t + every - DateTimeOffset.Now : TimeSpan.Zero;
@@ -218,7 +241,7 @@ public sealed partial class Supervisor : IDisposable
     {
         if (_launching || _stopping || _accounts == null) return;
         string? waiting = null;
-        foreach (var repo in _state.Repos.Where(r => r.Running && !_baseline.Contains(r)).ToList())
+        foreach (var repo in _state.Repos.Where(r => Active(r) && !_baseline.Contains(r)).ToList())
         {
             if (_disposed || _launching) break;
             if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking)) continue; // one at a time
@@ -285,7 +308,7 @@ public sealed partial class Supervisor : IDisposable
                     catch (Exception e) when (e is EngineException or System.Text.Json.JsonException) { }
                 prompt = WorkPrompt(repo, item, notes, item.Issue is { } n ? await IssueDiscussionAsync(repo, n) : null);
             }
-            if (!repo.Running || _stopping || item.State != ItemState.Working || !repo.Items.Contains(item))
+            if (!Active(repo) || _stopping || item.State != ItemState.Working || !repo.Items.Contains(item))
             {
                 // Paused, stopped or skipped while this was being prepared.
                 if (item.State == ItemState.Working && repo.Items.Contains(item)) item.State = ItemState.Queued;
@@ -560,6 +583,47 @@ public sealed partial class Supervisor : IDisposable
         await Task.WhenAny(Task.WhenAll(StopWorkersAsync(null, "paused"), Task.WhenAll(finishing)), Task.Delay(Config.StopGrace + TimeSpan.FromSeconds(15)));
     }
 
+    // -- the agents terminal ------------------------------------------------
+
+    /// Authorized, not paused, and its agents terminal open: agents never work in the background.
+    bool Active(RepoAgents repo) => repo.Running && TerminalOpen(repo);
+
+    public bool TerminalOpen(RepoAgents repo) => _terminals.GetValueOrDefault(repo.Key) > 0;
+
+    /// An agents terminal opened for this folder, or linked up again after a restart.
+    public void Attach(string path)
+    {
+        var key = AgentStore.KeyFor(path);
+        _terminals[key] = _terminals.GetValueOrDefault(key) + 1;
+        Pump();
+    }
+
+    /// One closed. With none left, the repository's work stops as on a pause and continues on the next open.
+    public void Detach(string path)
+    {
+        var key = AgentStore.KeyFor(path);
+        if (_terminals.GetValueOrDefault(key) > 1) _terminals[key]--;
+        else _terminals.Remove(key);
+        Pump();
+    }
+
+    /// Runs and verifications of repositories without an open terminal stop: no failure, resumed later.
+    /// Right after a start, open terminals first get a moment to link up again.
+    void StopUnwatched()
+    {
+        if (DateTimeOffset.Now - _started < Config.Relink) return;
+        foreach (var repo in _state.Repos.Where(r => !Active(r)))
+        {
+            foreach (var item in _workers.Keys.Where(repo.Items.Contains).ToList()) Fire(() => StopWorkerAsync(item, "paused"));
+            foreach (var (item, (_, proc)) in _verifying.Where(v => v.Value.Repo == repo).ToList())
+            {
+                _verifying.Remove(item);
+                _interrupted.Add(item);
+                Fire(() => proc.StopAsync(TimeSpan.Zero));
+            }
+        }
+    }
+
     public RepoAgents? RepoFor(string path)
     {
         var key = AgentStore.KeyFor(path);
@@ -631,7 +695,7 @@ public sealed partial class Supervisor : IDisposable
     {
         _disposed = true;
         _timer.Dispose();
-        // Runs keep going; the next start re-attaches. Only our handles go.
+        // Runs keep going; the next start re-attaches them, and stops them unless their terminal is open.
         foreach (var w in _workers.Values) w.Proc.Dispose();
         _workers.Clear();
     }

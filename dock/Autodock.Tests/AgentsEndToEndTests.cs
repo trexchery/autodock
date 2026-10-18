@@ -76,16 +76,26 @@ public sealed class AgentsEndToEndTests : IDisposable
         PrEvery = TimeSpan.FromSeconds(1),
         StopGrace = TimeSpan.FromSeconds(5),
         LaunchBackoff = TimeSpan.FromSeconds(1),
+        Relink = TimeSpan.FromSeconds(1),
     };
 
-    Task<Supervisor> StartAsync(AgentsConfig? config = null) => _loop.Run(() =>
+    /// The tray starting, with the repository's agents terminal open (agents work only then) unless `terminal` is false.
+    Task<Supervisor> StartAsync(AgentsConfig? config = null, bool terminal = true) => _loop.Run(() =>
     {
         var s = new Supervisor(_engine, _cli, _store, config ?? Fast());
         s.Authorize = (_, _, _) => Task.FromResult(true);
         s.Notify = (title, text) => _notes.Enqueue($"{title}: {text}");
         s.Start();
+        if (terminal) s.Attach(_repo);
         s.UpdateAccounts(Accounts, []);
         return _sup = s;
+    });
+
+    Task Terminal(bool open) => _loop.Run(() =>
+    {
+        if (open) _sup!.Attach(_repo);
+        else _sup!.Detach(_repo);
+        return 0;
     });
 
     void Issues(string json) => File.WriteAllText(Path.Combine(_gh, "issues.json"), json);
@@ -304,6 +314,66 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Equal("Resumed.", await Tool("agents_control", """{"action":"resume"}"""));
         await Until(r => Item(r, 60).State == ItemState.Open, "the resumed run finishes");
         Assert.Contains(Runs, r => r.Contains("--resume"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ClosingTheTerminalPausesTheWorkAndReopeningContinuesIt()
+    {
+        Issues("""[{"number":61,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 61).State == ItemState.Working && Item(r, 61).Run is { Pid: > 0 }, "the run starts");
+        var pid = await On(r => Item(r, 61).Run!.Pid);
+        await Terminal(open: false);
+        await Until(r => Item(r, 61).State == ItemState.Queued && Item(r, 61).Run is { Live: false }, "the run stops with its terminal");
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        Assert.Equal(0, await On(r => Item(r, 61).Failures));
+        var runs = Runs.Length;
+        await Task.Delay(3000);
+        Assert.Equal(runs, Runs.Length); // nothing starts in the background
+        Assert.Equal(ItemState.Queued, await On(r => Item(r, 61).State));
+        Assert.True(await On(r => r.Running)); // still authorized, not paused: it waits for the terminal
+
+        await Terminal(open: true);
+        await Until(r => Item(r, 61).State == ItemState.Open, "the work continues once the terminal is open again");
+        Assert.Contains("--resume", Runs[runs]);
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ClosingTheTerminalDuringTheBaselineCheckRunsItAgainLater()
+    {
+        Issues("""[{"number":63,"title":"Small","body":"Polish.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var ready = P("ready");
+        await StartAsync();
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist \"{ready}\" (exit 0) else (ping -n 120 127.0.0.1 >nul)" }));
+        await Task.Delay(3000); // the baseline check is under way (or about to be)
+        await Terminal(open: false);
+        await Task.Delay(3000);
+        Assert.False(await On(r => r.Paused)); // stopped, not failed: no "fails on main"
+        Assert.Null(await On(r => r.Note));
+        File.WriteAllText(ready, "");
+        await Terminal(open: true);
+        await Until(r => Item(r, 63).State == ItemState.Open, "the baseline runs again and the work goes on"); // a baseline left running would hold it for 2 minutes
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ARestartWithoutItsTerminalStopsTheRunUntilItOpens()
+    {
+        Issues("""[{"number":62,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 62).State == ItemState.Working && Item(r, 62).Run is { Pid: > 0 }, "the run starts");
+        var pid = await On(r => Item(r, 62).Run!.Pid);
+        await _loop.Run(() => { _sup!.Dispose(); return 0; }); // the tray exits; the terminal is closed meanwhile
+        await StartAsync(terminal: false);
+        await Until(r => Item(r, 62).State == ItemState.Queued && Item(r, 62).Run is { Live: false }, "the re-attached run stops");
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        Assert.Equal(0, await On(r => Item(r, 62).Failures));
+        await Terminal(open: true);
+        await Until(r => Item(r, 62).State == ItemState.Open, "the work continues once the terminal opens");
         _sup!.Dispose();
     }
 

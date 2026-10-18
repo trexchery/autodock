@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -640,5 +641,57 @@ public class AgentsLinkTests
         var text = await AgentsLink.CallAsync("agents_control", JsonDocument.Parse("""{"action":"pause"}""").RootElement, @"C:\repo", name);
         Assert.Equal(@"agents_control|pause|C:\repo", text);
         Assert.Null(await AgentsLink.CallAsync("agents_status", default, "x", name + "-nobody"));
+    }
+
+    [Fact]
+    public async Task AnOpenTerminalHoldsItsPresenceAndLinksUpAgainAfterARestart()
+    {
+        var name = "autodock-agents-test-" + Guid.NewGuid().ToString("N");
+        var seen = new ConcurrentQueue<string>();
+        AgentsLink.Server Tray() => new((_, _, _) => Task.FromResult(""), name, (repo, open) => seen.Enqueue($"{(open ? "open" : "closed")} {repo}"));
+        async Task Saw(params string[] events)
+        {
+            for (var i = 0; i < 100 && seen.Count < events.Length; i++) await Task.Delay(100);
+            Assert.Equal(events, seen);
+        }
+
+        using var bridge = new CancellationTokenSource();
+        var hold = AgentsLink.HoldAsync(@"C:\repo", name, bridge.Token); // no tray yet: it keeps trying
+        var tray = Tray();
+        await Saw(@"open C:\repo");
+        tray.Dispose(); // autodock restarts
+        await Saw(@"open C:\repo", @"closed C:\repo");
+        using var again = Tray();
+        await Saw(@"open C:\repo", @"closed C:\repo", @"open C:\repo");
+        bridge.Cancel(); // the terminal closes
+        await hold;
+        await Saw(@"open C:\repo", @"closed C:\repo", @"open C:\repo", @"closed C:\repo");
+    }
+}
+
+public class AgentProblemTests
+{
+    [Fact]
+    public void OnlyARealProblemLightsTheDot()
+    {
+        static WorkItem Parked(string note, string? hold = null, bool asked = false) =>
+            new() { State = ItemState.NeedsOwner, Note = note, HoldFor = hold, AskedAt = asked ? DateTimeOffset.Now : null };
+        // The owner's decisions: answered in the agents terminal.
+        Assert.False(Supervisor.Problem(Parked("Should this target v2?", asked: true)));
+        Assert.False(Supervisor.Problem(Parked("two review passes still found problems", hold: "review")));
+        Assert.False(Supervisor.Problem(Parked("the change touches .github/workflows/ci.yml", hold: "workflow")));
+        Assert.False(Supervisor.Problem(Parked("finished without changing anything: already done")));
+        Assert.False(Supervisor.Problem(new WorkItem { State = ItemState.Queued, Note = "`npm test` failed" })); // retried on its own
+        // Broken until the owner fixes something.
+        Assert.True(Supervisor.Problem(Parked("stopped after 3 attempts: Claude did not start")));
+        Assert.True(Supervisor.Problem(Parked("could not push: remote rejected")));
+        Assert.True(Supervisor.Problem(Parked("pull request #7 still needs work after 3 passes")));
+
+        var repo = new RepoAgents { Path = @"C:\repo", Authorized = true, Items = [Parked("Should this target v2?", asked: true)] };
+        Assert.False(Supervisor.Problem(repo));
+        repo.Note = "could not read issues: gh is not signed in (run `gh auth login`)";
+        Assert.True(Supervisor.Problem(repo));
+        repo.Authorized = false; // stopped: nothing to show
+        Assert.False(Supervisor.Problem(repo));
     }
 }
