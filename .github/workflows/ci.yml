@@ -4,9 +4,8 @@ on:
   push:
     branches: [main, feat/windows-tray]
     paths-ignore: ['**.md', 'assets/**', 'docs/**']
-  pull_request:
+  pull_request: # every pull request: main requires these checks, so a docs-only one would wait forever
     branches: [main]
-    paths-ignore: ['**.md', 'assets/**', 'docs/**']
 
 jobs:
   test:

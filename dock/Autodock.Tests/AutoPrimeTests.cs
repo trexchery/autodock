@@ -18,7 +18,7 @@ public class AutoPrimeTests
         { UsageFetchedAt = fetched ?? Now - TimeSpan.FromMinutes(1), Provider = provider };
 
     [Fact]
-    public void ReadyMeansAFreshUnstartedWindowThatCannotCostAnything()
+    public void ReadyMeansAFreshUnstartedWindowWellWithinThePlansLimits()
     {
         using var tmp = new TempDir();
         var p = new Primer(Path.Combine(tmp.Path, "prime.json"));
@@ -37,6 +37,9 @@ public class AutoPrimeTests
             A(11, provider: "codex"),
         };
         Assert.Equal([1], p.Ready(accounts, Now).Select(a => a.Number));
+        // At the click, only a reading taken just now counts.
+        Assert.Single(p.Ready([A(1, fetched: Now.AddMinutes(-10))], Now));
+        Assert.Empty(p.Ready([A(1, fetched: Now.AddMinutes(-10))], Now, Primer.SendReadingAge));
     }
 
     [Fact]
@@ -48,9 +51,9 @@ public class AutoPrimeTests
         Assert.True(p.Observe([A(1, five: 40, resets: Now.AddMinutes(-2), fetched: Now.AddMinutes(-10))], Now)); // learns the window that just ended
         var fresh = A(1, fetched: Now);
         Assert.Single(p.Ready([fresh], Now));
-        p.Begin(fresh, Now); // written before the request: a crash right after never sends twice
+        Assert.True(p.Begin(fresh, Now)); // written before the request: a crash right after never sends twice
         Assert.Empty(new Primer(path).Ready([fresh], Now.AddMinutes(1)));
-        p.Finish(fresh, ok: true, "sent");
+        p.Finish(fresh, PrimeResult.Sent, "sent");
         Assert.Empty(p.Ready([fresh], Now.AddMinutes(2)));
 
         // Nobody saw the primed window (the laptop slept through it): once it's surely over, fresh again.
@@ -71,16 +74,13 @@ public class AutoPrimeTests
         foreach (var a in new[] { one, two, three })
         {
             p.Begin(a, Now);
-            p.Finish(a, ok: true, "sent");
+            p.Finish(a, PrimeResult.Sent, "sent");
         }
         Assert.Equal("sent", p.Records["a1@example.com|org"].Outcome);
 
         // A reading from before the request proves nothing.
         p.Observe([A(1, five: 2, resets: Now.AddHours(5), fetched: Now.AddMinutes(-1))], Now.AddMinutes(1));
         Assert.Equal("sent", p.Records["a1@example.com|org"].Outcome);
-        Assert.False(p.WantsReread(Now.AddMinutes(1)));
-        Assert.True(p.WantsReread(Now.AddMinutes(4))); // once the engine's cached reading can show it
-        Assert.False(p.WantsReread(Now.AddMinutes(5)));
 
         p.Observe([
             A(1, five: 2, resets: Now.AddHours(5), fetched: Now.AddMinutes(4)), // rounded to the hour or not: started by the prime
@@ -101,11 +101,94 @@ public class AutoPrimeTests
         var p = new Primer(Path.Combine(tmp.Path, "prime.json"));
         var a = A(4);
         p.Begin(a, Now);
-        p.Finish(a, ok: false, "login expired: run cswap login 4");
+        p.Finish(a, PrimeResult.Refused, "login expired: run cswap login 4");
         Assert.Contains("#4 failed: login expired: run cswap login 4", p.Status([a], Now));
         Assert.Empty(p.Ready([a], Now.AddMinutes(1))); // the reading from before the attempt may be stale now
         Assert.Single(p.Ready([A(4, fetched: Now.AddMinutes(2))], Now.AddMinutes(3)));
         Assert.Null(p.LastPrime); // nothing went out
+    }
+
+    [Fact]
+    public void AnUnclearPrimeIsNeverRetriedUntilEvidenceOrTheWindowIsOver()
+    {
+        using var tmp = new TempDir();
+        var p = new Primer(Path.Combine(tmp.Path, "prime.json"));
+        var (one, two) = (A(1), A(2));
+        foreach (var a in new[] { one, two })
+        {
+            p.Begin(a, Now);
+            p.Finish(a, PrimeResult.Unknown, "engine timed out"); // the provider may have taken it
+        }
+        Assert.Contains("#1 unknown: engine timed out", p.Status([one], Now));
+        Assert.Empty(p.Ready([A(1, fetched: Now.AddMinutes(2)), A(2, fetched: Now.AddMinutes(2))], Now.AddMinutes(3))); // not "failed": no retry
+        Assert.True(p.WantsReread(Now.AddMinutes(4)));
+
+        p.Observe([A(1, five: 1, resets: Now.AddHours(5), fetched: Now.AddMinutes(4))], Now.AddMinutes(4)); // it did go out
+        Assert.Equal("verified", p.Records["a1@example.com|org"].Outcome);
+        p.Observe([], Now.AddMinutes(31));
+        Assert.Equal("unverified", p.Records["a2@example.com|org"].Outcome);
+        Assert.Empty(p.Ready([A(2, fetched: Now.AddHours(2))], Now.AddHours(2)));
+        Assert.Single(p.Ready([A(2, fetched: Now.AddHours(5).AddMinutes(1))], Now.AddHours(5).AddMinutes(2))); // that window is surely over
+    }
+
+    [Fact]
+    public void TheVerificationRereadIsKeptUntilAReadingComesBack()
+    {
+        using var tmp = new TempDir();
+        var p = new Primer(Path.Combine(tmp.Path, "prime.json"));
+        p.Begin(A(1), Now);
+        p.Finish(A(1), PrimeResult.Sent, "sent");
+        Assert.False(p.WantsReread(Now.AddMinutes(1))); // the engine's cached reading can't show it yet
+        Assert.True(p.WantsReread(Now.AddMinutes(4)));
+        Assert.True(p.WantsReread(Now.AddMinutes(5))); // that re-read failed: still wanted
+
+        p.Reread(Now.AddMinutes(5)); // this one came back, but with a reading from before the prime
+        p.Observe([A(1, fetched: Now.AddMinutes(-1))], Now.AddMinutes(5));
+        Assert.Equal("sent", p.Records["a1@example.com|org"].Outcome);
+        Assert.False(p.WantsReread(Now.AddMinutes(6))); // no faster than the engine's cache
+        Assert.True(p.WantsReread(Now.AddMinutes(9)));
+
+        p.Reread(Now.AddMinutes(9));
+        p.Observe([A(1, five: 1, resets: Now.AddHours(5), fetched: Now.AddMinutes(9))], Now.AddMinutes(9));
+        Assert.Equal("verified", p.Records["a1@example.com|org"].Outcome);
+        Assert.False(p.WantsReread(Now.AddMinutes(20)));
+    }
+
+    [Fact]
+    public void ALedgerThatCantBeReadOrSavedBlocksPriming()
+    {
+        using var tmp = new TempDir();
+        var path = Path.Combine(tmp.Path, "prime.json");
+
+        // Unwritable: Begin says so and leaves no trace, nothing is ready until a save works again.
+        Directory.CreateDirectory(path);
+        var p = new Primer(path);
+        Assert.False(p.Begin(A(1), Now));
+        Assert.Null(p.Records["a1@example.com|org"].Window);
+        Assert.StartsWith("can't save the prime ledger", p.Problem);
+        Assert.Empty(p.Ready([A(1)], Now));
+        Assert.Contains(p.Status([A(1)], Now), l => l.StartsWith("Paused: can't save"));
+        Directory.Delete(path);
+        Assert.True(p.Observe([], Now)); // the failed save is tried again
+        Assert.True(p.Save());
+        Assert.Single(p.Ready([A(1)], Now));
+
+        // Corrupt: blocked, across a restart too, and left as it is for the owner to fix or delete.
+        File.WriteAllText(path, "{ not json");
+        foreach (var restarted in new[] { new Primer(path), new Primer(path) })
+        {
+            Assert.Contains(path, restarted.Problem);
+            Assert.Empty(restarted.Ready([A(1)], Now));
+            Assert.False(restarted.Begin(A(1), Now));
+            Assert.False(restarted.Observe([A(1, resets: Now.AddHours(1))], Now));
+            Assert.False(restarted.Save());
+        }
+        Assert.Equal("{ not json", File.ReadAllText(path));
+        p = new Primer(path);
+        File.Delete(path);
+        p.Observe([], Now); // deleted: priming carries on
+        Assert.Null(p.Problem);
+        Assert.Single(p.Ready([A(1)], Now));
     }
 
     [Fact]
@@ -156,16 +239,22 @@ public sealed class AutoPrimeEngineTests : IDisposable
         var engine = new Engine(Path.Combine(AppContext.BaseDirectory, "fakes", "cswap.cmd"));
         var account = new Account(2, "b@example.com", false, "ok", null);
 
-        Assert.Equal((true, "sent"), await engine.PrimeAsync(account));
+        Assert.Equal((PrimeResult.Sent, "sent"), await engine.PrimeAsync(account));
         Assert.Contains("run 2 --require-session -- -p Hi --model haiku", File.ReadAllText(log));
         var seen = File.ReadAllText(log + ".prime").Trim().Split('|');
         Assert.Equal(["False", "False", "False"], seen[..3]); // no API key, config folder or parent session reached it
         Assert.Equal(Path.Combine(_tmp.Path, "prime"), seen[3].TrimEnd('\\')); // an empty folder, not the user's home
 
+        // The engine refused before Claude started: nothing went out.
         Set("FAKE_PRIME_FAIL", "Account-2 is the active default login");
-        var (ok, detail) = await engine.PrimeAsync(account);
-        Assert.False(ok);
+        var (result, detail) = await engine.PrimeAsync(account);
+        Assert.Equal(PrimeResult.Refused, result);
         Assert.Contains("active default login", detail);
+
+        // Claude started, then failed without an answer: it may have gone out.
+        Set("FAKE_PRIME_FAIL", null);
+        Set("FAKE_PRIME_CRASH", "connection reset");
+        Assert.Equal(PrimeResult.Unknown, (await engine.PrimeAsync(account)).Result);
     }
 
     public void Dispose()

@@ -38,7 +38,7 @@ no installer or admin access required. unsigned releases may trigger windows sma
 - **continue in...** notes are built locally and autodock sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
 - saved credentials are encrypted locally with windows dpapi. a pinned claude terminal holds a plaintext login only while it's open; autodock moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
 - grok build support has only been tested with synthetic data so far.
-- auto-prime never sends on its own: anthropic's consumer terms don't clearly allow unattended, scripted use of a subscription, so each prime is one click of yours. it skips excluded, api-key and paid-extra-usage accounts and any at a weekly limit, so a prime can't cost anything.
+- auto-prime is off by default and never sends on a schedule: each prime is one click of yours. that click doesn't make it allowed: anthropic's consumer terms (§3) restrict automated or scripted access to a subscription, so whether to use it is your call. it skips excluded, api-key and paid-extra-usage accounts and any near a weekly or model limit, which makes a charge unlikely but can't rule one out. when it can't tell whether a prime went out, or can't record one, it stops rather than send again.
 
 ## build from source
 
