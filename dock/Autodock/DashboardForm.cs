@@ -133,18 +133,22 @@ public sealed class DashboardForm : Form
         _syncing = false;
     }
 
-    public void Render(Snapshot? snap, string? error)
+    /// `others`: Codex/Grok snapshots (or their error), drawn below Claude's rows.
+    public void Render(Snapshot? snap, string? error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? others = null)
     {
-        var pal = Palette.Current;
         ApplyTheme();
         _list.SuspendLayout();
         foreach (Control c in _list.Controls) c.Dispose();
         _list.Controls.Clear();
-        if (error != null) _list.Controls.Add(Message("Couldn't refresh · " + error));
-        if (snap is { Accounts.Count: > 0 })
+        var sections = new List<(string Provider, Snapshot? Snap, string? Error)> { ("claude", snap, error) };
+        sections.AddRange((others ?? []).Where(o => o.Snap is { Accounts.Count: > 0 } || o.Error != null));
+        var labelled = sections.Count(s => s.Snap is { Accounts.Count: > 0 } || (s.Provider != "claude" && s.Error != null)) > 1;
+        var now = DateTimeOffset.Now;
+        foreach (var (provider, s, err) in sections)
         {
-            var now = DateTimeOffset.Now;
-            foreach (var a in snap.Accounts.OrderByDescending(a => a.Active).ThenBy(a => a.Number))
+            if (labelled && (s is { Accounts.Count: > 0 } || err != null)) _list.Controls.Add(SectionLabel(ProviderCli.Title(provider)));
+            if (err != null) _list.Controls.Add(Message("Couldn't refresh · " + err));
+            foreach (var a in (s?.Accounts ?? []).OrderByDescending(a => a.Active).ThenBy(a => a.Number))
             {
                 var row = new AccountRow(a, now);
                 row.SwitchClicked += x => SwitchRequested?.Invoke(x);
@@ -152,13 +156,14 @@ public sealed class DashboardForm : Form
                 row.MenuAction += (x, act) => AccountAction?.Invoke(x, act);
                 row.ExpandRequested += ToggleRow;
                 row.SizeChanged += (_, _) => FitHeight();
-                if (a.Email == _expandedEmail) row.SetExpanded(true, animate: false);
+                if (Key(a) == _expandedEmail) row.SetExpanded(true, animate: false);
                 _list.Controls.Add(row);
             }
         }
-        else if (snap == null && error == null)
+        var any = sections.Any(x => x.Snap is { Accounts.Count: > 0 });
+        if (!any && snap == null && error == null)
             _list.Controls.Add(Message("Loading…"));
-        else if (error == null)
+        else if (!any && error == null)
         {
             _list.Controls.Add(Message("No accounts yet. Add the account you use with Claude Code."));
             var add = new Pill("Add account", PillStyle.Primary, Ui.Add) { Margin = new Padding(Ui.S(12), Ui.S(2), 0, Ui.S(12)) };
@@ -174,8 +179,21 @@ public sealed class DashboardForm : Form
         var open = !row.Expanded;
         foreach (var r in _list.Controls.OfType<AccountRow>()) if (r != row && r.Expanded) r.SetExpanded(false);
         row.SetExpanded(open);
-        _expandedEmail = open ? row.Account.Email : null;
+        _expandedEmail = open ? Key(row.Account) : null;
     }
+
+    static string Key(Account a) => a.Provider + ":" + a.Email;
+
+    /// Small muted caps above a provider's rows; only drawn when several providers have accounts.
+    static Label SectionLabel(string title) => new()
+    {
+        Text = title.ToUpperInvariant(),
+        Tag = "section",
+        ForeColor = Palette.Current.Faint,
+        Font = Ui.Font(7f, semibold: true),
+        AutoSize = true,
+        Margin = new Padding(Ui.S(12), Ui.S(8), 0, Ui.S(2)),
+    };
 
     Label Message(string text) => new()
     {

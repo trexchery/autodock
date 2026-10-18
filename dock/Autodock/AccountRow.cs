@@ -121,11 +121,18 @@ public sealed class AccountRow : Control
         if (!_a.Active) menu.Items.Add("Switch to this account", null, (_, _) => SwitchClicked?.Invoke(_a));
         menu.Items.Add("Open terminal", null, (_, _) => TerminalClicked?.Invoke(_a));
         menu.Items.Add("Open terminal in folder…", null, (_, _) => MenuAction?.Invoke(_a, "terminal-folder"));
-        menu.Items.Add("Pin a folder to this account…", null, (_, _) => MenuAction?.Invoke(_a, "map"));
+        var cont = new ToolStripMenuItem("Continue in");
+        foreach (var t in ProviderCli.HandoffTargets(_a.Provider))
+            cont.DropDownItems.Add(ProviderCli.Title(t) + "…", null, (_, _) => MenuAction?.Invoke(_a, "continue:" + t));
+        if (cont.HasDropDownItems) menu.Items.Add(cont);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(_a.Disabled ? "Include in auto-switch" : "Exclude from auto-switch", null,
-            (_, _) => MenuAction?.Invoke(_a, _a.Disabled ? "enable" : "disable"));
-        menu.Items.Add("Rename…", null, (_, _) => MenuAction?.Invoke(_a, "alias"));
+        if (_a.Provider == "claude") // folder pins, auto-switch and aliases are Claude-engine features
+        {
+            menu.Items.Insert(menu.Items.Count - 1, new ToolStripMenuItem("Pin a folder to this account…", null, (_, _) => MenuAction?.Invoke(_a, "map")));
+            menu.Items.Add(_a.Disabled ? "Include in auto-switch" : "Exclude from auto-switch", null,
+                (_, _) => MenuAction?.Invoke(_a, _a.Disabled ? "enable" : "disable"));
+            menu.Items.Add("Rename…", null, (_, _) => MenuAction?.Invoke(_a, "alias"));
+        }
         menu.Items.Add("Log in again…", null, (_, _) => MenuAction?.Invoke(_a, "reenroll"));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Remove…", null, (_, _) => MenuAction?.Invoke(_a, "remove"));
@@ -163,11 +170,16 @@ public sealed class AccountRow : Control
         TextRenderer.DrawText(g, name, NameFont, new Rectangle(x, Ui.S(9), nameWidth, NameFont.Height), _a.Disabled ? pal.Muted : pal.Text, flags);
         TextRenderer.DrawText(g, Meta(), MetaFont, new Rectangle(x, Ui.S(28), nameWidth, MetaFont.Height), pal.Muted, flags);
 
-        // Two hairline meters on the right: 5h and week.
-        var five = _a.ShownUsage?.FiveHour;
-        var week = _a.ShownUsage?.SevenDay;
-        Meter(g, pal, "5h", five?.Pct, right, Ui.S(12));
-        Meter(g, pal, "wk", week?.Pct, right, Ui.S(30));
+        // Hairline meters on the right for the windows this account has (Codex Team: weekly only,
+        // Grok: one weekly or monthly pool). No usage yet: two empty placeholders.
+        var u = _a.ShownUsage;
+        var meters = new List<(string, double?)>();
+        if (u?.FiveHour is { } f) meters.Add(("5h", f.Pct));
+        if (u?.SevenDay is { } s) meters.Add(("wk", s.Pct));
+        if (meters.Count == 0 && u?.Scoped is [var first, ..]) meters.Add(("mo", first.Pct));
+        if (meters.Count == 0) meters.AddRange([("5h", null), ("wk", null)]);
+        if (meters.Count == 1) Meter(g, pal, meters[0].Item1, meters[0].Item2, right, Ui.S(21));
+        else { Meter(g, pal, meters[0].Item1, meters[0].Item2, right, Ui.S(12)); Meter(g, pal, meters[1].Item1, meters[1].Item2, right, Ui.S(30)); }
 
         _buttons.Clear();
         if (_t <= 0.01f) return;

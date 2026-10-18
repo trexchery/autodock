@@ -89,6 +89,44 @@ public class ModelTests
     }
 }
 
+public class ProviderTests
+{
+    // Shape of `cswap codex list --json` / `cswap grok list --json` (synthetic).
+    const string ProviderJson = """
+    {
+      "schemaVersion": 1, "activeAccountNumber": 1,
+      "accounts": [
+        { "number": 1, "email": "dev@example.com", "plan": "plus", "active": true, "usageStatus": "ok",
+          "usage": { "fiveHour": { "pct": 40, "resetsAt": "2026-06-22T23:00:00Z" },
+                     "sevenDay": { "pct": 10, "resetsAt": "2026-06-26T00:00:00Z" } }, "usageAgeSeconds": 3 },
+        { "number": 2, "email": "x@example.com", "active": false, "usageStatus": "token_expired", "usage": null,
+          "usageNote": "login expired; codex renews it after a switch, else re-enroll" },
+        { "number": 3, "email": "g@example.com", "active": false, "usageStatus": "ok",
+          "usage": { "scoped": [ { "name": "Monthly limit", "pct": 63.5, "resetsAt": "2026-07-01T00:00:00Z" } ] } }
+      ]
+    }
+    """;
+
+    [Fact]
+    public void ParsesProviderSnapshotAndPrefersEngineNote()
+    {
+        var s = Json.Parse<Snapshot>(ProviderJson);
+        Assert.Equal(3, s.Accounts.Count);
+        Assert.Equal("claude", s.Accounts[0].Provider); // tagged by Engine.ListAsync, never by the payload
+        Assert.Equal(40, s.Accounts[0].Usage!.FiveHour!.Pct);
+        Assert.Equal("login expired; codex renews it after a switch, else re-enroll", s.Accounts[1].StatusNote);
+        Assert.Equal(63.5, Format.Peak(s.Accounts[2]));
+        Assert.Equal("Now using", Json.Parse<SwitchResult>("""{"switched":true,"note":"Now using"}""").Note);
+    }
+
+    [Fact]
+    public void RoutesProviderArguments()
+    {
+        Assert.Equal(["list", "--json"], Engine.Args("claude", "list", "--json"));
+        Assert.Equal(["codex", "switch", "2", "--json"], Engine.Args("codex", "switch", "2", "--json"));
+    }
+}
+
 public class RedactionTests
 {
     [Theory]
@@ -257,6 +295,9 @@ public class EngineIntegrationTests
 
 public class RenderTests
 {
+    static List<string> SectionLabels(Control c) =>
+        c.Controls.Cast<Control>().SelectMany(x => x is Label { Tag: "section" } l ? [l.Text] : SectionLabels(x)).ToList();
+
     static IEnumerable<AccountRow> FindRows(Control c) =>
         c.Controls.Cast<Control>().SelectMany(x => x is AccountRow r ? [r] : FindRows(x));
 
@@ -289,6 +330,21 @@ public class RenderTests
                 form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
                 Assert.InRange(form.Height, Ui.S(200), Ui.S(320)); // three slim rows, not cards
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
+                Assert.Empty(SectionLabels(form)); // one provider: no section labels
+
+                var codex = new Snapshot(1, 1, [new Account(1, "dev@example.com", true, "ok", new Usage(W(40, 3), W(10, 90), null, null)) { Provider = "codex" }]);
+                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")]);
+                Application.DoEvents();
+                Assert.Equal(["CLAUDE", "CODEX", "GROK"], SectionLabels(form));
+                Assert.InRange(form.Height, Ui.S(260), Ui.S(460));
+                if (Environment.GetEnvironmentVariable("DOCK_RENDER_PROVIDERS_OUT") is { Length: > 0 } pOut)
+                {
+                    using var pb = new Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(pb, new Rectangle(0, 0, form.Width, form.Height));
+                    pb.Save(pOut);
+                }
+                form.Render(snap, null);
+                Application.DoEvents();
 
                 // Expanded row (accordion) must also lay out.
                 var row = FindRows(form).First();

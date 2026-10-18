@@ -1008,6 +1008,16 @@ def main() -> None:
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
+    # Other providers' engines (Codex CLI, Grok Build) own their whole subtree.
+    if argv and argv[0] in ("codex", "grok"):
+        import importlib
+
+        sys.exit(importlib.import_module(f"claude_swap.providers.{argv[0]}").main(argv[1:]))
+    if argv and argv[0] == "handoff":
+        from claude_swap import handoff
+
+        sys.exit(handoff.main(argv[1:]))
+
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
