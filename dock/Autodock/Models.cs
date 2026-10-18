@@ -24,6 +24,7 @@ public sealed record Account(
     Usage? Usage,
     Usage? LastGoodUsage = null,
     double? UsageAgeSeconds = null,
+    double? LastGoodAgeSeconds = null,
     string? Alias = null,
     bool Disabled = false,
     DateTimeOffset? LoginExpiresAt = null,

@@ -10,7 +10,7 @@ public sealed class TrayApp : ApplicationContext
     readonly ContextMenuStrip _menu = new();
     Snapshot? _snap;
     string? _error;
-    bool _busy;
+    bool _busy, _refreshPending;
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
 
@@ -24,7 +24,7 @@ public sealed class TrayApp : ApplicationContext
         _dash.SwitchRequested += a => _ = SwitchAsync(a);
         _dash.TerminalRequested += a => OpenTerminal(a, null);
         _dash.AccountAction += (a, act) => _ = AccountActionAsync(a, act);
-        _dash.RefreshRequested += () => _ = TickAsync(runAuto: false);
+        _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
         _dash.SettingsRequested += () => _ = ShowSettingsAsync();
         _dash.AddRequested += () => _ = EnrollAsync(null);
         _dash.AutoToggled += on => SetAutoSwitch(on);
@@ -67,6 +67,7 @@ public sealed class TrayApp : ApplicationContext
 
     void ShowDashboard()
     {
+        _ = TickAsync(runAuto: false, refresh: true); // opening it is when freshness matters
         _dash.Render(_snap, _error);
         if (_dash.Pinned) { _dash.ShowPinnedAt(_settings.PinnedX, _settings.PinnedY); _dash.Activate(); }
         else _dash.ShowNearTray();
@@ -78,15 +79,19 @@ public sealed class TrayApp : ApplicationContext
         _settings.Save();
     }
 
-    async Task TickAsync(bool runAuto)
+    async Task TickAsync(bool runAuto, bool refresh = false)
     {
-        if (_busy) return;
+        if (_busy)
+        {
+            _refreshPending |= refresh; // run it right after the current pass
+            return;
+        }
         _busy = true;
         _dash.SetStatus("updating…");
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
-            _snap = await _engine.ListAsync();
+            _snap = await _engine.ListAsync(refresh);
             _error = null;
             _dash.SetStatus($"{DateTime.Now:HH:mm}");
         }
@@ -105,6 +110,11 @@ public sealed class TrayApp : ApplicationContext
         if (old != TrayIcons.App) old?.Dispose();
         _tray.Text = Format.Tooltip(_snap, _settings.AutoSwitch);
         if (_dash.Visible) _dash.Render(_snap, _error);
+        if (_refreshPending)
+        {
+            _refreshPending = false;
+            _ = TickAsync(runAuto: false, refresh: true);
+        }
     }
 
     async Task AutoTickAsync()
@@ -153,7 +163,7 @@ public sealed class TrayApp : ApplicationContext
         _menu.Items.Add(term);
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
         _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
-        _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false));
+        _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => ExitThread());

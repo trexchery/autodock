@@ -331,6 +331,9 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # `list --refresh`: someone is looking right now, so stale (> serve
+        # TTL) entries are fetched even when their idle plan says later.
+        self.force_usage_refresh = False
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -5071,8 +5074,10 @@ class ClaudeAccountSwitcher:
             claims = store.reserve(
                 requested,
                 identities,
-                respect_plans=True,
-                repair_overslept=True,
+                # Forced: "poll-due or stale" — the serve TTL still floors
+                # each account at one fetch per SERVE_TTL_S, inside budget.
+                respect_plans=not self.force_usage_refresh,
+                repair_overslept=not self.force_usage_refresh,
             )
         else:
             claims = store.reserve(

@@ -111,6 +111,8 @@ public class FormatTests
         Assert.Equal("in 1m", Format.When(Now.AddSeconds(20), Now));
         Assert.Equal("in 45m", Format.When(Now.AddMinutes(45), Now));
         Assert.Equal("in 2h 05m", Format.When(Now.AddMinutes(125), Now));
+        Assert.Equal("7m ago", Format.Age(420));
+        Assert.Equal("2h ago", Format.Age(7300));
         Assert.Equal(Now.AddDays(3).ToLocalTime().ToString("ddd HH:mm"), Format.When(Now.AddDays(3), Now));
     }
 

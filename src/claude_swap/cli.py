@@ -1137,6 +1137,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="With 'list': re-read usage for every account whose reading is "
+        "older than the 3-minute serve floor, ignoring the idle back-off "
+        "schedule (failure backoff and 429 holds still apply)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help=(
@@ -1453,6 +1460,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
+            switcher.force_usage_refresh = args.refresh
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,

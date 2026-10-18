@@ -87,7 +87,10 @@ public sealed partial class Engine(string exe)
         return Json.Parse<T>(r.Stdout);
     }
 
-    public Task<Snapshot> ListAsync() => RunJsonAsync<Snapshot>("list", "--json");
+    /// `refresh`: someone is looking, so re-read readings older than the
+    /// engine's 3-minute floor instead of waiting out the idle back-off.
+    public Task<Snapshot> ListAsync(bool refresh = false) =>
+        refresh ? RunJsonAsync<Snapshot>("list", "--json", "--refresh") : RunJsonAsync<Snapshot>("list", "--json");
 
     public Task<SwitchResult> SwitchAsync(int number) =>
         RunJsonAsync<SwitchResult>("switch", number.ToString(), "--json");

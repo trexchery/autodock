@@ -85,6 +85,9 @@ public sealed class AccountRow : Control
             _ => null,
         };
         if (status != null) parts.Add(status);
+        // Readings older than 5 minutes say so, instead of looking current.
+        if ((_a.Usage != null ? _a.UsageAgeSeconds : _a.LastGoodAgeSeconds) is { } age && age >= 300)
+            parts.Add(Format.Age(age));
         return parts.Count > 0 ? string.Join(" · ", parts) : $"account {_a.Number}";
     }
 
@@ -261,6 +264,9 @@ public static class Format
         if (d < TimeSpan.FromDays(1)) return $"in {(int)d.TotalHours}h {d.Minutes:00}m";
         return t.ToLocalTime().ToString("ddd HH:mm");
     }
+
+    public static string Age(double seconds) =>
+        seconds < 3600 ? $"{(int)(seconds / 60)}m ago" : seconds < 86400 ? $"{(int)(seconds / 3600)}h ago" : $"{(int)(seconds / 86400)}d ago";
 
     /// Compact tray tooltip (Windows caps it at 127 chars).
     public static string Tooltip(Snapshot? s, bool auto)
