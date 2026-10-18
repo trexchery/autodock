@@ -64,6 +64,7 @@ module only.
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable
 from datetime import datetime
 
@@ -111,6 +112,14 @@ MOVEMENT_DELTA_PCT = 1.0
 # (watch + menu bar + auto) drift apart instead of fetching in lockstep.
 JITTER_FRAC = 0.1
 
+# Random gap (seconds) between successive usage requests to one provider.
+USAGE_GAP_S = (2.0, 7.0)
+# Most total gap one usage pass may add. A worst-case Claude fetch (refresh
+# under the credential locks) takes ~45 s, so 30 s keeps the last record well
+# inside ``usage_store.CLAIM_TTL_S`` (90 s) and every pass inside the tray's
+# 120 s engine timeout.
+USAGE_SPREAD_MAX_S = 30.0
+
 # Reaction to a 429 with ``Retry-After: 0`` (the saturated-window edge):
 # probe at most every 5 minutes (≤12/hour) so aging-out — up to ~30/hour —
 # outpaces the probing (used by the usage store's failure backoff)...
@@ -145,6 +154,31 @@ ESCALATION_MARGIN_PCT = 15.0
 # Never schedule a poll later than a known window reset (+ slack): stored
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
+
+
+def usage_gap() -> float:
+    """A fresh random gap from ``USAGE_GAP_S`` (0.0 when it is emptied)."""
+    return random.uniform(*USAGE_GAP_S) if USAGE_GAP_S else 0.0
+
+
+def pacer() -> Callable[[], None]:
+    """Call the returned hook right before each network request of one
+    sequential pass: the first returns at once, each later one first sleeps a
+    fresh :func:`usage_gap`, so several accounts never fire on a fixed beat.
+    The pass sleeps at most ``USAGE_SPREAD_MAX_S`` in all."""
+    calls, left = 0, USAGE_SPREAD_MAX_S
+
+    def pace() -> None:
+        nonlocal calls, left
+        if calls and left > 0:
+            # ponytail: past the budget requests go back to back (one round
+            # trip apart); spread big rosters over passes if that matters.
+            gap = min(usage_gap(), left)
+            left -= gap
+            time.sleep(gap)
+        calls += 1
+
+    return pace
 
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:

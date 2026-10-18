@@ -804,8 +804,8 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         flight — separate guards, two threads, one switcher.
 
         Measured, a sibling doing what a second lane's build does, against a
-        4ms window (`_FETCH_STAGGER_S` is 250ms, so the real window is far
-        wider — 501ms at 3 accounts, 1001ms at 10):
+        4ms window (requests start `poll_policy.USAGE_GAP_S`, 2-7 s, apart,
+        so the real window is far wider — seconds from 2 accounts up):
 
             lane A's degraded verdict lost 60/60 times
 

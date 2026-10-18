@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from claude_swap import dpapi
+from claude_swap import dpapi, poll_policy
 from claude_swap.providers import grok
 
 SECRET = "SYNTHETIC-SECRET"
@@ -247,3 +247,21 @@ def test_list_sweeps_orphaned_run_home(env, capsys):
     run(capsys, "list")
     assert not (home / "auth.json").exists()
     assert grok._unseal(1)[1]["key"].endswith("-b2")
+
+
+def test_list_paces_network_fetches(env, capsys, monkeypatch):
+    home, calls = env
+    write_live(home, make_store("a@example.com", "u1"))
+    run(capsys, "add-current")
+    write_live(home, {"xai::api_key": make_record("k@example.com", "u9", auth_mode="api_key")})
+    run(capsys, "add-current")
+    write_live(home, make_store("c@example.com", "u3", tag="c"))
+    run(capsys, "add-current")
+    monkeypatch.setattr(poll_policy, "USAGE_GAP_S", (2.0, 7.0))
+    monkeypatch.setattr(poll_policy.random, "uniform", lambda a, b: b)
+    monkeypatch.setattr(poll_policy.time, "sleep", calls.append)  # gaps land between requests
+    run(capsys, "list")
+    # the first goes at once; the API-key row makes no request, so no gap
+    assert ["get" if isinstance(c, str) else c for c in calls] == ["get", 7.0, "get"]
+    run(capsys, "list")
+    assert len(calls) == 3  # all cached: no request, no wait

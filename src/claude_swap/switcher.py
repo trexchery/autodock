@@ -106,10 +106,9 @@ KEYRING_SERVICE = "claude-code"
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
-# Delay between successive usage-request launches in one collect pass, so N
-# accounts never burst the shared usage endpoint from one IP in the same
-# instant (request hygiene; see issue #85).
-_FETCH_STAGGER_S = 0.25
+# Guards each switcher's next allowed usage launch (``_run_usage_fetches``):
+# the TUI runs two collect lanes on one switcher.
+_USAGE_PACE_LOCK = threading.Lock()
 
 # Show a "· Xm ago" age note on displayed usage older than this. Inside the
 # serve TTL the data is current by design (that is the polling cadence), so
@@ -4981,24 +4980,41 @@ class ClaudeAccountSwitcher:
         infos: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry] | None = None,
     ) -> dict[str, FetchRecord]:
-        """Fetch the given accounts in parallel, staggering request starts so
-        N accounts never hit the endpoint in the same instant. ``entries``
-        is the pre-fetch snapshot, for each row's refused-credential stamp."""
+        """Fetch the given accounts in parallel. Each request starts a fresh
+        ``poll_policy.usage_gap()`` after the previous one, also across the
+        back-to-back passes of one tick (the first goes at once), so N
+        accounts never hit the endpoint in the same instant or on a fixed
+        beat. ``entries`` is the pre-fetch snapshot, for each row's
+        refused-credential stamp."""
+        with _USAGE_PACE_LOCK:
+            now = time.monotonic()
+            offsets = [max(0.0, getattr(self, "_next_usage_at", 0.0) - now)]
+            for _ in infos[1:]:
+                offsets.append(offsets[-1] + poll_policy.usage_gap())
+            # ponytail: offsets past USAGE_SPREAD_MAX_S (30 s; possible from 5
+            # accounts) are scaled down, some gaps below USAGE_GAP_S's 2 s
+            # floor; spread big rosters over successive passes if it matters.
+            cap = poll_policy.USAGE_SPREAD_MAX_S
+            if offsets[-1] > cap:
+                offsets = [o * cap / offsets[-1] for o in offsets]
+            self._next_usage_at = now + offsets[-1] + poll_policy.usage_gap()
+
         def fetch_one(
-            idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
+            offset_info: tuple[float, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
-            idx, info = idx_info
-            if idx and _FETCH_STAGGER_S:
-                time.sleep(idx * _FETCH_STAGGER_S)
+            offset, info = offset_info
+            if offset:
+                time.sleep(offset)
             num = str(info[0])
             entry = entries.get(num) if entries else None
             return num, self._fetch_account_usage(
                 info, entry.rejected_fingerprint if entry else None
             )
 
-        with ThreadPoolExecutor() as executor:
+        # One worker per account: a queued task would start its offset late.
+        with ThreadPoolExecutor(max_workers=len(infos) or 1) as executor:
             return dict(
-                executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
+                executor.map(self._with_active_verdict(fetch_one), zip(offsets, infos))
             )
 
     def _collect_usage_entries(

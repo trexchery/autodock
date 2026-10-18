@@ -33,7 +33,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import dpapi
+from claude_swap import dpapi, poll_policy
 from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.json_output import SCHEMA_VERSION, error_envelope, usage_to_json
 from claude_swap.paths import get_backup_root
@@ -253,8 +253,9 @@ def parse_usage(payload: dict) -> dict:
     return {"scoped": [{"name": "Monthly limit", **entry}]}
 
 
-def _fetch(scope: str, record: dict, now: float) -> tuple[str, dict | None, str | None]:
-    """``(status, usage, error)`` for one login; never raises, never refreshes."""
+def _fetch(scope: str, record: dict, now: float, pace) -> tuple[str, dict | None, str | None]:
+    """``(status, usage, error)`` for one login; never raises, never refreshes.
+    ``pace`` runs right before the request (``poll_policy.pacer``)."""
     mode = record.get("auth_mode")
     first_party = mode in ("oidc", "external", "grok", "web_login") and (
         record.get("oidc_issuer", ISSUER) == ISSUER or scope.startswith(ISSUER)
@@ -271,6 +272,7 @@ def _fetch(scope: str, record: dict, now: float) -> tuple[str, dict | None, str 
         "x-grok-client-mode": "headless",
         "Accept": "application/json",
     }
+    pace()
     try:
         code, body = _http_get(BILLING_URL, headers)
     except (OSError, ValueError) as e:
@@ -284,12 +286,12 @@ def _fetch(scope: str, record: dict, now: float) -> tuple[str, dict | None, str 
 
 
 def _row(acc: dict, active: bool, login: tuple[str, dict] | None, refresh: bool,
-         cache: dict, now: float) -> dict:
+         cache: dict, now: float, pace) -> dict:
     key = _key(acc["userId"])
     entry = cache.get(key, {})
     due = now - entry.get("attemptAt", 0) >= (FORCED_MIN_S if refresh else FETCH_TTL_S)
     if login is not None and due:
-        status, usage, err = _fetch(*login, now)
+        status, usage, err = _fetch(*login, now, pace)
         entry = dict(entry, attemptAt=now, status=status, error=err)
         if usage:
             entry.update(usage=usage, fetchedAt=now)
@@ -346,6 +348,7 @@ def cmd_list(refresh: bool) -> dict:
     cache_path = store_dir() / "cache.json"
     cache = _read_json(cache_path, {})
     now = time.time()
+    pace = poll_policy.pacer()
     rows, active_num = [], None
     for acc in _roster():
         active = _key(acc["userId"]) == live_key
@@ -357,7 +360,7 @@ def cmd_list(refresh: bool) -> dict:
                 login = _unseal(acc["number"])
             except (GrokError, ValueError, OSError, KeyError):
                 login = None
-        rows.append(_row(acc, active, login, refresh, cache, now))
+        rows.append(_row(acc, active, login, refresh, cache, now, pace))
     _atomic_write(cache_path, json.dumps(cache))
     return {"schemaVersion": SCHEMA_VERSION, "activeAccountNumber": active_num, "accounts": rows}
 
