@@ -255,6 +255,9 @@ public class EngineIntegrationTests
 
 public class RenderTests
 {
+    static IEnumerable<AccountRow> FindRows(Control c) =>
+        c.Controls.Cast<Control>().SelectMany(x => x is AccountRow r ? [r] : FindRows(x));
+
     /// Smoke test: the dashboard lays out a realistic snapshot without throwing.
     /// Set DOCK_RENDER_OUT=<file.png> to also save what it drew.
     [Fact]
@@ -276,14 +279,26 @@ public class RenderTests
             {
                 using var form = new DashboardForm();
                 form.Render(snap, null);
-                form.SetStatus("Updated 12:00 · auto-switch on");
+                form.SetStatus("12:00");
                 form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
                 form.Show();
                 Application.DoEvents();
                 using var bmp = new Bitmap(form.Width, form.Height);
                 form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                Assert.True(form.Height > 300);
+                Assert.InRange(form.Height, Ui.S(200), Ui.S(320)); // three slim rows, not cards
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
+
+                // Expanded row (accordion) must also lay out.
+                var row = FindRows(form).First();
+                row.SetExpanded(true, animate: false);
+                Application.DoEvents();
+                Assert.True(row.Height > Ui.S(100));
+                if (Environment.GetEnvironmentVariable("DOCK_RENDER_EXPANDED_OUT") is { Length: > 0 } exOut)
+                {
+                    using var eb = new Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(eb, new Rectangle(0, 0, form.Width, form.Height));
+                    eb.Save(exOut);
+                }
 
                 using var settings = new SettingsForm { StartPosition = FormStartPosition.Manual, Location = new Point(-10000, -10000) };
                 settings.Show();

@@ -5,20 +5,22 @@ using Microsoft.Win32;
 namespace Autodock;
 
 public sealed record Palette(
-    bool IsDark, Color Back, Color Card, Color Text, Color Muted, Color Track,
-    Color Accent, Color OnAccent, Color Border, Color Hover, Color Pressed)
+    bool IsDark, Color Back, Color Card, Color Text, Color Muted, Color Faint, Color Track,
+    Color Live, Color Border, Color Hover, Color Pressed)
 {
     public static Palette Current => IsLight() ? Light : Dark;
 
+    // Neutral greys only. Colour is reserved for state: the active dot and
+    // meters that are close to a limit.
     static readonly Palette Light = new(false,
-        Color.FromArgb(243, 243, 243), Color.White, Color.FromArgb(27, 27, 27), Color.FromArgb(104, 104, 104),
-        Color.FromArgb(230, 230, 230), Color.FromArgb(13, 128, 117), Color.White, Color.FromArgb(229, 229, 229),
-        Color.FromArgb(0, 0, 0, 0x0A), Color.FromArgb(0, 0, 0, 0x14));
+        Color.FromArgb(249, 249, 249), Color.White, Color.FromArgb(24, 24, 24), Color.FromArgb(112, 112, 112),
+        Color.FromArgb(160, 160, 160), Color.FromArgb(0, 0, 0, 0x14), Color.FromArgb(46, 160, 100),
+        Color.FromArgb(0, 0, 0, 0x14), Color.FromArgb(0, 0, 0, 0x08), Color.FromArgb(0, 0, 0, 0x10));
 
     static readonly Palette Dark = new(true,
-        Color.FromArgb(28, 28, 28), Color.FromArgb(41, 41, 41), Color.FromArgb(242, 242, 242), Color.FromArgb(160, 160, 160),
-        Color.FromArgb(58, 58, 58), Color.FromArgb(52, 190, 172), Color.FromArgb(8, 32, 29), Color.FromArgb(52, 52, 52),
-        Color.FromArgb(0x10, 255, 255, 255), Color.FromArgb(0x1C, 255, 255, 255));
+        Color.FromArgb(32, 32, 32), Color.FromArgb(40, 40, 40), Color.FromArgb(236, 236, 236), Color.FromArgb(150, 150, 150),
+        Color.FromArgb(100, 100, 100), Color.FromArgb(0x1A, 255, 255, 255), Color.FromArgb(98, 196, 140),
+        Color.FromArgb(0x16, 255, 255, 255), Color.FromArgb(0x0C, 255, 255, 255), Color.FromArgb(0x16, 255, 255, 255));
 
     static bool IsLight()
     {
@@ -26,8 +28,15 @@ public sealed record Palette(
         return k?.GetValue("AppsUseLightTheme") is not int v || v != 0;
     }
 
+    public static readonly Color Warn = Color.FromArgb(214, 162, 67), Critical = Color.FromArgb(218, 106, 94);
+
+    /// Meter fill: quiet foreground until a window is nearly spent.
+    public Color Meter(double pct) =>
+        pct >= 95 ? Critical : pct >= 80 ? Warn : Color.FromArgb(IsDark ? 200 : 170, Text);
+
+    /// Tray dot (needs to read on any taskbar).
     public static Color ForPct(double pct) =>
-        pct >= 90 ? Color.FromArgb(226, 72, 60) : pct >= 70 ? Color.FromArgb(232, 163, 42) : Color.FromArgb(44, 168, 96);
+        pct >= 95 ? Critical : pct >= 80 ? Warn : Color.FromArgb(98, 196, 140);
 }
 
 /// Fonts, DPI scaling, glyphs and Win32 cosmetics shared by every surface.
@@ -123,54 +132,6 @@ public static class Ui
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 }
 
-/// Label + percentage on one line, a slim meter underneath.
-public sealed class UsageBar : Control
-{
-    public string Label { get; set; } = "";
-    public double Pct { get; set; }
-    public string Detail { get; set; } = "";
-    public bool Stale { get; set; }
-
-    public UsageBar()
-    {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
-        Height = Ui.S(32);
-    }
-
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        var pal = Palette.Current;
-        var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        using var label = Ui.Font(8.5f);
-        using var strong = Ui.Font(8.5f, semibold: true);
-
-        var pctText = $"{Pct:0}%";
-        var pctSize = TextRenderer.MeasureText(g, pctText, strong, Size.Empty, TextFormatFlags.NoPadding);
-        TextRenderer.DrawText(g, pctText, strong, new Point(Width - pctSize.Width, 0), pal.Text, TextFormatFlags.NoPadding);
-        var labelSize = TextRenderer.MeasureText(g, Label, label, Size.Empty, TextFormatFlags.NoPadding);
-        TextRenderer.DrawText(g, Label, label, new Point(0, 0), pal.Text, TextFormatFlags.NoPadding);
-        if (Detail.Length > 0)
-        {
-            var x = labelSize.Width + Ui.S(8);
-            TextRenderer.DrawText(g, Detail, label, new Rectangle(x, 0, Width - x - pctSize.Width - Ui.S(8), labelSize.Height),
-                pal.Muted, TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
-        }
-
-        float h = Ui.S(4), y = Height - h - Ui.S(4);
-        using (var track = new SolidBrush(pal.Track))
-        using (var path = Ui.Round(new RectangleF(0, y, Width - 1, h), h / 2)) g.FillPath(track, path);
-        var w = (float)((Width - 1) * Math.Clamp(Pct, 0, 100) / 100.0);
-        if (w > 0)
-        {
-            var c = Palette.ForPct(Pct);
-            using var fill = new SolidBrush(Stale ? Color.FromArgb(110, c) : c);
-            using var path = Ui.Round(new RectangleF(0, y, Math.Max(w, h), h), h / 2);
-            g.FillPath(fill, path);
-        }
-    }
-}
-
 public enum PillStyle { Primary, Subtle, Icon }
 
 /// Rounded flat button with hover/press states; text, a Fluent glyph, or both.
@@ -189,14 +150,14 @@ public sealed class Pill : Control, IButtonControl
         Glyph = glyph;
         Cursor = Cursors.Hand;
         Font = Ui.Font(9f, semibold: style == PillStyle.Primary);
-        Height = Ui.S(32);
-        Width = style == PillStyle.Icon ? Ui.S(32) : MeasureWidth();
+        Height = Ui.S(style == PillStyle.Icon ? 28 : 30);
+        Width = style == PillStyle.Icon ? Ui.S(28) : MeasureWidth();
         BackColor = Color.Transparent;
     }
 
     int MeasureWidth()
     {
-        var w = TextRenderer.MeasureText(Text, Font).Width + Ui.S(24);
+        var w = TextRenderer.MeasureText(Text, Font).Width + Ui.S(20);
         return Glyph.Length > 0 ? w + Ui.S(20) : w;
     }
 
@@ -229,17 +190,16 @@ public sealed class Pill : Control, IButtonControl
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var r = new RectangleF(0.5f, 0.5f, Width - 1, Height - 1);
-        using var path = Ui.Round(r, Ui.S(6));
+        using var path = Ui.Round(r, Ui.S(5));
 
         Color fg;
         if (Style == PillStyle.Primary)
         {
-            var bg = Enabled ? pal.Accent : pal.Track;
-            if (_down) bg = ControlPaint.Dark(bg, 0.05f);
-            else if (_hover) bg = pal.IsDark ? ControlPaint.Light(bg, 0.15f) : ControlPaint.Dark(bg, 0.02f);
+            var bg = Enabled ? pal.Text : pal.Track;
+            if (_down || _hover) bg = Color.FromArgb(_down ? 200 : 225, bg);
             using var b = new SolidBrush(bg);
             g.FillPath(b, path);
-            fg = Enabled ? pal.OnAccent : pal.Muted;
+            fg = Enabled ? pal.Back : pal.Muted;
         }
         else
         {
@@ -264,8 +224,8 @@ public sealed class Pill : Control, IButtonControl
         var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
         if (Style == PillStyle.Icon || Text.Length == 0)
         {
-            using var icon = Ui.Icons(10.5f);
-            TextRenderer.DrawText(g, Glyph, icon, ClientRectangle, fg, flags | TextFormatFlags.HorizontalCenter);
+            using var icon = Ui.Icons(9f);
+            TextRenderer.DrawText(g, Glyph, icon, ClientRectangle, _hover ? pal.Text : pal.Muted, flags | TextFormatFlags.HorizontalCenter);
             return;
         }
         if (Glyph.Length > 0)
@@ -297,11 +257,11 @@ public sealed class Toggle : Control
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor | ControlStyles.Selectable, true);
         Text = text;
-        Font = Ui.Font(9f);
+        Font = Ui.Font(8.5f);
         Cursor = Cursors.Hand;
         BackColor = Color.Transparent;
-        Height = Ui.S(24);
-        Width = Ui.S(52) + TextRenderer.MeasureText(text, Font).Width;
+        Height = Ui.S(22);
+        Width = Ui.S(42) + TextRenderer.MeasureText(text, Font).Width;
     }
 
     protected override void OnClick(EventArgs e) { Focus(); Checked = !Checked; base.OnClick(e); }
@@ -320,11 +280,11 @@ public sealed class Toggle : Control
         var pal = Palette.Current;
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        float w = Ui.S(40), h = Ui.S(20), y = (Height - h) / 2f;
+        float w = Ui.S(32), h = Ui.S(16), y = (Height - h) / 2f;
         using var track = Ui.Round(new RectangleF(1, y, w, h), h / 2);
         if (Checked)
         {
-            using var b = new SolidBrush(pal.Accent);
+            using var b = new SolidBrush(pal.Text);
             g.FillPath(b, track);
         }
         else
@@ -337,77 +297,11 @@ public sealed class Toggle : Control
             using var focus = new Pen(pal.Text, Math.Max(1, Ui.S(1))) { DashStyle = DashStyle.Dot };
             g.DrawPath(focus, track);
         }
-        float k = Checked ? h - Ui.S(8) : h - Ui.S(10);
-        var kx = Checked ? 1 + w - k - Ui.S(4) : 1 + Ui.S(5);
-        using (var knob = new SolidBrush(Checked ? pal.OnAccent : pal.Muted))
+        float k = h - Ui.S(7);
+        var kx = Checked ? 1 + w - k - Ui.S(4) : 1 + Ui.S(4);
+        using (var knob = new SolidBrush(Checked ? pal.Back : pal.Muted))
             g.FillEllipse(knob, kx, y + (h - k) / 2, k, k);
-        TextRenderer.DrawText(g, Text, Font, new Point((int)w + Ui.S(10), (Height - Font.Height) / 2), pal.Text, TextFormatFlags.NoPadding);
-    }
-}
-
-/// Initials in a soft coloured circle, stable per email.
-public sealed class Avatar : Control
-{
-    static readonly Color[] Hues =
-    [
-        Color.FromArgb(45, 140, 128), Color.FromArgb(90, 110, 200), Color.FromArgb(176, 92, 160),
-        Color.FromArgb(200, 120, 60), Color.FromArgb(70, 150, 80), Color.FromArgb(180, 80, 80),
-    ];
-
-    readonly string _initials;
-    readonly Color _color;
-
-    public Avatar(string name, string key)
-    {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
-        BackColor = Color.Transparent;
-        Size = new Size(Ui.S(36), Ui.S(36));
-        var letters = name.Split(['@', '.', ' ', '-', '_'], StringSplitOptions.RemoveEmptyEntries);
-        _initials = (letters.Length switch
-        {
-            0 => "?",
-            1 => letters[0][..Math.Min(2, letters[0].Length)],
-            _ => $"{letters[0][0]}{letters[1][0]}",
-        }).ToUpperInvariant();
-        // string.GetHashCode is randomised per process; a stable hash keeps colours fixed.
-        _color = Hues[key.ToLowerInvariant().Aggregate(0u, (h, c) => h * 31 + c) % (uint)Hues.Length];
-    }
-
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        using var b = new SolidBrush(_color);
-        g.FillEllipse(b, 0, 0, Width - 1, Height - 1);
-        using var f = Ui.Font(9.5f, semibold: true);
-        TextRenderer.DrawText(g, _initials, f, ClientRectangle, Color.White,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-    }
-}
-
-/// Rounded surface; an optional accent outline marks the active account.
-public class Surface : Panel
-{
-    public Color Fill { get; set; }
-    public Color? Outline { get; set; }
-
-    public Surface()
-    {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-    }
-
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        var g = e.Graphics;
-        g.Clear(Parent?.BackColor ?? BackColor);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        var stroke = Outline.HasValue ? Ui.S(2) : 1;
-        var r = new RectangleF(stroke / 2f, stroke / 2f, Width - stroke - 0.5f, Height - stroke - 0.5f);
-        using var path = Ui.Round(r, Ui.S(8));
-        using var b = new SolidBrush(Fill);
-        g.FillPath(b, path);
-        using var pen = new Pen(Outline ?? Palette.Current.Border, stroke);
-        g.DrawPath(pen, path);
+        TextRenderer.DrawText(g, Text, Font, new Point((int)w + Ui.S(8), (Height - Font.Height) / 2), pal.Muted, TextFormatFlags.NoPadding);
     }
 }
 
@@ -443,7 +337,7 @@ public sealed class MenuRenderer(Palette pal) : ToolStripProfessionalRenderer(ne
     protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
     {
         using var f = Ui.Icons(9f);
-        TextRenderer.DrawText(e.Graphics, Ui.Check, f, e.ImageRectangle, pal.Accent,
+        TextRenderer.DrawText(e.Graphics, Ui.Check, f, e.ImageRectangle, pal.Text,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
     }
 

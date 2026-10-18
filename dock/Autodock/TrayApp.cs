@@ -82,18 +82,18 @@ public sealed class TrayApp : ApplicationContext
     {
         if (_busy) return;
         _busy = true;
-        _dash.SetStatus("Refreshing…");
+        _dash.SetStatus("updating…");
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
             _snap = await _engine.ListAsync();
             _error = null;
-            _dash.SetStatus($"Updated {DateTime.Now:HH:mm}" + (_settings.AutoSwitch ? " · auto-switch on" : ""));
+            _dash.SetStatus($"{DateTime.Now:HH:mm}");
         }
         catch (Exception e)
         {
             _error = Engine.Redact(e.Message);
-            _dash.SetStatus("Engine error: " + _error);
+            _dash.SetStatus("offline");
         }
         finally
         {

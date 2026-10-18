@@ -14,7 +14,7 @@ $pngs = foreach ($s in $sizes) {
     $path.AddArc($w - 2 * $r, $w - 2 * $r, 2 * $r, 2 * $r, 0, 90)
     $path.AddArc(0, $w - 2 * $r, 2 * $r, 2 * $r, 90, 90)
     $path.CloseFigure()
-    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(16, 150, 136))), $path)
+    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(38, 38, 38))), $path)
     # Dock: three stacked bars of decreasing width, bottom-aligned.
     $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
     $bar = [Math]::Max(2, [int]($s * 0.12))

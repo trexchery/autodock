@@ -11,7 +11,7 @@ public sealed class SettingsForm : Form
 
     readonly Palette _pal = Palette.Current;
     int _y;
-    readonly int _w = Ui.S(460), _pad = Ui.S(24);
+    readonly int _w = Ui.S(400), _pad = Ui.S(22);
 
     public SettingsForm()
     {
@@ -21,18 +21,18 @@ public sealed class SettingsForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         Font = Ui.Font(9f);
         Icon = TrayIcons.App;
-        Strategy.Items.AddRange(["Most quota left", "Use soonest reset first"]);
+        Strategy.Items.AddRange(["Most quota left", "Soonest weekly reset"]);
         Strategy.SelectedIndex = 0;
         _y = Ui.S(20);
 
         Section("Auto-switch");
-        Row("Switch at", "When the active account's 5-hour or weekly usage reaches this percentage.", Threshold, Ui.S(80), "%");
-        Row("Pick next account by", "Most quota left, or the account whose weekly quota resets soonest.", Strategy, Ui.S(190));
-        Row("Also watch models", "Per-model weekly limits to include, e.g. Opus. Comma-separated, or 'all'.", Models, Ui.S(190));
-        _y += Ui.S(12);
+        Row("Switch at", "of the 5-hour or weekly limit", Threshold, Ui.S(72), "%");
+        Row("Next account", null, Strategy, Ui.S(170));
+        Row("Also watch models", "e.g. Opus, or 'all'", Models, Ui.S(170));
+        _y += Ui.S(6);
         Section("General");
-        Row("Start with Windows", "Launch autodock in the tray when you sign in.", Startup, Ui.S(44));
-        Row("Refresh every", "Seconds between dashboard updates. The engine still spaces out real API calls.", RefreshInterval, Ui.S(80), "s");
+        Row("Start with Windows", null, Startup, Ui.S(34));
+        Row("Refresh every", null, RefreshInterval, Ui.S(72), "s");
 
         _y += Ui.S(8);
         var about = new Label
@@ -40,7 +40,7 @@ public sealed class SettingsForm : Form
             Text = "autodock is an independent open-source project, not affiliated with or endorsed by Anthropic. " +
                    "Built on claude-swap by Onur Cetinkol (MIT).",
             Tag = "muted",
-            Font = Ui.Font(8f),
+            Font = Ui.Font(7.5f),
             Location = new Point(_pad, _y),
             MaximumSize = new Size(_w - 2 * _pad, 0),
             AutoSize = true,
@@ -62,23 +62,28 @@ public sealed class SettingsForm : Form
 
     void Section(string title)
     {
-        Controls.Add(new Label { Text = title, Font = Ui.Font(10.5f, semibold: true), AutoSize = true, Location = new Point(_pad, _y) });
-        _y += Ui.S(32);
+        Controls.Add(new Label { Text = title.ToUpperInvariant(), Tag = "muted", Font = Ui.Font(7.5f, semibold: true), AutoSize = true, Location = new Point(_pad, _y) });
+        _y += Ui.S(24);
     }
 
-    void Row(string label, string hint, Control input, int inputWidth, string? suffix = null)
+    void Row(string label, string? hint, Control input, int inputWidth, string? suffix = null)
     {
         var textWidth = _w - 2 * _pad - inputWidth - Ui.S(40);
         Controls.Add(new Label { Text = label, AutoSize = true, Location = new Point(_pad, _y) });
-        var h = new Label { Text = hint, Tag = "muted", Font = Ui.Font(8f), AutoSize = true, MaximumSize = new Size(textWidth, 0), Location = new Point(_pad, _y + Ui.S(20)) };
-        Controls.Add(h);
+        var hintHeight = 0;
+        if (hint != null)
+        {
+            var h = new Label { Text = hint, Tag = "muted", Font = Ui.Font(8f), AutoSize = true, MaximumSize = new Size(textWidth, 0), Location = new Point(_pad, _y + Ui.S(19)) };
+            Controls.Add(h);
+            hintHeight = Ui.S(19) + h.PreferredHeight;
+        }
         var right = _w - _pad - (suffix != null ? Ui.S(20) : 0);
         input.Width = inputWidth;
         input.Location = new Point(right - inputWidth, _y);
         Controls.Add(input);
         if (suffix != null)
             Controls.Add(new Label { Text = suffix, Tag = "muted", AutoSize = true, Location = new Point(right + Ui.S(6), _y + Ui.S(3)) });
-        _y += Math.Max(Ui.S(20) + h.PreferredHeight, input.Height) + Ui.S(16);
+        _y += Math.Max(Math.Max(hintHeight, Ui.S(20)), input.Height) + Ui.S(14);
     }
 
     /// Engine values for the strategy picker.
