@@ -16,10 +16,12 @@ public sealed class DockSettings
     public bool PreserveRemoteControl { get; set; } = true; // keys absent from an older settings.json keep these defaults
     public bool AutoProjectAccount { get; set; }
     public bool QuotaNotifications { get; set; }
+    public string? AgentLastRepo { get; set; }
 
     public const int MinRefreshSeconds = 60;
 
-    public static string Dir => Path.Combine(
+    /// AUTODOCK_DATA runs a separate, isolated instance (development, benchmarks).
+    public static string Dir => Environment.GetEnvironmentVariable("AUTODOCK_DATA") is { Length: > 0 } d ? d : Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "autodock");
 
     static string FilePath => Path.Combine(Dir, "settings.json");

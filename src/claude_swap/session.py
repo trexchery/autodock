@@ -61,7 +61,7 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_claude_config_home, get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, is_pid_alive, scan_sessions
+from claude_swap.process_detection import ClaudeSession, is_pid_alive, process_created, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -113,8 +113,9 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
 # Windows run markers: ``<profile>/.cswap-runs/<pid>``, one per resident
-# `cswap run` wrapper using the profile. The profile's plaintext login is
-# sealed back into the (DPAPI) backup only once no live wrapper is left.
+# `cswap run` wrapper using the profile, holding the wrapper's creation time.
+# The profile's plaintext login is sealed back into the (DPAPI) backup only
+# once no live wrapper is left.
 RUN_MARKERS = ".cswap-runs"
 
 
@@ -540,20 +541,40 @@ def live_run_markers(session_dir: Path, ignore: int | None = None) -> bool:
     the window X kills the wrapper before it can remove its own). A seal
     decides under the store lock, which registration also takes. An
     unlistable directory raises: not knowing is not "nobody there".
+    """
+    return bool(live_run_marker_pids(session_dir, ignore))
 
-    ponytail: a recycled PID keeps a dead wrapper's marker "live", which only
-    delays the seal; store the process start time if that ever matters.
+
+def live_run_marker_pids(session_dir: Path, ignore: int | None = None) -> list[int]:
+    """PIDs of the live `cswap run` wrappers (other than ``ignore``) using
+    this profile, cleaning dead markers like ``live_run_markers``.
+
+    A headless ``claude -p`` writes no session record, so its wrapper's
+    marker is the only sign that a claude owns the profile's tokens.
     """
     runs = session_dir / RUN_MARKERS
     if not runs.is_dir():
-        return False
-    live = False
+        return []
+    live = []
     for marker in runs.iterdir():
-        if not marker.name.isdigit() or not is_pid_alive(int(marker.name)):
+        if not _marker_is_live(marker):
             marker.unlink(missing_ok=True)
         elif int(marker.name) != ignore:
-            live = True
+            live.append(int(marker.name))
     return live
+
+
+def _marker_is_live(marker: Path) -> bool:
+    """The marker's wrapper still runs: its PID is alive and, when the marker
+    recorded a creation time, it is that same process and not a recycled PID
+    (a stale marker would otherwise keep the account busy indefinitely)."""
+    if not marker.name.isdigit() or not is_pid_alive(pid := int(marker.name)):
+        return False
+    try:
+        stamp = marker.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return True
+    return not stamp.isdigit() or process_created(pid) in (None, int(stamp))
 
 
 def _mkdir_private(path: Path) -> None:
@@ -854,7 +875,9 @@ class SessionManager:
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             runs = session_dir / RUN_MARKERS
             runs.mkdir(parents=True, exist_ok=True)
-            (runs / str(os.getpid())).touch()
+            (runs / str(os.getpid())).write_text(
+                str(process_created(os.getpid()) or ""), encoding="ascii"
+            )
 
     def _seal_after_exit(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str

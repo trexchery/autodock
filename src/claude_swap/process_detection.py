@@ -101,6 +101,32 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
+def process_created(pid: int) -> int | None:
+    """A Windows process's creation time (a FILETIME, as an int), or None when
+    unknowable or not on Windows. Same PID, different value: a recycled PID."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(wintypes.HANDLE(handle), *(ctypes.byref(t) for t in times)):
+                return None
+            return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
 def _ps(pid: int, *columns: str) -> str | None:
     """``ps -o`` ``columns`` for ``pid``, or None when unknowable.
 

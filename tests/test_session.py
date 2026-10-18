@@ -1955,6 +1955,44 @@ class TestSealProfiles:
         manager.seal_idle_profiles()
         assert (session_dir / ".credentials.json").read_text() == CREDS
 
+    def test_live_wrapper_marker_counts_as_a_live_session(self, manager):
+        # A headless claude writes no session record: the wrapper's marker is
+        # the only sign its tokens are in use, so nothing may adopt or rotate them.
+        session_dir = _seed_profile(manager, OTHER_CREDS)
+        (session_dir / RUN_MARKERS).mkdir()
+        (session_dir / RUN_MARKERS / str(os.getppid())).touch()  # live, not us
+        switcher = manager.switcher
+        assert switcher._live_session_pids(ACCOUNT_NUM, ACCOUNT_EMAIL) == [os.getppid()]
+        assert switcher._adopt_session_credential(ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID) is None
+        assert self._backup(manager) == CREDS
+
+    def test_own_wrapper_marker_is_not_a_peer(self, manager):
+        session_dir = _seed_profile(manager)
+        (session_dir / RUN_MARKERS).mkdir()
+        (session_dir / RUN_MARKERS / str(os.getpid())).touch()
+        assert manager.switcher._live_session_pids(ACCOUNT_NUM, ACCOUNT_EMAIL) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="run markers are Windows-only")
+    def test_wrapper_marker_of_a_recycled_pid_is_dead(self, manager):
+        from claude_swap.process_detection import process_created
+
+        session_dir = _seed_profile(manager)
+        peer = os.getppid()
+        marker = session_dir / RUN_MARKERS / str(peer)
+        marker.parent.mkdir()
+        marker.write_text(str(process_created(peer)))
+        assert session_mod.live_run_marker_pids(session_dir) == [peer]
+        marker.write_text(str(process_created(peer) + 1))  # same number, another process
+        assert session_mod.live_run_marker_pids(session_dir) == []
+        assert not marker.exists()
+
+    def test_registered_marker_records_the_wrapper(self, manager):
+        session_dir = _seed_profile(manager)
+        manager._register_run(session_dir)
+        stamp = (session_dir / RUN_MARKERS / str(os.getpid())).read_text()
+        assert stamp.isdigit() if sys.platform == "win32" else stamp == ""
+        assert session_mod.live_run_marker_pids(session_dir) == [os.getpid()]
+
     def test_dead_wrapper_marker_is_cleaned(self, manager):
         session_dir = _seed_profile(manager)
         dead = session_dir / RUN_MARKERS / str(2**22 + 12345)

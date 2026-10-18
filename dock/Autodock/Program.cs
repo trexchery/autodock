@@ -5,7 +5,11 @@ static class Program
     [STAThread]
     static void Main(string[] args)
     {
-        using var mutex = new Mutex(true, @"Local\Autodock-" + Environment.UserName, out var first);
+        // Started by the agents terminal's Claude Code as its autodock tools; talks to the running tray.
+        if (args is ["agents-mcp", ..]) { Environment.ExitCode = AgentsLink.ServeMcp(args); return; }
+
+        var isolated = Environment.GetEnvironmentVariable("AUTODOCK_DATA") is { Length: > 0 } ? "-" + AgentStore.KeyFor(DockSettings.Dir) : "";
+        using var mutex = new Mutex(true, @"Local\Autodock-" + Environment.UserName + isolated, out var first);
         if (!first) return; // already running in the tray
 
         // A bug in a UI handler must never take the tray down silently.

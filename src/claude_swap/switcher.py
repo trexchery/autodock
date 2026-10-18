@@ -2731,10 +2731,18 @@ class ClaudeAccountSwitcher:
         usage heuristics that read this; a destructive guard must use
         ``_ensure_no_live_session``, which asks the readability question too.
         """
-        from claude_swap.session import scan_live_sessions
+        from claude_swap.session import live_run_marker_pids, scan_live_sessions
 
-        sessions, _ = scan_live_sessions(self._session_dir(account_num, email))
-        return [s.pid for s in sessions]
+        session_dir = self._session_dir(account_num, email)
+        sessions, _ = scan_live_sessions(session_dir)
+        pids = [s.pid for s in sessions]
+        # A headless claude (`cswap run N -- -p`, autodock agents) writes no
+        # session record; its live wrapper still owns the profile's tokens.
+        try:
+            wrappers = live_run_marker_pids(session_dir, ignore=os.getpid())
+        except OSError:
+            wrappers = []  # scan-shaped, like an unreadable record
+        return pids + [p for p in wrappers if p not in pids]
 
     def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
         """Refuse a destructive operation while a session-mode claude is live.
@@ -2881,11 +2889,17 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
-        from claude_swap.session import profile_is_quiescent, read_session_identity
+        from claude_swap.session import (
+            live_run_markers,
+            profile_is_quiescent,
+            read_session_identity,
+        )
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir):
+            if not profile_is_quiescent(session_dir) or live_run_markers(
+                session_dir, ignore=os.getpid()
+            ):
                 return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
@@ -6786,7 +6800,7 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
-        from claude_swap.session import scan_live_sessions
+        from claude_swap.session import live_run_marker_pids, scan_live_sessions
 
         self._refuse_session_shell()
         warnings_out: list[str] = []
@@ -6805,10 +6819,15 @@ class ClaudeAccountSwitcher:
         pre_email = pre_account.get("email", "")
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
-            sessions, unreadable = scan_live_sessions(
-                self._session_dir(target_account, pre_email)
-            )
+            session_dir = self._session_dir(target_account, pre_email)
+            sessions, unreadable = scan_live_sessions(session_dir)
             pids = [s.pid for s in sessions]
+            # A headless claude's only trace is its live `cswap run` wrapper.
+            try:
+                wrappers = live_run_marker_pids(session_dir, ignore=os.getpid())
+            except OSError:
+                wrappers = []  # the adoption below asks again, and refuses on not knowing
+            pids += [p for p in wrappers if p not in pids]
             if pids or unreadable:
                 if self._session_profile_ahead(target_account, pre_email, pre_org):
                     who = (
