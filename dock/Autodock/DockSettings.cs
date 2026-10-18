@@ -17,6 +17,7 @@ public sealed class DockSettings
     public bool AutoProjectAccount { get; set; }
     public bool QuotaNotifications { get; set; }
     public string? AgentLastRepo { get; set; }
+    public bool AutoPrime { get; set; }
 
     public const int MinRefreshSeconds = 60;
 

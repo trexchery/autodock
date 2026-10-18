@@ -35,6 +35,9 @@ public sealed record Account(
     /// "claude", "codex" or "grok"; set by Engine.ListAsync, not part of the payload.
     [JsonIgnore] public string Provider { get; init; } = "claude";
 
+    /// When the live usage reading was taken (absent when there is none).
+    public DateTimeOffset? UsageFetchedAt { get; init; }
+
     public string DisplayName => string.IsNullOrEmpty(Alias) ? Email : $"{Alias}  ·  {Email}";
 
     /// Alias or email: how titles and balloons name the account.

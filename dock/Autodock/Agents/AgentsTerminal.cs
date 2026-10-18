@@ -5,11 +5,12 @@ using System.Text.Json.Nodes;
 namespace Autodock;
 
 /// The agents terminal: an ordinary Claude Code session in the repository, opened like any other
-/// autodock terminal (`cswap run`, so the folder's assigned account or the default login), plus three
+/// autodock terminal (`cswap run`, so the folder's assigned account or the default login), plus
 /// session-only files passed on the command line. Nothing in the owner's own settings changes.
-///   settings.json  the `autodock · agents` status line, and permission for autodock's read-only tools
+///   settings.json  the `autodock · agents` status line, autodock's theme, and permission for its read-only tools
 ///   mcp.json       the autodock MCP bridge for this repository
 ///   statusline.sh  the owner's own status line (if any), with the label on its last row
+///   theme/         a theme-only plugin: the owner's theme with a white mascot (the color is in the label)
 public static class AgentsTerminal
 {
     public const string Label = "autodock · agents";
@@ -17,27 +18,37 @@ public static class AgentsTerminal
     /// Seconds between Claude's own status-line refreshes: each one moves the gradient a step.
     public const int RefreshSeconds = 5;
 
-    public const int FrameCount = 18;
+    /// The pastel wheel in 5° steps. Neighbouring letters sit 15° apart, and each refresh moves the
+    /// gradient 45°, about three letters: a step that reads as motion (a full turn in 40 s).
+    public const int Hues = 72;
+    const int FrameStep = 9, LetterStep = 3;
+
+    /// The built-in dark themes: a white mascot only reads on these, so with any other (light, auto,
+    /// custom or none set) the terminal keeps the owner's theme untouched.
+    static readonly string[] DarkThemes = ["dark", "dark-daltonized", "dark-ansi"];
 
     static string Dir(string root, string repo) => Path.Combine(root, "terminal", AgentStore.KeyFor(repo));
 
-    public static void Open(Engine engine, string root, string repo, bool restoreRc, bool running)
+    public static void Open(Engine engine, string root, string repo, bool restoreRc, string state)
     {
         var dir = Dir(root, repo);
         Directory.CreateDirectory(dir);
-        SetRunning(root, repo, running);
+        SetState(root, repo, state);
         foreach (var old in Directory.GetFiles(dir, "user-statusline*"))
             try { File.Delete(old); } catch (IOException) { } // a terminal still open just renders its own again
         var script = Path.Combine(dir, "statusline.sh");
         // LF only: Git Bash runs it, and a stray CR would end up inside every token.
         File.WriteAllText(script, StatusScript(UserStatusLine(repo), Posix(Path.Combine(dir, "state")), Posix(Path.Combine(dir, "user-statusline"))).ReplaceLineEndings("\n"));
+        var plugin = WriteTheme(dir, UserSetting(repo, null, "theme") is JsonValue v && v.TryGetValue<string>(out var theme) ? theme : null);
         var settings = Path.Combine(dir, "settings.json");
-        File.WriteAllText(settings, new JsonObject
+        var session = new JsonObject
         {
             // Sourced, not started: the status line already runs in a Git Bash; no second process.
             ["statusLine"] = new JsonObject { ["type"] = "command", ["command"] = ". " + BashQuote(Posix(script)), ["refreshInterval"] = RefreshSeconds },
             ["permissions"] = new JsonObject { ["allow"] = new JsonArray("mcp__autodock__agents_status", "mcp__autodock__agents_details") },
-        }.ToJsonString());
+        };
+        if (plugin != null) session["theme"] = $"custom:{ThemePlugin}:{ThemeSlug}";
+        File.WriteAllText(settings, session.ToJsonString());
         var mcp = Path.Combine(dir, "mcp.json");
         File.WriteAllText(mcp, new JsonObject
         {
@@ -52,20 +63,65 @@ public static class AgentsTerminal
             },
         }.ToJsonString());
         var leaf = Path.GetFileName(repo.TrimEnd('\\', '/'));
-        engine.LaunchConsole($"{Label} · {leaf}", repo, Launch.Run(null, restoreRc, "--settings", settings, "--mcp-config", mcp));
+        engine.LaunchConsole($"{Label} · {leaf}", repo, Launch.Run(null, restoreRc,
+            ["--settings", settings, "--mcp-config", mcp, .. plugin != null ? (string[])["--plugin-dir", plugin] : []]));
     }
 
-    /// The label moves while agents run here and rests in grey otherwise.
-    public static void SetRunning(string root, string repo, bool running)
+    const string ThemePlugin = "autodock-agents", ThemeSlug = "autodock";
+
+    /// A theme-only plugin, loaded for this session alone with --plugin-dir: the owner's own dark theme
+    /// with only the mascot recolored, white, leaving the color to the moving label. Nothing goes into
+    /// ~/.claude, so every other terminal keeps its look. Null (no plugin) for any other theme.
+    internal static string? WriteTheme(string dir, string? ownerTheme)
+    {
+        if (!DarkThemes.Contains(ownerTheme)) return null;
+        var plugin = Path.Combine(dir, "theme");
+        Directory.CreateDirectory(Path.Combine(plugin, ".claude-plugin"));
+        Directory.CreateDirectory(Path.Combine(plugin, "themes"));
+        File.WriteAllText(Path.Combine(plugin, ".claude-plugin", "plugin.json"), new JsonObject
+        {
+            ["name"] = ThemePlugin,
+            ["version"] = "1.0.0",
+            ["description"] = "autodock agents terminal: a white mascot",
+        }.ToJsonString());
+        File.WriteAllText(Path.Combine(plugin, "themes", ThemeSlug + ".json"), new JsonObject
+        {
+            ["name"] = "autodock",
+            ["base"] = ownerTheme,
+            ["overrides"] = new JsonObject { ["clawd_body"] = "#FFFFFF" },
+        }.ToJsonString());
+        return plugin;
+    }
+
+    /// What the label says after its gradient: working, needs you, paused or off (idle says nothing).
+    public static string StateOf(RepoAgents? repo) =>
+        repo is not { Authorized: true } ? "off"
+        : repo.Paused ? "paused"
+        : repo.Items.Any(i => i.State == ItemState.NeedsOwner) ? "attention"
+        : repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking) ? "working"
+        : "idle";
+
+    public static void SetState(string root, string repo, string state)
     {
         var dir = Dir(root, repo);
         if (!Directory.Exists(dir)) return; // no terminal was ever opened for it
-        try { File.WriteAllText(Path.Combine(dir, "state"), running ? "on\n" : "off\n"); }
+        try { File.WriteAllText(Path.Combine(dir, "state"), state + "\n"); }
         catch (IOException) { }
     }
 
     /// The status line the owner already has for this folder, highest-precedence file first.
     internal static string? UserStatusLine(string repo, string? home = null)
+    {
+        try
+        {
+            return UserSetting(repo, home, "statusLine") is JsonObject s && s["type"]?.GetValue<string>() == "command"
+                   && s["command"]?.GetValue<string>() is { Length: > 0 } c ? c : null;
+        }
+        catch (Exception e) when (e is InvalidOperationException or FormatException) { return null; }
+    }
+
+    /// One of the owner's Claude Code settings for this folder, highest-precedence file first.
+    internal static JsonNode? UserSetting(string repo, string? home, string key)
     {
         home ??= StoreSecurity.UserProfile;
         foreach (var file in new[]
@@ -77,17 +133,16 @@ public static class AgentsTerminal
         {
             try
             {
-                if (JsonNode.Parse(File.ReadAllText(file))?["statusLine"] is JsonObject s
-                    && s["type"]?.GetValue<string>() == "command" && s["command"]?.GetValue<string>() is { Length: > 0 } c)
-                    return c;
+                if (JsonNode.Parse(File.ReadAllText(file)) is JsonObject o && o[key] is { } value) return value;
             }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { }
         }
         return null;
     }
 
-    /// Bash, and builtins only for the label: the frame follows the clock, so each refresh (every few
-    /// seconds, and on every message) shifts the gradient one step. No loop, nothing between refreshes.
+    /// Bash builtins only for the label: the frame follows the clock, so each refresh (every few seconds,
+    /// and on every message) shifts the gradient one step. The whole line is one gradient, the state
+    /// word included; the dots stay neutral. Nothing runs between refreshes.
     /// The owner's own status line re-runs only when the conversation changed; idle refreshes reuse it
     /// (one cache per session: two terminals on one repository never show each other's).
     internal static string StatusScript(string? userCommand, string statePath, string cachePath)
@@ -111,37 +166,40 @@ public static class AgentsTerminal
         }
         sb.AppendLine("__ad_s=off");
         sb.AppendLine("read -r __ad_s 2>/dev/null < " + BashQuote(statePath));
-        sb.AppendLine("""if [ "$__ad_s" = on ]; then""");
-        sb.AppendLine("  __ad_f=(");
-        foreach (var frame in Frames()) sb.AppendLine($"    $'{frame}'");
-        sb.AppendLine("  )");
-        sb.AppendLine("  printf -v __ad_t '%(%s)T' -1");
-        sb.AppendLine($$"""  printf '%s\n' "${__ad_f[(__ad_t / {{RefreshSeconds}}) % {{FrameCount}}]}" """);
-        sb.AppendLine("else");
-        sb.AppendLine($"  printf '%s\\n' $'{Rest()}'");
-        sb.AppendLine("fi");
+        sb.AppendLine("__ad_p=(" + string.Join(' ', Palette().Select(c => $"'{c}'")) + ")");
+        sb.AppendLine("case $__ad_s in");
+        foreach (var (state, text) in Lines)
+            sb.AppendLine($"  {state}) __ad_c=({string.Join(' ', text.Select(c => BashQuote(c.ToString())))}) ;;");
+        sb.AppendLine("esac");
+        sb.AppendLine("printf -v __ad_t '%(%s)T' -1");
+        sb.AppendLine($"__ad_f=$(( __ad_t / {RefreshSeconds} * {FrameStep} ))");
+        sb.AppendLine("__ad_o=");
+        sb.AppendLine("""for __ad_i in "${!__ad_c[@]}"; do""");
+        sb.AppendLine("  case ${__ad_c[__ad_i]} in");
+        sb.AppendLine("    ' ') __ad_o+=' ' ;;");
+        sb.AppendLine("""    '·') __ad_o+=$'\e[38;2;128;128;128m·' ;;""");
+        sb.AppendLine($$"""    *) __ad_o+=$'\e[38;2;'"${__ad_p[(__ad_f + __ad_i * {{LetterStep}}) % {{Hues}}]}m${__ad_c[__ad_i]}" ;;""");
+        sb.AppendLine("  esac");
+        sb.AppendLine("done");
+        sb.AppendLine("""printf '%s\e[0m\n' "$__ad_o" """);
         return sb.ToString();
     }
 
-    /// A soft rainbow across the label, each frame 20° further round the wheel (a full turn in 90 s
-    /// of refreshes). Pastel, so it reads on dark and light terminals alike; the dot stays neutral.
-    internal static IEnumerable<string> Frames()
-    {
-        for (var f = 0; f < FrameCount; f++)
-        {
-            var sb = new StringBuilder();
-            for (var i = 0; i < Label.Length; i++)
-            {
-                var c = Label[i];
-                if (c == ' ') { sb.Append(' '); continue; }
-                var (r, g, b) = c == '·' ? (128, 128, 128) : Hsl((f * 20 + i * 13) % 360, 0.55, 0.68);
-                sb.Append($@"\e[38;2;{r};{g};{b}m{c}");
-            }
-            yield return sb.Append(@"\e[0m").ToString();
-        }
-    }
+    /// The line for each state; working, needs you, paused and off say so, idle shows the label alone
+    /// (also for a state file from an older autodock).
+    internal static readonly (string State, string Text)[] Lines =
+    [
+        ("working", Label + " · working"),
+        ("attention", Label + " · needs you"),
+        ("paused", Label + " · paused"),
+        ("off", Label + " · off"),
+        ("*", Label),
+    ];
 
-    static string Rest() => $@"\e[38;2;120;120;120m{Label}\e[0m";
+    /// The pastel wheel as `r;g;b`: soft enough to read on dark and light terminals alike.
+    internal static IEnumerable<string> Palette() =>
+        Enumerable.Range(0, Hues).Select(k => Hsl(k * 360.0 / Hues, 0.55, 0.68)).Select(c => $"{c.Item1};{c.Item2};{c.Item3}");
+
 
     internal static (int, int, int) Hsl(double h, double s, double l)
     {

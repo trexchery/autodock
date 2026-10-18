@@ -8,7 +8,7 @@ public sealed partial class TrayApp
 {
     Supervisor? _agents;
     AgentsLink.Server? _link;
-    readonly Dictionary<string, bool> _labels = [];
+    readonly Dictionary<string, string> _labels = [];
 
     /// Created on first use, or at start when a repository was left running; never before.
     Supervisor? EnsureAgents()
@@ -48,10 +48,10 @@ public sealed partial class TrayApp
     {
         if (_agents == null) return;
         foreach (var repo in _agents.Repos)
-            if (!_labels.TryGetValue(repo.Path, out var was) || was != repo.Running)
+            if (AgentsTerminal.StateOf(repo) is var state && (!_labels.TryGetValue(repo.Path, out var was) || was != state))
             {
-                AgentsTerminal.SetRunning(AgentStore.DefaultRoot, repo.Path, repo.Running);
-                _labels[repo.Path] = repo.Running;
+                AgentsTerminal.SetState(AgentStore.DefaultRoot, repo.Path, state);
+                _labels[repo.Path] = state;
             }
         var needs = _agents.NeedsOwner;
         var working = _agents.Working;
@@ -118,9 +118,10 @@ public sealed partial class TrayApp
         if (EnsureAgents() is not { } agents) return;
         _settings.AgentLastRepo = root;
         _settings.Save();
-        try { AgentsTerminal.Open(_engine, AgentStore.DefaultRoot, root, _settings.PreserveRemoteControl, agents.RepoFor(root)?.Running == true); }
+        var state = AgentsTerminal.StateOf(agents.RepoFor(root));
+        try { AgentsTerminal.Open(_engine, AgentStore.DefaultRoot, root, _settings.PreserveRemoteControl, state); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception) { Error("Could not open the agents terminal", e); }
-        _labels[root] = agents.RepoFor(root)?.Running == true;
+        _labels[root] = state;
     }
 
     internal static string? GitRoot(string folder)

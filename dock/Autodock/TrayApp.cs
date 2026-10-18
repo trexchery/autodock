@@ -99,7 +99,9 @@ public sealed partial class TrayApp : ApplicationContext
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
-            _snap = await _engine.ListAsync(refresh);
+            var reread = _settings.AutoPrime && Prime.WantsReread(DateTimeOffset.Now);
+            _snap = await _engine.ListAsync(refresh || reread);
+            if (_settings.AutoPrime && (Prime.Observe(_snap.Accounts, DateTimeOffset.Now) | reread)) Prime.Save();
             fresh.Add(("claude", _snap));
             _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
             _error = null;
@@ -225,12 +227,55 @@ public sealed partial class TrayApp : ApplicationContext
             _menu.Items.Add(agents);
         }
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
+        if (_settings.AutoPrime && _snap != null) AddPrimeItems(_snap.Accounts);
         _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
         _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => _ = ExitAsync());
         MenuRenderer.Apply(_menu);
+    }
+
+    Primer? _primer;
+    Primer Prime => _primer ??= new(Primer.DefaultPath);
+    bool _priming;
+
+    /// One click primes every fresh window; the status lines say what happened and what's next.
+    void AddPrimeItems(IReadOnlyList<Account> accounts)
+    {
+        var now = DateTimeOffset.Now;
+        var ready = Prime.Ready(accounts, now);
+        if (ready.Count > 0)
+            _menu.Items.Add(new ToolStripMenuItem($"Prime {ready.Count} fresh 5-hour window{(ready.Count == 1 ? "" : "s")}", null, (_, _) => _ = PrimeAsync())
+            {
+                Enabled = !_priming,
+                ToolTipText = string.Join(", ", ready.Select(a => $"#{a.Number} {a.ShortName}")),
+            });
+        var status = new ToolStripMenuItem("Auto-Prime");
+        foreach (var line in Prime.Status(accounts, now).DefaultIfEmpty("No fresh 5-hour windows right now"))
+            status.DropDownItems.Add(new ToolStripMenuItem(line) { Enabled = false });
+        _menu.Items.Add(status);
+    }
+
+    /// Silent: no window, no transcript, no notification unless something needs the owner.
+    async Task PrimeAsync()
+    {
+        if (_priming || _snap == null) return;
+        _priming = true;
+        var failed = new List<string>();
+        try
+        {
+            foreach (var a in Prime.Ready(_snap.Accounts, DateTimeOffset.Now))
+            {
+                Prime.Begin(a, DateTimeOffset.Now);
+                var (ok, detail) = await _engine.PrimeAsync(a);
+                Prime.Finish(a, ok, detail);
+                if (!ok) failed.Add($"#{a.Number} {a.ShortName}: {detail}");
+            }
+        }
+        finally { _priming = false; }
+        if (failed.Count > 0) Notify("Auto-Prime", "Could not prime " + string.Join("; ", failed), ToolTipIcon.Warning);
+        _ = TickAsync(runAuto: false);
     }
 
     async Task SwitchAsync(Account a)
@@ -480,6 +525,7 @@ public sealed partial class TrayApp : ApplicationContext
         f.PreserveRc.Checked = _settings.PreserveRemoteControl;
         f.AutoProject.Checked = _settings.AutoProjectAccount;
         f.QuotaNotify.Checked = _settings.QuotaNotifications;
+        f.AutoPrime.Checked = _settings.AutoPrime;
         if (f.ShowDialog() != DialogResult.OK) return;
         try
         {
@@ -496,6 +542,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AutoProjectAccount = f.AutoProject.Checked;
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
             _settings.QuotaNotifications = f.QuotaNotify.Checked;
+            _settings.AutoPrime = f.AutoPrime.Checked;
             _settings.Save();
             _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = _settings.RefreshSeconds * 1000;

@@ -519,7 +519,7 @@ public class AgentsTerminalTests
     }
 
     [Fact]
-    public void LabelSitsBelowTheOwnersStatusLineAndRestsWhenOff()
+    public void LabelSitsBelowTheOwnersStatusLineAndAlwaysShimmers()
     {
         if (GitBash() is not { } bash) return; // Claude Code itself needs Git Bash for status lines
         using var tmp = new TempDir();
@@ -532,7 +532,7 @@ public class AgentsTerminalTests
         File.WriteAllText(script, AgentsTerminal.StatusScript(user, F("state"), F("cache")).ReplaceLineEndings("\n"));
         var json = $$"""{"session_id":"x","transcript_path":"{{F("transcript.jsonl").Replace("/", "\\\\")}}"}""";
 
-        File.WriteAllText(F("state"), "on\n");
+        File.WriteAllText(F("state"), "idle\n");
         var lines = RunStatusLine(bash, script, json).TrimEnd('\n').Split('\n');
         Assert.Equal(2, lines.Length);
         Assert.Equal("mine:{\"ses", lines[0]);
@@ -544,18 +544,53 @@ public class AgentsTerminalTests
         Assert.Equal("mine:{\"ses", again[0]);
         Assert.Single(File.ReadAllLines(F("count")));
 
-        File.WriteAllText(F("state"), "off\n");
-        Assert.Contains("\u001b[38;2;120;120;120m" + AgentsTerminal.Label, RunStatusLine(bash, script, json));
+        // Every state keeps the gradient across the whole line, the state word included.
+        string Plain(string s) => System.Text.RegularExpressions.Regex.Replace(s, "\u001b\\[[0-9;]*m", "").TrimEnd('\n').Split('\n')[^1];
+        foreach (var (state, shown) in new[] { ("working", " · working"), ("attention", " · needs you"), ("paused", " · paused"), ("off", " · off"), ("on", "") })
+        {
+            File.WriteAllText(F("state"), state + "\n");
+            var line = RunStatusLine(bash, script, json).TrimEnd('\n').Split('\n')[^1];
+            // A gradient: many distinct colors across the label, not one grey.
+            var colors = System.Text.RegularExpressions.Regex.Matches(line, "\u001b\\[38;2;([0-9;]+)m").Select(m => m.Groups[1].Value).ToList();
+            Assert.True(colors.Distinct().Count() >= 8, line);
+            Assert.All(colors.Where(c => c != "128;128;128"), c => Assert.Contains(c, AgentsTerminal.Palette())); // the dots stay neutral, the rest is the wheel
+            Assert.Equal((AgentsTerminal.Label + shown).Count(ch => ch is not (' ' or '·')), colors.Count(c => c != "128;128;128")); // every letter colored
+            Assert.Equal(AgentsTerminal.Label + shown, Plain(line));
+        }
+        // Motion: the next refresh shows the same words in moved colors.
+        var before = RunStatusLine(bash, script, json);
+        Thread.Sleep(TimeSpan.FromSeconds(AgentsTerminal.RefreshSeconds) + TimeSpan.FromMilliseconds(200));
+        var after = RunStatusLine(bash, script, json);
+        Assert.NotEqual(before, after);
+        Assert.Equal(Plain(before), Plain(after));
+
+        File.Delete(F("state")); // never opened by the tray yet: off
+        Assert.Equal(AgentsTerminal.Label + " · off", Plain(RunStatusLine(bash, script, json)));
     }
 
     [Fact]
-    public void FramesShiftAndStayPastel()
+    public void LabelStateFollowsTheRepository()
     {
-        var frames = AgentsTerminal.Frames().ToList();
-        Assert.Equal(AgentsTerminal.FrameCount, frames.Count);
-        Assert.Equal(frames.Count, frames.Distinct().Count());
-        foreach (var (r, g, b) in Enumerable.Range(0, 36).Select(i => AgentsTerminal.Hsl(i * 10, 0.55, 0.68)))
-            Assert.True(Math.Min(r, Math.Min(g, b)) >= 100 && Math.Max(r, Math.Max(g, b)) <= 230);
+        var repo = new RepoAgents { Path = @"C:\r", Authorized = true };
+        Assert.Equal("off", AgentsTerminal.StateOf(null));
+        Assert.Equal("idle", AgentsTerminal.StateOf(repo));
+        repo.Items.Add(new WorkItem { Id = "1", Title = "t", State = ItemState.Working });
+        Assert.Equal("working", AgentsTerminal.StateOf(repo));
+        repo.Items.Add(new WorkItem { Id = "2", Title = "q", State = ItemState.NeedsOwner });
+        Assert.Equal("attention", AgentsTerminal.StateOf(repo));
+        repo.Paused = true;
+        Assert.Equal("paused", AgentsTerminal.StateOf(repo));
+        repo.Authorized = false;
+        Assert.Equal("off", AgentsTerminal.StateOf(repo));
+    }
+
+    [Fact]
+    public void ThePaletteStaysPastel()
+    {
+        var palette = AgentsTerminal.Palette().ToList();
+        Assert.Equal(AgentsTerminal.Hues, palette.Distinct().Count());
+        foreach (var rgb in palette.Select(c => c.Split(';').Select(int.Parse).ToArray()))
+            Assert.True(rgb.Min() >= 100 && rgb.Max() <= 230);
     }
 
     [Fact]

@@ -17,6 +17,7 @@ multi-account switcher for claude code, codex, and grok build. live usage, reset
 - project folders: assign a folder to an account, and terminals opened there run as that account without changing your login
 - **preserve remote control** (on by default): a new terminal turns claude remote control back on only if its last session used it
 - optional quota notifications when a limit gets near, runs out, or resets
+- **auto-prime** (off by default): tracks each claude account's 5-hour window and, with one click in the tray menu, starts every fresh one early with a single silent haiku "hi" (no window, nothing saved), so it also resets early. success is only claimed once a new usage reading shows the window started
 - **agents** (off until you start them): work through a repository's open github issues on your other claude accounts, one reviewed pull request at a time, steered from a normal claude code terminal. never merges. [how it works](docs/agents.md)
 
 ## install
@@ -37,6 +38,7 @@ no installer or admin access required. unsigned releases may trigger windows sma
 - **continue in...** notes are built locally and autodock sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
 - saved credentials are encrypted locally with windows dpapi. a pinned claude terminal holds a plaintext login only while it's open; autodock moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
 - grok build support has only been tested with synthetic data so far.
+- auto-prime never sends on its own: anthropic's consumer terms don't clearly allow unattended, scripted use of a subscription, so each prime is one click of yours. it skips excluded, api-key and paid-extra-usage accounts and any at a weekly limit, so a prime can't cost anything.
 
 ## build from source
 

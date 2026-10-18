@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
 namespace Autodock;
@@ -37,7 +38,9 @@ public sealed partial class Engine(string exe)
     /// Absolute, so cmd is never resolved through the current directory or PATH.
     internal static string Cmd => Path.Combine(Environment.SystemDirectory, "cmd.exe");
 
-    public async Task<EngineResult> RunAsync(IEnumerable<string> args, TimeSpan? timeout = null, string? input = null, CancellationToken ct = default)
+    /// `unset`: variables the child must not inherit; `workDir`: instead of the user's profile folder.
+    public async Task<EngineResult> RunAsync(IEnumerable<string> args, TimeSpan? timeout = null, string? input = null, CancellationToken ct = default,
+        IEnumerable<string>? unset = null, string? workDir = null)
     {
         await _gate.WaitAsync(ct);
         try
@@ -58,7 +61,8 @@ public sealed partial class Engine(string exe)
             psi.Environment["NO_COLOR"] = "1";
             // Engine resolves `claude` via PATH; never from the working directory.
             psi.Environment["NoDefaultCurrentDirectoryInExePath"] = "1";
-            psi.WorkingDirectory = StoreSecurity.UserProfile;
+            foreach (var k in unset ?? []) psi.Environment.Remove(k);
+            psi.WorkingDirectory = workDir ?? StoreSecurity.UserProfile;
 
             using var p = Process.Start(psi) ?? throw new EngineException("failed to start engine");
             if (input != null) await p.StandardInput.WriteAsync(input);
@@ -171,9 +175,69 @@ public sealed partial class Engine(string exe)
             psi.Arguments = $"/k \"title {safeTitle} && {cmdline}\"";
         }
         psi.WorkingDirectory = workDir ?? StoreSecurity.UserProfile;
+        // A new terminal is a top-level session, even when autodock itself was started from inside one.
+        TopLevel(psi.Environment, FreshEnvironment);
         psi.Environment["NoDefaultCurrentDirectoryInExePath"] = "1";
         Process.Start(psi)?.Dispose();
     }
+
+    /// What a running Claude Code session hands its own children: its id, messaging socket and token,
+    /// "child session" and the like. A session that inherits them runs as that session's child (and,
+    /// among other things, saves no transcript). Configuration the owner set (CLAUDE_CODE_GIT_BASH_PATH,
+    /// CLAUDE_CODE_USE_BEDROCK, …) is not a marker and stays.
+    internal static IEnumerable<string> SessionMarkers(IEnumerable<string> names) =>
+        names.Where(n => SessionMarker().IsMatch(n));
+
+    /// A terminal's environment. Started from inside a Claude Code session, autodock carries what that
+    /// session set up for its own tools (NO_COLOR and AI_AGENT, so no colors; no git prompts or editor;
+    /// its own prompt and encodings, …): then a terminal gets the environment Windows gives any new
+    /// program of the signed-in user instead, as if opened from the Start menu. Either way, no session
+    /// markers.
+    internal static void TopLevel(IDictionary<string, string?> env, Func<IReadOnlyDictionary<string, string>?> fresh)
+    {
+        if (env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)) && fresh() is { } clean)
+        {
+            // autodock's own (an isolated instance's AUTODOCK_DATA) carry over: its terminals talk to it.
+            var own = env.Where(v => v.Key.StartsWith("AUTODOCK_", StringComparison.OrdinalIgnoreCase)).ToList();
+            env.Clear();
+            foreach (var (k, v) in clean.Concat(own.Select(o => KeyValuePair.Create(o.Key, o.Value ?? "")))) env[k] = v;
+        }
+        foreach (var k in SessionMarkers(env.Keys.ToList())) env.Remove(k);
+    }
+
+    /// Machine, user and volatile variables, as Windows builds them for a new process of this user.
+    internal static IReadOnlyDictionary<string, string>? FreshEnvironment()
+    {
+        if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x0008 /* TOKEN_QUERY */, out var token)) return null;
+        try
+        {
+            if (!CreateEnvironmentBlock(out var block, token, false)) return null;
+            try
+            {
+                var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (var p = block; Marshal.PtrToStringUni(p) is { Length: > 0 } entry; p += (entry.Length + 1) * 2)
+                    if (entry.IndexOf('=', 1) is var eq and > 0) env[entry[..eq]] = entry[(eq + 1)..]; // skips "=C:=C:\" entries
+                return env;
+            }
+            finally { DestroyEnvironmentBlock(block); }
+        }
+        finally { CloseHandle(token); }
+    }
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+    [System.Runtime.InteropServices.DllImport("userenv.dll", SetLastError = true)]
+    static extern bool CreateEnvironmentBlock(out IntPtr block, IntPtr token, bool inherit);
+
+    [System.Runtime.InteropServices.DllImport("userenv.dll", SetLastError = true)]
+    static extern bool DestroyEnvironmentBlock(IntPtr block);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+
+    [GeneratedRegex(@"^(CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(CHILD_SESSION|SESSION_(ID|ATTENDED|KIND|ACCESS_TOKEN|ORIGIN|NAME)|BRIDGE_SESSION_ID|MESSAGING_(SOCKET|TOKEN)|ENTRYPOINT|EXECPATH|SSE_PORT))$", RegexOptions.IgnoreCase)]
+    private static partial Regex SessionMarker();
 
     internal static string QuoteArg(string a) =>
         a.Length > 0 && a.IndexOfAny([' ', '\t', '"', '&', '|', '<', '>', '^']) < 0 ? a : "\"" + a.Replace("\"", "\\\"") + "\"";
