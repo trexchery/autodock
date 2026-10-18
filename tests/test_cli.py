@@ -1010,6 +1010,36 @@ class TestJsonOutputCli:
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="the sweep is Windows-only")
+    def test_list_json_seals_idle_profiles_without_touching_stdout(self, capsys):
+        email = "b@example.com"
+        creds = json.dumps(
+            {"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "expiresAt": 1}}
+        )
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [2],
+            "accounts": {"2": {"email": email, "organizationUuid": "org-b"}},
+        })
+        switcher._write_account_credentials("2", email, creds)
+        profile = switcher._session_dir("2", email)
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text(creds)
+        (profile / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": email, "organizationUuid": "org-b"}}
+        ))
+        payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
+        with patch.object(ClaudeAccountSwitcher, "list_accounts", return_value=payload), \
+             patch.object(sys, "argv", ["claude-swap", "list", "--json"]):
+            cli.main()
+
+        assert json.loads(capsys.readouterr().out) == payload
+        assert not (profile / ".credentials.json").exists()
+        assert (profile / ".claude.json").exists()
+
     def test_switch_json_forwarded_and_serialized(self, capsys):
         payload = {"schemaVersion": 1, "switched": True}
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \

@@ -1473,6 +1473,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
+            if sys.platform == "win32":
+                # The tray polls this: seal profiles whose terminal window was
+                # closed (no exit seal ran). Silent, so --json stays clean.
+                from claude_swap.session import SessionManager
+
+                SessionManager(switcher).seal_idle_profiles()
             switcher.force_usage_refresh = args.refresh
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

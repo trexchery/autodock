@@ -46,7 +46,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
@@ -60,7 +60,7 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, scan_sessions
+from claude_swap.process_detection import ClaudeSession, is_pid_alive, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -110,6 +110,11 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+# Windows run markers: ``<profile>/.cswap-runs/<pid>``, one per resident
+# `cswap run` wrapper using the profile. The profile's plaintext login is
+# sealed back into the (DPAPI) backup only once no live wrapper is left.
+RUN_MARKERS = ".cswap-runs"
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -526,6 +531,30 @@ def profile_is_quiescent(session_dir: Path) -> bool:
     return not sessions and unreadable == 0
 
 
+def live_run_markers(session_dir: Path, ignore: int | None = None) -> bool:
+    """Whether a live `cswap run` wrapper (other than PID ``ignore``) still
+    uses this profile.
+
+    Deletes the markers of dead wrappers on the way (a console closed with
+    the window X kills the wrapper before it can remove its own). A seal
+    decides under the store lock, which registration also takes. An
+    unlistable directory raises: not knowing is not "nobody there".
+
+    ponytail: a recycled PID keeps a dead wrapper's marker "live", which only
+    delays the seal; store the process start time if that ever matters.
+    """
+    runs = session_dir / RUN_MARKERS
+    if not runs.is_dir():
+        return False
+    live = False
+    for marker in runs.iterdir():
+        if not marker.name.isdigit() or not is_pid_alive(int(marker.name)):
+            marker.unlink(missing_ok=True)
+        elif int(marker.name) != ignore:
+            live = True
+    return live
+
+
 def _mkdir_private(path: Path) -> None:
     """mkdir -p with 0o700 on every created level.
 
@@ -631,9 +660,40 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
-        session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
-        )
+        # Windows keeps this wrapper resident (see _exec), so the profile's
+        # plaintext login lives only while a terminal uses it: registered
+        # before setup, sealed back into the backup after claude exits.
+        on_exit = None
+        if sys.platform == "win32":
+            self.seal_idle_profiles()
+            session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+            # Before setup: a peer's exit seal can no longer take the login
+            # from under this launch, and a peer's setup skips its pre-launch
+            # consume (see setup_session) while this one is still starting.
+            self._register_run(session_dir)
+
+            def on_exit() -> None:
+                self._seal_after_exit(session_dir, account_num, email, org_uuid)
+
+        try:
+            session_dir, account_num, email = self.setup_session(
+                identifier, share, share_history
+            )
+            if on_exit and not (session_dir / ".credentials.json").exists():
+                # A backup write elsewhere invalidated it during setup;
+                # setup_session re-seeds it from the backup.
+                session_dir, account_num, email = self.setup_session(
+                    identifier, share, share_history
+                )
+                if not (session_dir / ".credentials.json").exists():
+                    raise SessionError(
+                        f"Session profile for Account-{account_num} ({email}) "
+                        "lost its login while starting. Retry."
+                    )
+        except BaseException:
+            if on_exit:
+                on_exit()  # drop our marker; never raises
+            raise
 
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
@@ -643,7 +703,7 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(claude_bin, claude_args, env=env, on_exit=on_exit)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -661,13 +721,20 @@ class SessionManager:
             )
         self._exec(claude_bin, claude_args, env=dict(os.environ))
 
-    def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
+    def _exec(
+        self,
+        claude_bin: str,
+        claude_args: list[str],
+        env: dict[str, str],
+        on_exit: Callable[[], None] | None = None,
+    ) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
 
         POSIX: ``execvpe`` replaces the cswap process entirely (the lock is
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
-        resident as a thin wrapper and mirror claude's exit code.
+        resident as a thin wrapper and mirror claude's exit code. ``on_exit``
+        runs there once claude has exited; it must not raise.
         """
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
@@ -675,6 +742,11 @@ class SessionManager:
                 rc = subprocess.run(argv, env=env).returncode
             except KeyboardInterrupt:
                 rc = 130  # Ctrl+C went to claude; just mirror the exit
+            if on_exit is not None:
+                try:
+                    on_exit()
+                except KeyboardInterrupt:
+                    pass  # a second Ctrl+C skips it; the next sweep seals
             sys.exit(rc)
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
@@ -692,6 +764,98 @@ class SessionManager:
                 "'cswap run' (session mode) does not support API-key accounts yet. "
                 "Use 'cswap --switch-to' to make it your default login instead."
             )
+
+    # -- sealing (Windows) -----------------------------------------------
+
+    def _register_run(self, session_dir: Path) -> None:
+        """Mark this wrapper as using the profile.
+
+        Under the store lock, like the seal's decision, so a peer's exit seal
+        either sees this marker or finished before setup_session looks.
+        """
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            runs = session_dir / RUN_MARKERS
+            runs.mkdir(parents=True, exist_ok=True)
+            (runs / str(os.getpid())).touch()
+
+    def _seal_after_exit(
+        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+    ) -> None:
+        try:
+            (session_dir / RUN_MARKERS / str(os.getpid())).unlink(missing_ok=True)
+        except OSError as e:
+            self._logger.debug(f"Could not remove run marker: {e}")
+        self._seal_profile(session_dir, account_num, email, org_uuid)
+
+    def seal_idle_profiles(self) -> None:
+        """Seal every idle profile's plaintext login (terminals closed with
+        the window X never ran their exit seal). Best-effort, prints nothing:
+        `cswap list --json` calls it."""
+        try:
+            if not self.sessions_dir.is_dir():
+                return
+            data = self.switcher._get_sequence_data() or {}
+            for num, record in data.get("accounts", {}).items():
+                email = record.get("email", "")
+                session_dir = session_dir_for(self.switcher.backup_dir, num, email)
+                if (session_dir / ".credentials.json").exists():
+                    self._seal_profile(
+                        session_dir, num, email, record.get("organizationUuid") or ""
+                    )
+        except Exception as e:
+            self._logger.debug(f"Session profile sweep skipped: {e}")
+
+    def _seal_profile(
+        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+    ) -> None:
+        """Move an idle profile's login back into the sealed backup.
+
+        Adopt first (the profile may hold a newer generation than the backup),
+        then delete the plaintext only when the backup provably holds this
+        exact credential object (same login: the siblings are copied over
+        first) and nothing uses the profile. Every other outcome — a live
+        wrapper or claude, an unreadable record or backup, an in-session
+        /login to another account — leaves the profile as it is. Never raises.
+        """
+        from claude_swap import oauth as _oauth
+
+        try:
+            # None: a claude is live or a record/identity is unreadable.
+            if self.switcher._adopt_session_credential(
+                account_num, email, org_uuid
+            ) is None:
+                return
+            with FileLock(self.switcher.lock_file):
+                if live_run_markers(session_dir) or not profile_is_quiescent(
+                    session_dir
+                ):
+                    return
+                profile = read_session_credentials(session_dir)
+                backup, unreadable = self.switcher._read_account_credentials_ex(
+                    account_num, email
+                )
+                if (
+                    not profile
+                    or not backup
+                    or unreadable
+                    or _oauth.credential_fingerprint(profile)
+                    != _oauth.credential_fingerprint(backup)
+                ):
+                    return
+                if json.loads(profile) != json.loads(backup):
+                    # Same login, different siblings (an MCP server's OAuth,
+                    # a plugin secret, a refreshed access token): the backup
+                    # must take the whole object before the plaintext goes.
+                    if read_session_identity(
+                        session_dir
+                    ) is None or session_identity_drifted(session_dir, email, org_uuid):
+                        return
+                    self.switcher._store._write_account_credentials(
+                        account_num, email, profile
+                    )
+                self.switcher._invalidate_session_credentials(account_num, email)
+        except Exception as e:
+            self._logger.debug(f"Could not seal account {account_num}'s profile: {e}")
 
     # -- bootstrap -------------------------------------------------------
 
@@ -727,11 +891,15 @@ class SessionManager:
         # silently instead of warning about a flow that can't happen.
         # Never under a live claude: the profile may still hold the grant this
         # would spend, and the locked checks below refuse to hand it G+1.
+        # Nor under a peer `cswap run` that is still starting (no session
+        # record yet): the gate's backup write would invalidate the login
+        # that peer just seeded.
         pre_creds = self.switcher.read_account_credentials(account_num, email)
         if (
             pre_creds
             and self._has_refresh_token(pre_creds)
             and profile_is_quiescent(session_dir)
+            and not live_run_markers(session_dir, ignore=os.getpid())
         ):
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds

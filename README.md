@@ -131,8 +131,10 @@ never refreshes their tokens itself, because those tokens are single-use.
   requests go to Anthropic's OAuth, profile and usage endpoints, and to the usage endpoints the Codex and Grok
   CLIs themselves use.
 - **Encrypted at rest.** Saved logins are encrypted with Windows DPAPI, tied to your Windows user on this PC.
-  Profiles of terminals opened with **Terminal** or `cswap run` hold a plaintext login, because Claude Code needs
-  one, inside the locked-down folder.
+  A terminal opened with **Terminal** or `cswap run` holds a plaintext login in its profile, because Claude Code
+  needs one, normally only while the terminal uses it: autodock moves it back into the encrypted store when the
+  terminal closes (or at the tray's next refresh if the window was closed). A profile that logged into a different
+  account inside Claude Code keeps that login until its next launch.
 - **Locked-down folders.** On every start, `.claude-swap-backup` and `%LOCALAPPDATA%\autodock` are restricted
   to your user and SYSTEM.
 - **Safe writes.** Credential writes are atomic, and token refreshes use Claude Code's own lock files, so a
