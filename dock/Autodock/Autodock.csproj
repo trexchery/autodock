@@ -9,7 +9,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>dock.ico</ApplicationIcon>
     <AssemblyName>autodock</AssemblyName>
-    <Version>0.4.0</Version>
+    <Version>0.5.0</Version>
     <Product>autodock</Product>
     <Copyright>autodock contributors; engine (c) Onur Cetinkol, MIT</Copyright>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

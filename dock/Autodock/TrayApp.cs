@@ -99,7 +99,12 @@ public sealed partial class TrayApp : ApplicationContext
         try
         {
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
-            _snap = await _engine.ListAsync(refresh);
+            var reread = _settings.AutoPrime && Prime.WantsReread(DateTimeOffset.Now);
+            _snap = await _engine.ListAsync(refresh || reread);
+            if (reread) Prime.Reread(DateTimeOffset.Now); // spent only on a reading that came back
+            if (_settings.AutoPrime && Prime.Observe(_snap.Accounts, DateTimeOffset.Now)) Prime.Save();
+            if (_settings.AutoPrime && Prime.Problem != _primeProblem && (_primeProblem = Prime.Problem) != null)
+                Notify("Auto-Prime paused", _primeProblem, ToolTipIcon.Warning);
             fresh.Add(("claude", _snap));
             _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
             _error = null;
@@ -225,12 +230,63 @@ public sealed partial class TrayApp : ApplicationContext
             _menu.Items.Add(agents);
         }
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
+        if (_settings.AutoPrime && _snap != null) AddPrimeItems(_snap.Accounts);
         _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
         _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => _ = ExitAsync());
         MenuRenderer.Apply(_menu);
+    }
+
+    Primer? _primer;
+    Primer Prime => _primer ??= new(Primer.DefaultPath);
+    bool _priming;
+    string? _primeProblem;
+
+    /// One click primes every fresh window; the status lines say what happened and what's next.
+    void AddPrimeItems(IReadOnlyList<Account> accounts)
+    {
+        var now = DateTimeOffset.Now;
+        var ready = Prime.Ready(accounts, now);
+        if (ready.Count > 0)
+            _menu.Items.Add(new ToolStripMenuItem($"Prime {ready.Count} fresh 5-hour window{(ready.Count == 1 ? "" : "s")}", null, (_, _) => _ = PrimeAsync(ready))
+            {
+                Enabled = !_priming,
+                ToolTipText = string.Join(", ", ready.Select(a => $"#{a.Number} {a.ShortName}")),
+            });
+        var status = new ToolStripMenuItem("Auto-Prime");
+        foreach (var line in Prime.Status(accounts, now).DefaultIfEmpty("No fresh 5-hour windows right now"))
+            status.DropDownItems.Add(new ToolStripMenuItem(line) { Enabled = false });
+        _menu.Items.Add(status);
+    }
+
+    /// Silent: no window, no transcript, no notification unless something needs the owner.
+    async Task PrimeAsync(List<Account> shown)
+    {
+        if (_priming) return;
+        _priming = true;
+        var failed = new List<string>();
+        try
+        {
+            // Eligibility from a reading taken now, not the menu's: a window may have started or a limit moved since.
+            var snap = await _engine.ListAsync(refresh: true);
+            var now = DateTimeOffset.Now;
+            if (Prime.Observe(snap.Accounts, now)) Prime.Save();
+            foreach (var a in Prime.Ready(snap.Accounts, now, Primer.SendReadingAge).Where(a => shown.Any(s => Primer.Same(s, a))))
+            {
+                if (!Prime.Begin(a, DateTimeOffset.Now)) break; // unrecorded, a send could prime this window twice
+                var (result, detail) = await _engine.PrimeAsync(a);
+                Prime.Finish(a, result, detail);
+                if (result == PrimeResult.Refused) failed.Add($"#{a.Number} {a.ShortName}: {detail}");
+                if (result == PrimeResult.Unknown) failed.Add($"#{a.Number} {a.ShortName}: {detail} (it may have gone out, so not again for this window)");
+            }
+            if (Prime.Problem != null) failed.Add(Prime.Problem);
+        }
+        catch (Exception e) { failed.Add(e.Message); } // e.g. no fresh reading: nothing sent
+        finally { _priming = false; }
+        if (failed.Count > 0) Notify("Auto-Prime", "Could not prime " + string.Join("; ", failed), ToolTipIcon.Warning);
+        _ = TickAsync(runAuto: false);
     }
 
     async Task SwitchAsync(Account a)
@@ -480,6 +536,7 @@ public sealed partial class TrayApp : ApplicationContext
         f.PreserveRc.Checked = _settings.PreserveRemoteControl;
         f.AutoProject.Checked = _settings.AutoProjectAccount;
         f.QuotaNotify.Checked = _settings.QuotaNotifications;
+        f.AutoPrime.Checked = _settings.AutoPrime;
         if (f.ShowDialog() != DialogResult.OK) return;
         try
         {
@@ -496,6 +553,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AutoProjectAccount = f.AutoProject.Checked;
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
             _settings.QuotaNotifications = f.QuotaNotify.Checked;
+            _settings.AutoPrime = f.AutoPrime.Checked;
             _settings.Save();
             _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = _settings.RefreshSeconds * 1000;

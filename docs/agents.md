@@ -4,7 +4,7 @@ autodock agents work through a repository's actionable GitHub issues on their ow
 
 ## start
 
-1. click the agents button (bottom right of the autodock flyout, next to refresh) and pick the repository. a normal Claude Code terminal opens there, with a softly shifting `autodock · agents` label above its footer.
+1. click the agents button (bottom right of the autodock flyout, next to refresh) and pick the repository. a normal Claude Code terminal opens there, with a rainbow `autodock · agents` line above its footer that shifts every few seconds and says when agents are working, need you, are paused or off.
 2. ask in plain words: *"work through the open issues; `npm test` must pass"*, *"start with #36, then #21 and #33"*.
 3. confirm the autodock dialog. it shows the branch pull requests target and the exact verification command autodock will run; changing either asks again. the confirmation is remembered: agents keep going after restarts until you pause or stop them.
 
