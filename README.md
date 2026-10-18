@@ -17,6 +17,7 @@ multi-account switcher for claude code, codex, and grok build. live usage, reset
 - project folders: assign a folder to an account, and terminals opened there run as that account without changing your login
 - **preserve remote control** (on by default): a new terminal turns claude remote control back on only if its last session used it
 - optional quota notifications when a limit gets near, runs out, or resets
+- **agents** (off until you start them): work through a repository's open github issues on your other claude accounts, one reviewed pull request at a time, steered from a normal claude code terminal. never merges. [how it works](docs/agents.md)
 
 ## install
 

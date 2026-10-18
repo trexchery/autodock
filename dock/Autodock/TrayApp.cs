@@ -1,6 +1,6 @@
 namespace Autodock;
 
-public sealed class TrayApp : ApplicationContext
+public sealed partial class TrayApp : ApplicationContext
 {
     readonly Engine _engine;
     readonly DockSettings _settings = DockSettings.Load();
@@ -36,8 +36,10 @@ public sealed class TrayApp : ApplicationContext
         _dash.SetAuto(_settings.AutoSwitch);
         _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
         _dash.Moved += SavePinnedPosition;
+        _dash.AgentsRequested += (anchor, menu) => { if (menu) ShowAgentsMenu(anchor); else LaunchAgents(); };
 
         HardenStores();
+        if (AgentStore.HasWork(AgentStore.DefaultRoot)) EnsureAgents(); // authorized earlier: carry on
         _timer.Interval = _settings.RefreshSeconds * 1000;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
         _timer.Start();
@@ -99,6 +101,7 @@ public sealed class TrayApp : ApplicationContext
             if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
             _snap = await _engine.ListAsync(refresh);
             fresh.Add(("claude", _snap));
+            _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
             _error = null;
             _dash.SetStatus($"{DateTime.Now:HH:mm}");
         }
@@ -215,12 +218,18 @@ public sealed class TrayApp : ApplicationContext
                 cont.DropDownItems.Add($"{ProviderCli.Title(src)} → {ProviderCli.Title(t)}…", null, (_, _) => _ = ContinueAsync(src, t));
         cont.Enabled = cont.HasDropDownItems;
         _menu.Items.Add(cont);
+        if (_agents?.Repos.Count > 0)
+        {
+            var agents = new ToolStripMenuItem("Agents");
+            AddAgentItems(agents.DropDownItems);
+            _menu.Items.Add(agents);
+        }
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
         _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
         _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add("Exit", null, (_, _) => ExitThread());
+        _menu.Items.Add("Exit", null, (_, _) => _ = ExitAsync());
         MenuRenderer.Apply(_menu);
     }
 
@@ -488,6 +497,7 @@ public sealed class TrayApp : ApplicationContext
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
             _settings.QuotaNotifications = f.QuotaNotify.Checked;
             _settings.Save();
+            _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = _settings.RefreshSeconds * 1000;
         }
         catch (Exception e) { Error("Could not save settings", e); }
@@ -505,6 +515,8 @@ public sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _link?.Dispose();
+        _agents?.Dispose(); // workers keep running; the next start re-attaches
         _tray.Visible = false;
         _tray.Dispose();
         _dash.Dispose();

@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="fakes\**" CopyToOutputDirectory="PreserveNewest" LinkBase="fakes" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Autodock\Autodock.csproj" />
   </ItemGroup>
 

@@ -72,7 +72,7 @@ public static class Ui
     public static Font Icons(float pt) => new(IconFamily, pt);
 
     public const string Refresh = "\uE72C", Settings = "\uE713", More = "\uE712", Terminal = "\uE756",
-        Add = "\uE710", Check = "\uE73E", Pin = "\uE718", Unpin = "\uE77A", Close = "\uE711";
+        Add = "\uE710", Check = "\uE73E", Pin = "\uE718", Unpin = "\uE77A", Close = "\uE711", Agents = "\uE99A";
 
     public static GraphicsPath Round(RectangleF r, float radius)
     {
@@ -142,6 +142,8 @@ public sealed class Pill : Control, IButtonControl
 {
     public PillStyle Style { get; set; }
     public string Glyph { get; set; } = "";
+    /// A small state dot on an icon pill (null: none).
+    public Color? Badge { get; set; }
     public DialogResult DialogResult { get; set; }
     bool _hover, _down;
 
@@ -229,6 +231,12 @@ public sealed class Pill : Control, IButtonControl
         {
             using var icon = Ui.Icons(9f);
             TextRenderer.DrawText(g, Glyph, icon, ClientRectangle, _hover ? pal.Text : pal.Muted, flags | TextFormatFlags.HorizontalCenter);
+            if (Badge is { } dot)
+            {
+                using var b = new SolidBrush(dot);
+                float d = Ui.S(6);
+                g.FillEllipse(b, Width - d - Ui.S(4), Ui.S(4), d, d);
+            }
             return;
         }
         if (Glyph.Length > 0)

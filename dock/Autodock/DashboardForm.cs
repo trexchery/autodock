@@ -9,7 +9,7 @@ public sealed class DashboardForm : Form
     readonly Label _title, _status;
     readonly Toggle _auto;
     readonly Panel _header, _footer;
-    readonly Pill _pin, _close;
+    readonly Pill _pin, _close, _agents;
     readonly ToolTip _tips = new();
     bool _syncing;
     string? _expandedEmail;
@@ -21,6 +21,8 @@ public sealed class DashboardForm : Form
     public event Action<Account, string>? AccountAction;
     public event Action? RefreshRequested, SettingsRequested, AddRequested, Moved;
     public event Action<bool>? AutoToggled, PinToggled;
+    /// The agents launcher: (anchor, menu) where menu is a right-click.
+    public event Action<Control, bool>? AgentsRequested;
 
     public DashboardForm()
     {
@@ -71,7 +73,11 @@ public sealed class DashboardForm : Form
         refresh.Location = new Point(Width - Ui.S(14) - refresh.Width, Ui.S(7));
         refresh.Click += (_, _) => RefreshRequested?.Invoke();
         _tips.SetToolTip(refresh, "Refresh now");
-        _footer.Controls.AddRange([_auto, refresh]);
+        _agents = new Pill("", PillStyle.Icon, Ui.Agents) { TabStop = false };
+        _agents.Location = new Point(refresh.Left - Ui.S(2) - _agents.Width, Ui.S(7));
+        _agents.MouseUp += (_, e) => { if (e.Button is MouseButtons.Left or MouseButtons.Right) AgentsRequested?.Invoke(_agents, e.Button == MouseButtons.Right); };
+        _tips.SetToolTip(_agents, "Agents terminal");
+        _footer.Controls.AddRange([_auto, _agents, refresh]);
 
         Controls.Add(_list);
         Controls.Add(_header);
@@ -124,6 +130,15 @@ public sealed class DashboardForm : Form
         _status.Text = text;
         _status.MaximumSize = new Size(Math.Max(0, Width - Ui.S(14) - 4 * Ui.S(30) - _title.Right - Ui.S(8)), 0);
         _status.Location = new Point(_title.Right + Ui.S(4), _title.Top + (_title.Height - _status.Height) / 2 + Ui.S(1));
+    }
+
+    /// The agents button's dot (null: nothing to show) and tooltip.
+    public void SetAgents(Color? badge, string tip)
+    {
+        if (_agents.Badge == badge && _tips.GetToolTip(_agents) == tip) return;
+        _agents.Badge = badge;
+        _tips.SetToolTip(_agents, tip);
+        _agents.Invalidate();
     }
 
     public void SetAuto(bool on)
