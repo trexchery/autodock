@@ -18,10 +18,14 @@ public sealed class AccountRow : Control
     readonly DateTimeOffset _now;
     readonly List<(string Label, Window W, string? Extra)> _windows = [];
     readonly string? _note;
+    readonly IReadOnlyList<ProjectMapping> _projects;
+    readonly string? _projectsLine; // only when every leaf name fits on one line; the context menu always lists them
+    readonly ToolTip _tip = new();
     readonly System.Windows.Forms.Timer _anim = new() { Interval = 15 };
     readonly List<(Rectangle Rect, string Action, string Label)> _buttons = [];
+    Rectangle _projectsRect;
     float _t, _target; // 0 = collapsed, 1 = expanded
-    bool _hover;
+    bool _hover, _tipOn;
     string? _hot;
 
     public Account Account => _a;
@@ -29,7 +33,7 @@ public sealed class AccountRow : Control
 
     static int Collapsed => Ui.S(52);
 
-    public AccountRow(Account a, DateTimeOffset now)
+    public AccountRow(Account a, DateTimeOffset now, IReadOnlyList<ProjectMapping>? projects = null)
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         _a = a;
@@ -49,6 +53,13 @@ public sealed class AccountRow : Control
         if (a.Usage == null && a.LastGoodUsage != null) notes.Add("showing last known usage");
         if (a.LoginExpiresAt is { } exp && exp - now < TimeSpan.FromDays(5)) notes.Add($"login expires {Format.When(exp, now)}");
         _note = notes.Count > 0 ? string.Join(" · ", notes) : null;
+        _projects = projects ?? [];
+        if (_projects.Count > 0)
+        {
+            var line = "Projects · " + string.Join(", ", _projects.Select(p => p.Leaf));
+            if (TextRenderer.MeasureText(line, MetaFont, Size.Empty, TextFormatFlags.NoPadding).Width <= Ui.S(BaseWidth) - Ui.S(38))
+                _projectsLine = line;
+        }
 
         _anim.Tick += (_, _) =>
         {
@@ -59,7 +70,7 @@ public sealed class AccountRow : Control
     }
 
     int ExpandedHeight =>
-        Collapsed + _windows.Count * Ui.S(22) + (_note != null ? Ui.S(22) : 0) + Ui.S(44);
+        Collapsed + _windows.Count * Ui.S(22) + (_note != null ? Ui.S(22) : 0) + (_projectsLine != null ? Ui.S(22) : 0) + Ui.S(44);
 
     public void SetExpanded(bool expanded, bool animate = true)
     {
@@ -98,6 +109,12 @@ public sealed class AccountRow : Control
     {
         var hot = _buttons.FirstOrDefault(b => b.Rect.Contains(e.Location)).Action;
         if (hot != _hot) { _hot = hot; Invalidate(); }
+        var overProjects = _projectsRect.Contains(e.Location);
+        if (overProjects != _tipOn)
+        {
+            _tipOn = overProjects;
+            _tip.SetToolTip(this, overProjects ? string.Join("\n", _projects.Select(p => p.Folder)) : null);
+        }
         base.OnMouseMove(e);
     }
 
@@ -128,7 +145,19 @@ public sealed class AccountRow : Control
         menu.Items.Add(new ToolStripSeparator());
         if (_a.Provider == "claude") // folder pins, auto-switch and aliases are Claude-engine features
         {
-            menu.Items.Insert(menu.Items.Count - 1, new ToolStripMenuItem("Pin a folder to this account…", null, (_, _) => MenuAction?.Invoke(_a, "map")));
+            menu.Items.Insert(menu.Items.Count - 1, new ToolStripMenuItem("Assign project folder…", null, (_, _) => MenuAction?.Invoke(_a, "map")));
+            if (_projects.Count > 0)
+            {
+                var proj = new ToolStripMenuItem("Projects");
+                foreach (var p in _projects)
+                {
+                    var folder = new ToolStripMenuItem(p.Leaf) { ToolTipText = p.Folder };
+                    folder.DropDownItems.Add("Open terminal", null, (_, _) => MenuAction?.Invoke(_a, "project-open:" + p.Folder));
+                    folder.DropDownItems.Add("Remove", null, (_, _) => MenuAction?.Invoke(_a, "project-remove:" + p.Folder));
+                    proj.DropDownItems.Add(folder);
+                }
+                menu.Items.Insert(menu.Items.Count - 1, proj);
+            }
             menu.Items.Add(_a.Disabled ? "Include in auto-switch" : "Exclude from auto-switch", null,
                 (_, _) => MenuAction?.Invoke(_a, _a.Disabled ? "enable" : "disable"));
             menu.Items.Add("Rename…", null, (_, _) => MenuAction?.Invoke(_a, "alias"));
@@ -183,6 +212,7 @@ public sealed class AccountRow : Control
         else { Meter(g, pal, meters[0].Item1, meters[0].Item2, right, Ui.S(12)); Meter(g, pal, meters[1].Item1, meters[1].Item2, right, Ui.S(30)); }
 
         _buttons.Clear();
+        _projectsRect = Rectangle.Empty;
         if (_t <= 0.01f) return;
 
         // Expanded: every window with its reset, then actions.
@@ -196,7 +226,7 @@ public sealed class AccountRow : Control
             if (extra != null) reset = extra + (reset.Length > 0 ? " · " + reset : "");
             var pct = $"{w.Pct:0}%";
             var pw = TextRenderer.MeasureText(g, pct, MetaFont, Size.Empty, TextFormatFlags.NoPadding).Width;
-            TextRenderer.DrawText(g, pct, MetaFont, new Point(right - pw, y), pal.Meter(w.Pct) is var c && w.Pct >= 80 ? c : pal.Text, TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(g, pct, MetaFont, new Point(right - pw, y), pal.Meter(w.Pct) is var c && w.Pct >= Palette.WarnPct ? c : pal.Text, TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, reset, MetaFont, new Rectangle(x + Ui.S(96), y, right - pw - Ui.S(8) - x - Ui.S(96), MetaFont.Height),
                 pal.Muted, flags);
             y += Ui.S(22);
@@ -204,6 +234,12 @@ public sealed class AccountRow : Control
         if (_note != null)
         {
             TextRenderer.DrawText(g, _note, MetaFont, new Rectangle(x, y, right - x, MetaFont.Height), pal.Muted, flags);
+            y += Ui.S(22);
+        }
+        if (_projectsLine != null)
+        {
+            _projectsRect = new Rectangle(x, y, right - x, MetaFont.Height);
+            TextRenderer.DrawText(g, _projectsLine, MetaFont, _projectsRect, pal.Muted, flags);
             y += Ui.S(22);
         }
 
@@ -232,7 +268,7 @@ public sealed class AccountRow : Control
             g.FillPath(fill, path);
         }
         var tw = TextRenderer.MeasureText(g, text, MetaFont, Size.Empty, TextFormatFlags.NoPadding).Width;
-        var tc = pct is { } q && q >= 80 ? pal.Meter(q) : pal.Text;
+        var tc = pct is { } q && q >= Palette.WarnPct ? pal.Meter(q) : pal.Text;
         TextRenderer.DrawText(g, text, MetaFont, new Point(right - tw, y), pct == null ? pal.Faint : tc, TextFormatFlags.NoPadding);
     }
 
@@ -261,7 +297,7 @@ public sealed class AccountRow : Control
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _anim.Dispose();
+        if (disposing) { _anim.Dispose(); _tip.Dispose(); }
         base.Dispose(disposing);
     }
 }
@@ -294,6 +330,10 @@ public static class Format
               (auto ? "\nAuto-switch on" : "");
         return text.Length <= 127 ? text : text[..127];
     }
+
+    /// The single, quiet balloon after a Claude switch.
+    public static string SwitchNotice(AccountRef? from, AccountRef? to) =>
+        (from == null ? "autodocked" : $"{from.Email} autodocked") + $" · {to?.Email ?? "(none)"} active";
 
     public static double Peak(Account? a) =>
         a?.ShownUsage is { } u

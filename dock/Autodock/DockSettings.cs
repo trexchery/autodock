@@ -13,6 +13,9 @@ public sealed class DockSettings
     public bool Pinned { get; set; }
     public int? PinnedX { get; set; }
     public int? PinnedY { get; set; }
+    public bool PreserveRemoteControl { get; set; } = true; // keys absent from an older settings.json keep these defaults
+    public bool AutoProjectAccount { get; set; }
+    public bool QuotaNotifications { get; set; }
 
     public const int MinRefreshSeconds = 60;
 

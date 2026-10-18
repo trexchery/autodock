@@ -100,9 +100,13 @@ def claude_project_dirs() -> list[Path]:
     return out
 
 
-def find_claude(project: str) -> Path | None:
+def project_dir_name(project: str | Path) -> str:
     # Claude Code names the folder after the cwd with every non-alphanumeric char as '-'.
-    encoded = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(project))
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(project))
+
+
+def find_claude(project: str) -> Path | None:
+    encoded = project_dir_name(project)
     return _newest(f for root in claude_project_dirs() for f in (root / encoded).glob("*.jsonl"))
 
 

@@ -8,6 +8,7 @@ public sealed class SettingsForm : Form
     public readonly TextBox Models = new() { PlaceholderText = "none" };
     public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     public readonly Toggle Startup = new("");
+    public readonly Toggle PreserveRc = new(""), AutoProject = new(""), QuotaNotify = new("");
 
     readonly Palette _pal = Palette.Current;
     int _y;
@@ -35,6 +36,9 @@ public sealed class SettingsForm : Form
         Section("General");
         Row("Start with Windows", null, Startup, Ui.S(34));
         Row("Refresh every", null, RefreshInterval, Ui.S(72), "s");
+        Row("Preserve Remote Control", "New terminals turn Remote Control back on only if their last session used it", PreserveRc, Ui.S(34));
+        Row("Use project accounts automatically", "Terminals and Continue in use the account assigned to the folder", AutoProject, Ui.S(34));
+        Row("Quota notifications", "When a limit is near, reached or reset", QuotaNotify, Ui.S(34));
 
         _y += Ui.S(8);
         var about = new Label

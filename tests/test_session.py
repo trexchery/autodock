@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import unicodedata
@@ -35,6 +36,7 @@ from claude_swap.session import (
     SessionManager,
     _probe_env,
     keychain_service_name,
+    last_session_used_remote_control,
     profile_is_quiescent,
     read_session_identity,
     scan_live_sessions,
@@ -1471,6 +1473,286 @@ class TestRun:
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
+
+
+# ---------------------------------------------------------------------------
+# --restore-rc: Remote Control follows the profile's last session
+# ---------------------------------------------------------------------------
+
+RC_LINE = json.dumps(
+    {
+        "type": "bridge-session",
+        "bridgeSessionId": "bridge-1",
+        "ownerAccountUuid": "uuid-2",
+        "sessionId": "s1",
+    }
+)
+PLAIN_LINE = json.dumps({"type": "user", "message": {"content": "hi"}})
+
+
+def _folder(cwd) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+
+
+def _transcript(config_dir, folder, lines, name="s1.jsonl", mtime=None) -> Path:
+    d = Path(config_dir) / "projects" / folder
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+    if mtime is not None:
+        os.utime(f, (mtime, mtime))
+    return f
+
+
+@pytest.fixture
+def proj(tmp_path, monkeypatch) -> Path:
+    cwd = tmp_path / "work" / "my proj"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    return cwd
+
+
+class TestLastSessionUsedRemoteControl:
+    def test_used(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [PLAIN_LINE, RC_LINE])
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+    def test_never_used(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [PLAIN_LINE, PLAIN_LINE])
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_no_history(self, tmp_path, proj):
+        assert last_session_used_remote_control(tmp_path, proj) is False
+        (tmp_path / "projects" / _folder(proj)).mkdir(parents=True)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_remote_control_at_startup_defers_to_claude(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [RC_LINE])
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"remoteControlAtStartup": True}), encoding="utf-8"
+        )
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            '{"remoteControlAtStartup": false}',
+            "{ nope",
+            "[]",
+            pytest.param("[" * 100_000, id="deeply-nested"),
+        ],
+    )
+    def test_other_settings_do_not_block(self, tmp_path, proj, settings):
+        _transcript(tmp_path, _folder(proj), [RC_LINE])
+        (tmp_path / "settings.json").write_text(settings, encoding="utf-8")
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+    def test_newest_transcript_decides(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [RC_LINE], name="old.jsonl", mtime=1_000_000)
+        _transcript(tmp_path, _folder(proj), [PLAIN_LINE], name="new.jsonl", mtime=2_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+        _transcript(tmp_path, _folder(proj), [RC_LINE], name="newer.jsonl", mtime=3_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+    def test_cwd_project_preferred_over_newer_other_project(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [RC_LINE], mtime=1_000_000)
+        _transcript(tmp_path, "other-project", [PLAIN_LINE], mtime=2_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+        _transcript(tmp_path, _folder(proj), [PLAIN_LINE], mtime=3_000_000)
+        _transcript(tmp_path, "other-project", [RC_LINE], name="s2.jsonl", mtime=4_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_falls_back_to_newest_anywhere(self, tmp_path, proj):
+        _transcript(tmp_path, "a", [RC_LINE], mtime=1_000_000)
+        _transcript(tmp_path, "b", [PLAIN_LINE], mtime=2_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+        _transcript(tmp_path, "c", [RC_LINE], mtime=3_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+    def test_subagent_transcripts_are_not_sessions(self, tmp_path, proj):
+        _transcript(tmp_path, _folder(proj), [PLAIN_LINE], mtime=1_000_000)
+        _transcript(
+            tmp_path, f"{_folder(proj)}/s1/subagents", [RC_LINE], name="agent.jsonl", mtime=2_000_000
+        )
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_malformed_lines_are_skipped(self, tmp_path, proj):
+        junk = [
+            "not json bridge-session",
+            "[1, 2] bridge-session",
+            json.dumps({"type": "user", "note": "bridge-session"}),
+            json.dumps({"type": ["bridge-session"]}),
+            "[" * 100_000 + "bridge-session",
+            '{"type": "bridge-session"',
+        ]
+        f = _transcript(tmp_path, _folder(proj), junk)
+        with open(f, "ab") as fh:
+            fh.write(b"\xff\xfe bridge-session \x80\n")
+        assert last_session_used_remote_control(tmp_path, proj) is False
+        with open(f, "ab") as fh:
+            fh.write(RC_LINE.encode() + b"\n")
+        assert last_session_used_remote_control(tmp_path, proj) is True
+
+    def test_huge_transcript_is_read_in_bounded_windows(self, tmp_path, proj, monkeypatch):
+        monkeypatch.setattr(session_mod, "_RC_SCAN_BYTES", 4096)
+        folder = _folder(proj)
+        filler = json.dumps({"type": "user", "pad": "x" * 500})
+        # A single line far larger than a window must not stall or crash either.
+        blob = '{"type":"user","pad":"' + "y" * 1_000_000 + '"}'
+        middle = [filler] * 100 + [blob] + [filler] * 100
+
+        _transcript(tmp_path, folder, [RC_LINE, *middle, PLAIN_LINE], name="head.jsonl", mtime=1_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is True
+        _transcript(tmp_path, folder, [PLAIN_LINE, *middle, RC_LINE], name="tail.jsonl", mtime=2_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is True
+        # Deliberate bound: a record only in the unread middle is not seen.
+        _transcript(tmp_path, folder, [PLAIN_LINE, *middle, RC_LINE, *middle, PLAIN_LINE],
+                    name="mid.jsonl", mtime=3_000_000)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_unreadable_transcript_is_false(self, tmp_path, proj):
+        # A directory named like a transcript: stat works, open() raises OSError.
+        (tmp_path / "projects" / _folder(proj) / "s1.jsonl").mkdir(parents=True)
+        assert last_session_used_remote_control(tmp_path, proj) is False
+
+    def test_profiles_are_isolated(self, tmp_path, proj):
+        a, b = tmp_path / "a", tmp_path / "b"
+        _transcript(a, _folder(proj), [RC_LINE])
+        _transcript(b, _folder(proj), [PLAIN_LINE])
+        assert last_session_used_remote_control(a, proj) is True
+        assert last_session_used_remote_control(b, proj) is False
+
+
+class TestRestoreRcLaunch:
+    """The real run()/exec_default paths, through the capture_exec fake."""
+
+    @pytest.fixture
+    def session_dir(self, manager) -> Path:
+        return session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+    @pytest.fixture
+    def default_dir(self) -> Path:
+        return Path.home() / ".claude"
+
+    @pytest.fixture
+    def active_default(self, manager, monkeypatch):
+        monkeypatch.setattr(
+            manager.switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID)
+        )
+
+    def _run(self, manager, args=(), **kw) -> list[str]:
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", list(args), **kw)
+        return exc.value.argv[1:]
+
+    def test_session_profile_used_adds_flag(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir, proj
+    ):
+        _transcript(session_dir, _folder(proj), [RC_LINE])
+        assert self._run(manager, ["--resume"], restore_rc=True) == ["--resume", "--remote-control"]
+
+    def test_session_profile_never_used(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir, proj
+    ):
+        _transcript(session_dir, _folder(proj), [PLAIN_LINE])
+        assert self._run(manager, ["--resume"], restore_rc=True) == ["--resume"]
+
+    def test_without_flag_never_added(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir, proj
+    ):
+        _transcript(session_dir, _folder(proj), [RC_LINE])
+        assert self._run(manager, ["--resume"]) == ["--resume"]
+        assert self._run(manager, ["--resume"], restore_rc=False) == ["--resume"]
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["--remote-control"],
+            ["--rc"],
+            ["--remote-control=my-name"],
+            ["--rc=my-name"],
+            ["--remote-control", "my-name", "--resume"],
+        ],
+    )
+    def test_already_requested_is_not_duplicated(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir, proj, args
+    ):
+        _transcript(session_dir, _folder(proj), [RC_LINE])
+        assert self._run(manager, args, restore_rc=True) == args
+
+    def test_remote_control_at_startup_not_added(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir,
+        default_dir, proj
+    ):
+        _transcript(session_dir, _folder(proj), [RC_LINE])
+        # settings.json is shared from ~/.claude into the profile on launch.
+        default_dir.mkdir(parents=True, exist_ok=True)
+        (default_dir / "settings.json").write_text(
+            json.dumps({"remoteControlAtStartup": True}), encoding="utf-8"
+        )
+        assert self._run(manager, [], restore_rc=True) == []
+
+    def test_other_profiles_history_never_leaks_in(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, session_dir,
+        default_dir, proj
+    ):
+        other = session_dir_for(manager.switcher.backup_dir, "1", "account1@example.com")
+        _transcript(other, _folder(proj), [RC_LINE])
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        _transcript(session_dir, _folder(proj), [PLAIN_LINE], mtime=1_000_000)
+        assert self._run(manager, [], restore_rc=True) == []
+
+    def test_fast_path_checks_default_config_dir(
+        self, manager, capture_exec, active_default, session_dir, default_dir, proj
+    ):
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        assert self._run(manager, ["-c"], restore_rc=True) == ["-c", "--remote-control"]
+
+    def test_fast_path_ignores_the_session_profile(
+        self, manager, capture_exec, active_default, session_dir, default_dir, proj
+    ):
+        _transcript(session_dir, _folder(proj), [RC_LINE])
+        _transcript(default_dir, _folder(proj), [PLAIN_LINE])
+        assert self._run(manager, ["-c"], restore_rc=True) == ["-c"]
+
+    def test_fast_path_without_flag(
+        self, manager, capture_exec, active_default, default_dir, proj
+    ):
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        assert self._run(manager, ["-c"]) == ["-c"]
+
+    def test_exec_default_used_adds_flag(self, manager, capture_exec, default_dir, proj):
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(["--resume"], restore_rc=True)
+        assert exc.value.argv == ["/fake/bin/claude", "--resume", "--remote-control"]
+
+    def test_exec_default_never_added_otherwise(self, manager, capture_exec, default_dir, proj):
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(["--resume"])
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+
+        _transcript(default_dir, _folder(proj), [PLAIN_LINE])  # overwrites the RC session
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(["--resume"], restore_rc=True)
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+
+    def test_exec_default_honours_config_dir_env(
+        self, manager, capture_exec, default_dir, tmp_path, monkeypatch, proj
+    ):
+        custom = tmp_path / "custom-config"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        _transcript(default_dir, _folder(proj), [RC_LINE])
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([], restore_rc=True)
+        assert exc.value.argv == ["/fake/bin/claude"]
+
+        _transcript(custom, _folder(proj), [RC_LINE])
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([], restore_rc=True)
+        assert exc.value.argv == ["/fake/bin/claude", "--remote-control"]
 
 
 class TestExec:
