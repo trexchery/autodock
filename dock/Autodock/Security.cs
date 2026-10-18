@@ -120,6 +120,14 @@ public static class ClaudeCli
 public static class ProviderCli
 {
     public static readonly string[] All = ["codex", "grok"];
+    public static readonly string[] Every = ["claude", .. All];
+
+    /// Any CLI autodock can open, Claude included.
+    public static string? FindAny(string provider) => provider == "claude" ? ClaudeCli.Find() : Find(provider);
+
+    /// "Continue in" targets for work interrupted in `source`. Grok sessions can't be read yet, so Grok is a target only.
+    public static IEnumerable<string> HandoffTargets(string source) =>
+        source == "grok" ? [] : Every.Where(p => p != source && FindAny(p) != null);
 
     public static string Title(string provider) => provider switch { "codex" => "Codex", "grok" => "Grok", _ => "Claude" };
 

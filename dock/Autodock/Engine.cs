@@ -98,6 +98,10 @@ public sealed partial class Engine(string exe)
     public Task<SwitchResult> SwitchAsync(int number, string provider = "claude") =>
         RunJsonAsync<SwitchResult>(Args(provider, ["switch", number.ToString(), "--json"]));
 
+    /// Writes local hand-off notes from `source`'s newest session in `folder`; returns their path.
+    public Task<HandoffResult> HandoffAsync(string source, string folder) =>
+        RunJsonAsync<HandoffResult>("handoff", "--from", source, "--dir", folder, "--json");
+
     /// `cswap codex …` / `cswap grok …` route to the provider engines; Claude is the bare CLI.
     internal static string[] Args(string provider, params string[] args) =>
         provider == "claude" ? args : [provider, .. args];
@@ -157,7 +161,7 @@ public sealed partial class Engine(string exe)
             // what needs it. wt may hand the tab to an already-running Terminal process, which
             // ignores our WorkingDirectory: pass it explicitly.
             foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", "cmd.exe", "/k", Exe }.Concat(args))
-                psi.ArgumentList.Add(a);
+                psi.ArgumentList.Add(a.Replace(";", "\\;")); // wt splits subcommands on a bare ';'
         }
         else
         {

@@ -43,6 +43,9 @@ and encrypted credential storage.
   so your current login is never touched.
 - **Codex and Grok Build too.** Detected automatically and shown in their own section: Codex 5-hour and weekly
   limits (whichever your plan has), Grok's weekly or monthly pool.
+- **Continue in another CLI.** Hit a limit or a crash mid-task? *Continue in* starts a new Codex, Claude or Grok
+  session in the same folder with notes from the interrupted one (request, recent steps, git status). It is a
+  fresh start, not a resume: unfinished reasoning can't be transferred. Notes stay local and are deleted after 7 days.
 - **Optional auto-switch.** Off by default, Claude accounts only. Moves to the account with the most headroom before you reach a
   threshold you choose.
 - **Stays out of the way.** A dot in the tray, a dashboard that follows the Windows light or dark theme,
@@ -90,6 +93,7 @@ to remove everything.
 | Add an account | Click **+** (it asks which CLI when several are installed). A console runs the official login. Open the link in a **private browser window** so you approve the right account, then paste the code if one is shown. Nothing appears while you paste; press Enter. |
 | Work on one account | Click **Terminal** in an expanded row. That window stays on its account until you close it. |
 | Keep it on screen | Click the pin icon. The dashboard becomes a movable window and reopens where you left it. |
+| Pick up interrupted work | Right-click a row → *Continue in*, or right-click the tray icon → *Continue interrupted work*. Choose the project folder; a new session opens there with hand-off notes (`cswap handoff --from claude --dir .` writes them by hand). Reading Grok sessions isn't supported yet. |
 | Everything else | Right-click a row: open a terminal in a folder, rename, exclude from auto-switch, sign in again, remove. |
 
 ### Auto-switch

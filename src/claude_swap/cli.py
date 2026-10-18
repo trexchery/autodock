@@ -1013,6 +1013,10 @@ def main() -> None:
         import importlib
 
         sys.exit(importlib.import_module(f"claude_swap.providers.{argv[0]}").main(argv[1:]))
+    if argv and argv[0] == "handoff":
+        from claude_swap import handoff
+
+        sys.exit(handoff.main(argv[1:]))
 
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme

@@ -59,6 +59,8 @@ public sealed record AccountRef(int? Number, string Email);
 
 public sealed record SwitchResult(bool Switched, AccountRef? From, AccountRef? To, string? Reason, string? Note = null);
 
+public sealed record HandoffResult(string Path, string Source, int Chars);
+
 public sealed record EngineError(string? Type, string? Message);
 
 // `cswap auto --once --json` event lines (autoswitch.py AutoSwitchEvent subclasses).

@@ -121,6 +121,10 @@ public sealed class AccountRow : Control
         if (!_a.Active) menu.Items.Add("Switch to this account", null, (_, _) => SwitchClicked?.Invoke(_a));
         menu.Items.Add("Open terminal", null, (_, _) => TerminalClicked?.Invoke(_a));
         menu.Items.Add("Open terminal in folder…", null, (_, _) => MenuAction?.Invoke(_a, "terminal-folder"));
+        var cont = new ToolStripMenuItem("Continue in");
+        foreach (var t in ProviderCli.HandoffTargets(_a.Provider))
+            cont.DropDownItems.Add(ProviderCli.Title(t) + "…", null, (_, _) => MenuAction?.Invoke(_a, "continue:" + t));
+        if (cont.HasDropDownItems) menu.Items.Add(cont);
         menu.Items.Add(new ToolStripSeparator());
         if (_a.Provider == "claude") // folder pins, auto-switch and aliases are Claude-engine features
         {

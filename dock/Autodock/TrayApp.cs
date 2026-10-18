@@ -193,6 +193,12 @@ public sealed class TrayApp : ApplicationContext
         sw.Enabled = term.Enabled = sw.DropDownItems.Count > 0;
         _menu.Items.Add(sw);
         _menu.Items.Add(term);
+        var cont = new ToolStripMenuItem("Continue interrupted work");
+        foreach (var src in ProviderCli.Every)
+            foreach (var t in ProviderCli.HandoffTargets(src))
+                cont.DropDownItems.Add($"{ProviderCli.Title(src)} → {ProviderCli.Title(t)}…", null, (_, _) => _ = ContinueAsync(src, t));
+        cont.Enabled = cont.HasDropDownItems;
+        _menu.Items.Add(cont);
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
         _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
         _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
@@ -254,12 +260,40 @@ public sealed class TrayApp : ApplicationContext
         catch (Exception e) { Error("Could not open terminal", e); }
     }
 
+    /// Starts a new session in `target` with notes from the interrupted `source` session.
+    /// Not a resume: the notes are built locally and nothing is sent anywhere.
+    async Task ContinueAsync(string source, string target)
+    {
+        if (PickFolder($"Folder of the interrupted {ProviderCli.Title(source)} work") is not { } folder) return;
+        try
+        {
+            var exe = ProviderCli.FindAny(target) ?? throw new EngineException($"{ProviderCli.Title(target)} CLI not found.");
+            var h = await _engine.HandoffAsync(source, folder);
+            var prompt = $"Read the hand-off notes in {h.Path} and continue the interrupted task.";
+            var title = $"{ProviderCli.Title(target)} · continue";
+            if (target == "grok")
+            {
+                // ponytail: no known initial-prompt argument for grok; pass it as an arg once one exists.
+                Clipboard.SetText(prompt);
+                Engine.LaunchConsoleWith(exe, title, folder);
+                Notify("Hand-off ready", "Paste the copied line into Grok to start with the notes.");
+                return;
+            }
+            Engine.LaunchConsoleWith(exe, title, folder, prompt);
+            Notify("Hand-off ready", $"New {ProviderCli.Title(target)} session started with notes from the interrupted one.");
+        }
+        catch (Exception e) { Error("Could not continue", e); }
+    }
+
     async Task AccountActionAsync(Account a, string action)
     {
         try
         {
             switch (action)
             {
+                case not null when action.StartsWith("continue:"):
+                    await ContinueAsync(a.Provider, action["continue:".Length..]);
+                    return;
                 case "terminal-folder":
                     if (PickFolder($"Open a terminal as #{a.Number} in…") is { } f) OpenTerminal(a, f);
                     return;
