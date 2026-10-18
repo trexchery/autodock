@@ -1,10 +1,10 @@
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text.Json;
-using ClaudeDock;
+using Autodock;
 using Xunit;
 
-namespace ClaudeDock.Tests;
+namespace Autodock.Tests;
 
 // All credentials in this file are synthetic.
 
@@ -121,7 +121,7 @@ public class FormatTests
             new Usage(new Window(10, null), new Window(20, null), null, null));
         var tip = Format.Tooltip(new Snapshot(1, 1, [acct]), auto: true);
         Assert.True(tip.Length <= 127);
-        Assert.Equal("Claude Dock — no managed account active", Format.Tooltip(null, false));
+        Assert.Equal("autodock — no managed account active", Format.Tooltip(null, false));
     }
 
     [Fact]
@@ -189,14 +189,14 @@ public class StorageTests
 }
 
 /// Drives the real engine end to end against a synthetic home directory.
-/// Set CLAUDE_DOCK_TEST_ENGINE to a cswap.exe (build.ps1 does); skipped otherwise.
+/// Set AUTODOCK_TEST_ENGINE to a cswap.exe (build.ps1 does); skipped otherwise.
 [Collection("engine")]
 public class EngineIntegrationTests
 {
     [Fact]
     public async Task EnrollListSealRemove()
     {
-        var exe = Environment.GetEnvironmentVariable("CLAUDE_DOCK_TEST_ENGINE");
+        var exe = Environment.GetEnvironmentVariable("AUTODOCK_TEST_ENGINE");
         if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) return; // no engine build available
 
         using var home = new TempDir();
@@ -284,6 +284,17 @@ public class RenderTests
                 form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
                 Assert.True(form.Height > 300);
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
+
+                using var settings = new SettingsForm { StartPosition = FormStartPosition.Manual, Location = new Point(-10000, -10000) };
+                settings.Show();
+                Application.DoEvents();
+                Assert.True(settings.Width > 300 && settings.Height > 200);
+                if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
+                {
+                    using var sb = new Bitmap(settings.Width, settings.Height);
+                    settings.DrawToBitmap(sb, new Rectangle(0, 0, settings.Width, settings.Height));
+                    sb.Save(sOut);
+                }
             }
             catch (Exception e) { failure = e; }
         });

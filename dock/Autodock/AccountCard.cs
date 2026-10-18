@@ -1,4 +1,4 @@
-namespace ClaudeDock;
+namespace Autodock;
 
 public sealed class AccountCard : Panel
 {
@@ -143,8 +143,8 @@ public static class Format
     {
         var active = s?.Accounts.FirstOrDefault(a => a.Active);
         var text = active == null
-            ? "Claude Dock — no managed account active"
-            : $"Claude Dock — {(string.IsNullOrEmpty(active.Alias) ? active.Email : active.Alias)}" +
+            ? "autodock — no managed account active"
+            : $"autodock — {(string.IsNullOrEmpty(active.Alias) ? active.Email : active.Alias)}" +
               (active.ShownUsage is { } u
                   ? $"\n5h {u.FiveHour?.Pct ?? 0:0}% · week {u.SevenDay?.Pct ?? 0:0}%"
                   : "") +

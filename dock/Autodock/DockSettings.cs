@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Microsoft.Win32;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 /// Dock-only preferences. Auto-switch thresholds live in the engine's
 /// settings.json (`cswap config`) so the CLI and the dock never disagree.
@@ -14,7 +14,7 @@ public sealed class DockSettings
     public const int MinRefreshSeconds = 60;
 
     public static string Dir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClaudeDock");
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "autodock");
 
     static string FilePath => Path.Combine(Dir, "settings.json");
 
@@ -65,7 +65,7 @@ public static class AtomicFile
 public static class Startup
 {
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string Name = "ClaudeDock";
+    const string Name = "autodock";
 
     public static bool IsEnabled()
     {

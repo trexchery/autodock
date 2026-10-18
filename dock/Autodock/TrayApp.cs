@@ -1,4 +1,4 @@
-namespace ClaudeDock;
+namespace Autodock;
 
 public sealed class TrayApp : ApplicationContext
 {
@@ -17,7 +17,7 @@ public sealed class TrayApp : ApplicationContext
     public TrayApp(Engine engine, bool minimized)
     {
         _engine = engine;
-        _tray = new NotifyIcon { Icon = TrayIcons.App, Text = "Claude Dock", Visible = true, ContextMenuStrip = _menu };
+        _tray = new NotifyIcon { Icon = TrayIcons.App, Text = "autodock", Visible = true, ContextMenuStrip = _menu };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleDashboard(); };
         _menu.Opening += (_, _) => BuildMenu();
 
@@ -146,7 +146,7 @@ public sealed class TrayApp : ApplicationContext
                 "sessions on the default login use the new account from their next message (the first one may " +
                 "use extra quota while its cache rebuilds). Terminals opened with “Terminal” keep their own account.\n\n" +
                 $"Switch to #{a.Number} {a.Email}?",
-                "Claude Dock", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
+                "autodock", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
             return;
         try
         {
@@ -195,9 +195,9 @@ public sealed class TrayApp : ApplicationContext
                     await EnrollAsync(a);
                     return;
                 case "remove":
-                    if (MessageBox.Show($"Remove #{a.Number} {a.Email} from Claude Dock?\n\nIts stored backup is deleted. " +
+                    if (MessageBox.Show($"Remove #{a.Number} {a.Email} from autodock?\n\nIts stored backup is deleted. " +
                                         "Your current Claude Code login is not logged out.",
-                            "Claude Dock", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                            "autodock", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
                     await _engine.CommandWithInputAsync("y\n", "remove", a.Number.ToString());
                     break;
             }
@@ -216,7 +216,7 @@ public sealed class TrayApp : ApplicationContext
                 "3. If a code is shown, paste it into the console and press Enter. Nothing appears while you paste; that is normal.\n\n" +
                 "The console closes when done. Your password is only ever entered in the browser, never in the console.\n\n" +
                 "This uses a separate, temporary profile: your current login and running sessions are not affected.",
-                "Claude Dock", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+                "autodock", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
         try
         {
             // First run: keep the login already on this machine as an account too.
@@ -241,13 +241,15 @@ public sealed class TrayApp : ApplicationContext
         {
             var ok = MessageBox.Show(
                 "Auto-switch moves Claude Code to another of your accounts when the active one nears its limit.\n\n" +
-                "• Use only accounts you are entitled to use. Anthropic's terms and usage policies apply to each account.\n" +
+                "• You are responsible for following Anthropic's Consumer Terms and Usage Policy (anthropic.com/legal), " +
+                "including any rules on multiple accounts and usage limits. Use only accounts that are yours.\n" +
                 "• It never bypasses a limit: an exhausted account stays exhausted until it resets.\n" +
                 "• Excluded accounts, accounts whose login has expired, and API-key accounts are never chosen.\n" +
                 "• Sessions on the default login move to the new account from their next message; a response in " +
                 "progress is not interrupted. Pinned terminals keep their account.\n" +
-                "• Polling is conservative: the engine spaces out usage checks per account.\n\nEnable auto-switch?",
-                "Claude Dock — auto-switch", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes;
+                "• Polling is conservative: the engine spaces out usage checks per account.\n\n" +
+                "autodock is an independent project, not affiliated with or endorsed by Anthropic.\n\nEnable auto-switch?",
+                "autodock — auto-switch", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes;
             if (!ok) { _dash.SetAuto(false); return; }
             _settings.AutoSwitchPolicyAccepted = true;
         }
@@ -296,7 +298,7 @@ public sealed class TrayApp : ApplicationContext
     }
 
     static void Error(string title, Exception e) =>
-        MessageBox.Show(Engine.Redact(e.Message), "Claude Dock — " + title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        MessageBox.Show(Engine.Redact(e.Message), "autodock — " + title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
     protected override void ExitThreadCore()
     {

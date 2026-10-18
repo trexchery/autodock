@@ -1,0 +1,39 @@
+name: Release
+
+# Push a tag like v0.1.0 to build, test and publish autodock-win-x64.zip.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.14'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build and test (synthetic credentials only)
+        shell: pwsh
+        run: ./dock/build.ps1
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = 'dist/autodock-win-x64.zip'
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  autodock-win-x64.zip" | Set-Content dist/autodock-win-x64.zip.sha256
+          gh release create $env:GITHUB_REF_NAME $zip dist/autodock-win-x64.zip.sha256 `
+            --title "autodock $env:GITHUB_REF_NAME" `
+            --notes "Portable build. Unzip and run autodock.exe. SHA-256: $hash"

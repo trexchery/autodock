@@ -1542,7 +1542,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    # Never in the frozen Claude Dock bundle: it only talks to Anthropic, and
+    # Never in the frozen autodock bundle: it only talks to Anthropic, and
     # an upstream PyPI release cannot upgrade a bundled engine anyway.
     if not args.purge and not args.upgrade and not args.json and not getattr(sys, "frozen", False):
         from claude_swap.update_check import check_for_update

@@ -1,6 +1,6 @@
-﻿# Claude Dock
+﻿# autodock
 
-Private Windows 11 tray application built on claude-swap v0.27.2.
+Open-source Windows 11 tray application (autodock) built on claude-swap v0.27.2.
 
 - Preserve the upstream MIT license and attribution.
 - Reuse the existing credential, quota, and switching engines.

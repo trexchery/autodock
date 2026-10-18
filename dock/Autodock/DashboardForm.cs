@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 /// Flyout anchored above the tray: every account, its windows, and actions.
 public sealed class DashboardForm : Form
@@ -19,7 +19,7 @@ public sealed class DashboardForm : Form
 
     public DashboardForm()
     {
-        Text = "Claude Dock";
+        Text = "autodock";
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -30,7 +30,7 @@ public sealed class DashboardForm : Form
         Icon = TrayIcons.App;
 
         _header = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(16, 0, 10, 0) };
-        var title = new Label { Text = "Claude Dock", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(16, 13) };
+        var title = new Label { Text = "autodock", Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(16, 13) };
         var settings = IconButton("⚙", "Settings");
         settings.Click += (_, _) => SettingsRequested?.Invoke();
         var refresh = IconButton("⟳", "Refresh now");

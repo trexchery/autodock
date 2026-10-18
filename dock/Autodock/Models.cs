@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 // Mirrors the schema-v1 payloads of `cswap list --json` / `switch --json`
 // (src/claude_swap/json_output.py). Unknown fields are ignored: the contract is additive.

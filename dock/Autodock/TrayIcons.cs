@@ -1,7 +1,7 @@
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 public static class TrayIcons
 {

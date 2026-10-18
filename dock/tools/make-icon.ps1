@@ -1,6 +1,6 @@
-# Regenerates dock/ClaudeDock/dock.ico (multi-size, PNG-compressed entries).
+# Regenerates dock/Autodock/dock.ico (multi-size, PNG-compressed entries).
 Add-Type -AssemblyName System.Drawing
-$out = Join-Path $PSScriptRoot '..\ClaudeDock\dock.ico'
+$out = Join-Path $PSScriptRoot '..\Autodock\dock.ico'
 $sizes = 16, 24, 32, 48, 64, 256
 $pngs = foreach ($s in $sizes) {
     $bmp = New-Object System.Drawing.Bitmap $s, $s
@@ -14,7 +14,7 @@ $pngs = foreach ($s in $sizes) {
     $path.AddArc($w - 2 * $r, $w - 2 * $r, 2 * $r, 2 * $r, 0, 90)
     $path.AddArc(0, $w - 2 * $r, 2 * $r, 2 * $r, 90, 90)
     $path.CloseFigure()
-    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(217, 119, 87))), $path)
+    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(16, 150, 136))), $path)
     # Dock: three stacked bars of decreasing width, bottom-aligned.
     $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
     $bar = [Math]::Max(2, [int]($s * 0.12))

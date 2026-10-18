@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\ClaudeDock\ClaudeDock.csproj" />
+    <ProjectReference Include="..\Autodock\Autodock.csproj" />
   </ItemGroup>
 
 </Project>

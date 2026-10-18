@@ -1,4 +1,4 @@
-"""Claude Dock engine additions: DPAPI sealing and isolated enrollment.
+"""autodock engine additions: DPAPI sealing and isolated enrollment.
 
 All credentials here are synthetic.
 """

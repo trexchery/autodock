@@ -1,7 +1,7 @@
 using System.Drawing.Drawing2D;
 using Microsoft.Win32;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 public sealed record Palette(Color Back, Color Card, Color Text, Color Muted, Color Track, Color Accent, Color Border)
 {
@@ -9,11 +9,11 @@ public sealed record Palette(Color Back, Color Card, Color Text, Color Muted, Co
 
     static readonly Palette Light = new(
         Color.FromArgb(243, 243, 243), Color.White, Color.FromArgb(28, 28, 28), Color.FromArgb(96, 96, 96),
-        Color.FromArgb(225, 225, 225), Color.FromArgb(201, 100, 66), Color.FromArgb(222, 222, 222));
+        Color.FromArgb(225, 225, 225), Color.FromArgb(13, 138, 126), Color.FromArgb(222, 222, 222));
 
     static readonly Palette Dark = new(
         Color.FromArgb(32, 32, 32), Color.FromArgb(43, 43, 43), Color.FromArgb(240, 240, 240), Color.FromArgb(170, 170, 170),
-        Color.FromArgb(62, 62, 62), Color.FromArgb(217, 119, 87), Color.FromArgb(58, 58, 58));
+        Color.FromArgb(62, 62, 62), Color.FromArgb(32, 168, 152), Color.FromArgb(58, 58, 58));
 
     static bool IsLight()
     {

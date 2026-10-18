@@ -8,10 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>dock.ico</ApplicationIcon>
-    <AssemblyName>ClaudeDock</AssemblyName>
+    <AssemblyName>autodock</AssemblyName>
     <Version>0.1.0</Version>
-    <Product>Claude Dock</Product>
-    <Copyright>Claude Dock contributors; engine (c) Onur Cetinkol, MIT</Copyright>
+    <Product>autodock</Product>
+    <Copyright>autodock contributors; engine (c) Onur Cetinkol, MIT</Copyright>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
@@ -22,7 +22,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="dock.ico" LogicalName="dock.ico" />
-    <InternalsVisibleTo Include="ClaudeDock.Tests" />
+    <InternalsVisibleTo Include="Autodock.Tests" />
   </ItemGroup>
 
 </Project>

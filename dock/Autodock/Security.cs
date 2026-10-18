@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Security.AccessControl;
 using System.Security.Principal;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 public static class StoreSecurity
 {

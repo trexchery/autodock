@@ -1,4 +1,4 @@
-namespace ClaudeDock;
+namespace Autodock;
 
 /// Dock preferences plus the engine's autoswitch.* keys (written via `cswap config set`).
 public sealed class SettingsForm : Form
@@ -7,11 +7,11 @@ public sealed class SettingsForm : Form
     public readonly NumericUpDown RefreshInterval = new() { Minimum = DockSettings.MinRefreshSeconds, Maximum = 3600, Increment = 30, Value = 180, Width = 70 };
     public readonly TextBox Models = new() { Width = 180, PlaceholderText = "e.g. Opus  (blank = none)" };
     public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
-    public readonly CheckBox Startup = new() { Text = "Start Claude Dock when I sign in to Windows", AutoSize = true };
+    public readonly CheckBox Startup = new() { Text = "Start autodock when I sign in to Windows", AutoSize = true };
 
     public SettingsForm()
     {
-        Text = "Claude Dock settings";
+        Text = "autodock settings";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -49,5 +49,15 @@ public sealed class SettingsForm : Form
         CancelButton = cancel;
         Controls.Add(grid);
         Controls.Add(buttons);
+        Controls.Add(new Label
+        {
+            Text = "autodock is an independent open-source project, not affiliated with or endorsed by Anthropic. " +
+                   "Built on claude-swap by Onur Cetinkol (MIT).",
+            ForeColor = SystemColors.GrayText,
+            AutoSize = true,
+            MaximumSize = new Size(440, 0),
+            Dock = DockStyle.Bottom,
+            Padding = new Padding(0, 10, 0, 0),
+        });
     }
 }

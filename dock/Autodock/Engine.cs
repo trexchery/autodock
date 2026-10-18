@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace ClaudeDock;
+namespace Autodock;
 
 public sealed record EngineResult(int ExitCode, string Stdout, string Stderr);
 
@@ -18,15 +18,15 @@ public sealed partial class Engine(string exe)
 
     public static Engine Locate()
     {
-        var env = Environment.GetEnvironmentVariable("CLAUDE_DOCK_ENGINE");
+        var env = Environment.GetEnvironmentVariable("AUTODOCK_ENGINE");
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
         var bundled = Path.Combine(AppContext.BaseDirectory, "engine", "cswap.exe");
         if (File.Exists(bundled)) return new Engine(bundled);
         var onPath = FindOnPath("cswap.exe");
         if (onPath != null) return new Engine(onPath);
         throw new EngineException(
-            "Engine not found. Expected engine\\cswap.exe next to ClaudeDock.exe " +
-            "(or set CLAUDE_DOCK_ENGINE).");
+            "Engine not found. Expected engine\\cswap.exe next to autodock.exe " +
+            "(or set AUTODOCK_ENGINE).");
     }
 
     internal static string? FindOnPath(string file) =>
