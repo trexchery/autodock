@@ -278,6 +278,40 @@ class TestJitter:
         assert late == pytest.approx(NOW + interval * 1.1)
 
 
+class TestUsageGap:
+    def test_gap_is_drawn_from_the_range(self, monkeypatch):
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", (2.0, 7.0))
+        gaps = [poll_policy.usage_gap() for _ in range(200)]
+        assert all(2.0 <= g <= 7.0 for g in gaps) and len(set(gaps)) > 1
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", ())
+        assert poll_policy.usage_gap() == 0.0
+
+    def test_pacer_waits_a_fresh_gap_before_every_call_but_the_first(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", (2.0, 7.0))
+        draws = iter([2.0, 7.0, 4.5])
+        monkeypatch.setattr(poll_policy.random, "uniform", lambda a, b: next(draws))
+        slept: list[float] = []
+        monkeypatch.setattr(poll_policy.time, "sleep", slept.append)
+        pace = poll_policy.pacer()
+        pace()
+        assert slept == []
+        pace(), pace(), pace()
+        assert slept == [2.0, 7.0, 4.5]
+
+    def test_pacer_stops_sleeping_past_its_budget(self, monkeypatch):
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", (2.0, 7.0))
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_SPREAD_MAX_S", 10.0)
+        monkeypatch.setattr(poll_policy.random, "uniform", lambda a, b: b)
+        slept: list[float] = []
+        monkeypatch.setattr(poll_policy.time, "sleep", slept.append)
+        pace = poll_policy.pacer()
+        for _ in range(5):
+            pace()
+        assert slept == [7.0, 3.0]  # 10 s in all, then back to back
+
+
 class TestBudgetInvariants:
     """Relationships the measured rate limit demands of the constants.
 

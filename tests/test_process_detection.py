@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -78,6 +78,19 @@ class TestIsPidAlive:
              ) as mock_win:
             assert is_pid_alive(12345) is True
             mock_win.assert_called_once_with(12345)
+
+    @pytest.mark.parametrize("last_error, alive", [(5, True), (87, False)])
+    def test_windows_open_failure_access_denied_is_alive(self, last_error, alive):
+        """OpenProcess failing with ERROR_ACCESS_DENIED is a live process."""
+        import ctypes
+
+        from claude_swap.process_detection import _is_pid_alive_windows
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        with patch.object(ctypes, "WinDLL", return_value=kernel32, create=True), \
+             patch.object(ctypes, "get_last_error", return_value=last_error, create=True):
+            assert _is_pid_alive_windows(12345) is alive
 
     def test_current_process_is_alive(self):
         """Smoke test on the real platform branch (win32 or POSIX)."""

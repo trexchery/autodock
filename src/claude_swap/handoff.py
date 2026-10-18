@@ -2,9 +2,10 @@
 
 Builds local hand-off notes from the newest session transcript a CLI left for a
 project folder, so a *different* agent can start a new session with that
-context. Nothing is sent anywhere: the notes are a Markdown file under
-``%LOCALAPPDATA%\\autodock\\handoff``. Unfinished reasoning can't be
-transferred; this is a fresh start with notes, not a resume.
+context. The notes are built locally as a Markdown file under
+``%LOCALAPPDATA%\\autodock\\handoff`` and autodock sends nothing, but the target
+agent reads them and sends them to its provider like any prompt. Unfinished
+reasoning can't be transferred; this is a fresh start with notes, not a resume.
 """
 
 from __future__ import annotations
@@ -26,16 +27,25 @@ TRANSCRIPT_CAP = 6000
 KEEP_DAYS = 7
 SOURCES = ("claude", "codex", "grok")
 
-# Same patterns as the tray's Engine.Redact, plus generic sk-/xai- keys and JWTs.
+# Same patterns as the tray's Engine.Redact, plus generic sk-/xai- keys, JWTs, and common
+# GitHub/AWS/Slack/Google/Stripe keys and PEM private keys: the notes go to another vendor's agent.
 _SECRET = re.compile(
     r"sk-ant-[A-Za-z0-9_\-]{6,}"
     r"|(?i:bearer)\s+[A-Za-z0-9._\-]{12,}"
-    r"|(?i:\"(access|refresh)_?token\"\s*:\s*\"[^\"]*\")"
-    r"|(?i:(access|refresh)_?token\s*[=:]\s*[^\s\"',;]+)"
-    r"|(?i:(api_?key|secret|password)\w*\s*[=:]\s*[^\s\"',;]+)"
+    r"|(?i:\"(access|refresh|id)_?token\"\s*:\s*\"[^\"]*\")"
+    r"|(?i:(access|refresh|id)_?token[\"']?\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"',;]+))"
+    r"|(?i:(api_?key|secret|password)\w*[\"']?\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"',;]+))"
     r"|\b(sk|xai)-[A-Za-z0-9_\-]{16,}"
     r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"
+    r"|gh[pousr]_[A-Za-z0-9]{30,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[0-9A-Za-z_\-]{30,}"
+    r"|\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"
 )
+# Applied first: a "secret_key=" prefix would otherwise eat the BEGIN line and leak the key body.
+_PEM = re.compile(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)")
 
 
 class HandoffError(Exception):
@@ -43,7 +53,7 @@ class HandoffError(Exception):
 
 
 def redact(text: str) -> str:
-    return _SECRET.sub("[redacted]", text)
+    return _SECRET.sub("[redacted]", _PEM.sub("[redacted]", text))
 
 
 def _same_dir(a: str, b: str) -> bool:
@@ -209,12 +219,15 @@ def parse_codex(path: Path) -> tuple[list[str], list[str]]:
 # -- notes -------------------------------------------------------------------------
 
 def _git(project: str) -> str:
+    # The folder's repo config is untrusted: core.fsmonitor, external diff and textconv could run its commands.
+    # --no-optional-locks: no index write, so no post-index-change hook and no index.lock under a live session.
+    git = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", project]
     try:
-        status = subprocess.run(["git", "-C", project, "status", "--short"],
+        status = subprocess.run(git + ["status", "--short"],
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         if status.returncode != 0:
             return "_Not a git repository._"
-        stat = subprocess.run(["git", "-C", project, "diff", "--stat"],
+        stat = subprocess.run(git + ["diff", "--stat", "--no-ext-diff", "--no-textconv"],
                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return "_git not available._"

@@ -691,7 +691,6 @@ class TestAdaptiveScheduler:
             yield
 
     def _harness(self, temp_home, monkeypatch, accounts=3, **settings_kwargs):
-        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
         h = EngineHarness(temp_home, **settings_kwargs)
         emails = ["a@example.com", "b@example.com", "c@example.com"]
         for num in range(1, accounts + 1):

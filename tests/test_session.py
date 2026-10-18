@@ -10,6 +10,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -29,6 +30,7 @@ from claude_swap.paths import get_global_config_path
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
+    RUN_MARKERS,
     SHARE_MANIFEST,
     SessionManager,
     _probe_env,
@@ -551,6 +553,50 @@ class TestBootstrap:
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
         assert session_mod.is_session_stale(session_dir)
+
+    @pytest.mark.parametrize("verdict", ["unreachable", "invalid"])
+    def test_live_profile_never_reseeded_or_deleted(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, verdict: str,
+    ):
+        """A second `cswap run` that cannot verify a live profile (claude
+        unreachable) or sees drift (an in-session /login) must refuse, not
+        overwrite the running claude's credentials or delete the profile."""
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        (session_dir / ".credentials.json").write_text("live lineage")
+        make_live(session_dir)
+        monkeypatch.setattr(SessionManager, "_session_validity", lambda *a: verdict)
+        consume = MagicMock(wraps=seeded_switcher.consume_backup_grant)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant", consume)
+
+        with pytest.raises(SessionError, match="in\\s+use"):
+            manager.setup_session("2", share=False)
+
+        assert (session_dir / ".credentials.json").read_text() == "live lineage"
+        consume.assert_not_called()
+
+    def test_validation_failure_keeps_profile_a_peer_joined(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates, block_real_keychain
+    ):
+        """A peer claude that joined between the seed and the post-bootstrap
+        probe keeps its profile; the run still fails validation."""
+        def peer_joins_then_invalid(cmd, env=None, **kwargs):
+            make_live(Path(env["CLAUDE_CONFIG_DIR"]))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", peer_joins_then_invalid)
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session("2", share=False)
+
+        assert session_dir.exists()
 
     def test_rebootstrap_preserves_profile_history(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
@@ -1270,8 +1316,9 @@ class TestMcpMirror:
 
 
 class _ExecCalled(Exception):
-    def __init__(self, binary, argv, env):
+    def __init__(self, binary, argv, env, on_exit=None):
         self.binary, self.argv, self.env = binary, argv, env
+        self.on_exit = on_exit
 
 
 @pytest.fixture
@@ -1280,8 +1327,8 @@ def capture_exec(monkeypatch):
     # it: _exec() dispatches to os.execvpe on POSIX but subprocess.run on
     # Windows, and patching subprocess.run here would also swallow the
     # `claude auth status` probe that some of these tests stub separately.
-    def fake_exec(self, claude_bin, claude_args, env):
-        raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+    def fake_exec(self, claude_bin, claude_args, env, on_exit=None):
+        raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env, on_exit)
 
     monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
     monkeypatch.setattr(
@@ -1458,6 +1505,227 @@ class TestExec:
             manager._exec("/bin/claude", ["--resume"], {"A": "B"})
         assert exc.value.code == 7
         assert seen["call"] == (["/bin/claude", "--resume"], {"A": "B"})
+
+    def test_windows_runs_on_exit_after_claude_and_keeps_its_code(
+        self, manager, monkeypatch
+    ):
+        order = []
+
+        def fake_run(argv, env=None, **kwargs):
+            order.append("claude")
+            return SimpleNamespace(returncode=3)
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            manager._exec("/bin/claude", [], {}, on_exit=lambda: order.append("seal"))
+        assert exc.value.code == 3
+        assert order == ["claude", "seal"]
+
+    def test_windows_ctrl_c_still_runs_on_exit(self, manager, monkeypatch):
+        def fake_run(argv, env=None, **kwargs):
+            raise KeyboardInterrupt
+
+        sealed = []
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            manager._exec("/bin/claude", [], {}, on_exit=lambda: sealed.append(1))
+        assert exc.value.code == 130
+        assert sealed == [1]
+
+    def test_windows_ctrl_c_in_on_exit_keeps_claudes_code(self, manager, monkeypatch):
+        def interrupted():
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+        monkeypatch.setattr(
+            session_mod.subprocess, "run", lambda argv, env=None: SimpleNamespace(returncode=3)
+        )
+        with pytest.raises(SystemExit) as exc:
+            manager._exec("/bin/claude", [], {}, on_exit=interrupted)
+        assert exc.value.code == 3
+
+
+# ---------------------------------------------------------------------------
+# sealing idle profiles (Windows)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_windows(monkeypatch):
+    """run()'s Windows-only steps on any host. Swaps session's own `sys`, not
+    the global one: FileLock picks its locking primitive from that."""
+    monkeypatch.setattr(
+        session_mod, "sys", SimpleNamespace(platform="win32", exit=sys.exit)
+    )
+
+
+def _seed_profile(manager, creds: str = CREDS, email: str = ACCOUNT_EMAIL) -> Path:
+    """An idle profile holding `creds`, logged in as `email`, with history."""
+    session_dir = session_dir_for(
+        manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+    )
+    (session_dir / "projects").mkdir(parents=True, exist_ok=True)
+    (session_dir / ".credentials.json").write_text(creds)
+    (session_dir / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {"emailAddress": email, "organizationUuid": ORG_UUID}
+    }))
+    return session_dir
+
+
+OTHER_CREDS = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "other-access",
+        "refreshToken": "other-refresh",
+        "expiresAt": 9999999999999,
+    }
+})
+
+
+class TestSealProfiles:
+    def _backup(self, manager) -> str:
+        return manager.switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+    def test_exit_seals_when_the_backup_holds_the_login(
+        self, manager, capture_exec, fake_windows, auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+        session_dir = Path(exc.value.env["CLAUDE_CONFIG_DIR"])
+        marker = session_dir / RUN_MARKERS / str(os.getpid())
+        assert marker.exists()
+        (session_dir / "projects").mkdir()
+
+        exc.value.on_exit()  # claude exited
+
+        assert not marker.exists()
+        assert not (session_dir / ".credentials.json").exists()
+        assert (session_dir / ".claude.json").exists()
+        assert (session_dir / "projects").is_dir()
+        assert self._backup(manager) == ROTATED_CREDS
+
+    def test_posix_registers_nothing(
+        self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        monkeypatch.setattr(
+            session_mod, "sys", SimpleNamespace(platform="linux", exit=sys.exit)
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+        assert exc.value.on_exit is None
+        assert not (Path(exc.value.env["CLAUDE_CONFIG_DIR"]) / RUN_MARKERS).exists()
+
+    def test_adopts_a_newer_profile_then_seals(self, manager):
+        session_dir = _seed_profile(manager, ROTATED_CREDS)  # backup: CREDS
+        manager.seal_idle_profiles()
+        assert self._backup(manager) == ROTATED_CREDS
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_live_peer_wrapper_blocks_the_seal(self, manager):
+        session_dir = _seed_profile(manager)
+        (session_dir / RUN_MARKERS).mkdir()
+        (session_dir / RUN_MARKERS / str(os.getpid())).touch()
+        manager.seal_idle_profiles()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_live_claude_blocks_the_seal(self, manager):
+        session_dir = _seed_profile(manager)
+        make_live(session_dir)
+        manager.seal_idle_profiles()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_identity_drift_is_left_alone(self, manager):
+        session_dir = _seed_profile(manager, OTHER_CREDS, "other@example.com")
+        manager.seal_idle_profiles()
+        assert (session_dir / ".credentials.json").read_text() == OTHER_CREDS
+        assert self._backup(manager) == CREDS
+
+    def test_siblings_reach_the_backup_before_the_seal(self, manager):
+        with_mcp = json.dumps(
+            {**json.loads(CREDS), "mcpOAuth": {"srv": {"refreshToken": "m"}}}
+        )
+        session_dir = _seed_profile(manager, with_mcp)  # backup: CREDS
+        manager.seal_idle_profiles()
+        assert json.loads(self._backup(manager)) == json.loads(with_mcp)
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_starting_peer_skips_the_pre_launch_consume(
+        self, manager, auth_status_tracks_seed, refresh_rotates
+    ):
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        (session_dir / RUN_MARKERS).mkdir(parents=True)
+        (session_dir / RUN_MARKERS / str(os.getppid())).touch()  # live, not us
+        manager.setup_session("2", share=False)
+        assert refresh_rotates == []
+        assert self._backup(manager) == CREDS
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_unreadable_backup_is_left_alone(self, manager, monkeypatch):
+        session_dir = _seed_profile(manager)
+        monkeypatch.setattr(
+            manager.switcher, "_read_account_credentials_ex", lambda n, e: ("", True)
+        )
+        manager.seal_idle_profiles()
+        assert (session_dir / ".credentials.json").read_text() == CREDS
+
+    def test_dead_wrapper_marker_is_cleaned(self, manager):
+        session_dir = _seed_profile(manager)
+        dead = session_dir / RUN_MARKERS / str(2**22 + 12345)
+        dead.parent.mkdir()
+        dead.touch()
+        manager.seal_idle_profiles()
+        assert not dead.exists()
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_register_retries_when_the_login_vanished(
+        self, manager, capture_exec, fake_windows, auth_status_tracks_seed,
+        refresh_rotates, monkeypatch,
+    ):
+        real_setup = manager.setup_session
+        calls = []
+        marker = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) / RUN_MARKERS / str(os.getpid())
+
+        def setup(*args, **kwargs):
+            assert marker.exists()  # registered before setup looks
+            result = real_setup(*args, **kwargs)
+            calls.append(result)
+            if len(calls) == 1:
+                (result[0] / ".credentials.json").unlink()  # a peer's exit seal
+            return result
+
+        monkeypatch.setattr(manager, "setup_session", setup)
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+        session_dir = calls[-1][0]
+        assert len(calls) == 2
+        assert (session_dir / ".credentials.json").exists()
+        assert (session_dir / RUN_MARKERS / str(os.getpid())).exists()
+
+    def test_register_refuses_after_one_retry(
+        self, manager, capture_exec, fake_windows, auth_status_tracks_seed,
+        refresh_rotates, monkeypatch,
+    ):
+        real_setup = manager.setup_session
+
+        def setup(*args, **kwargs):
+            result = real_setup(*args, **kwargs)
+            (result[0] / ".credentials.json").unlink()
+            return result
+
+        monkeypatch.setattr(manager, "setup_session", setup)
+        with pytest.raises(SessionError, match="lost its login"):
+            manager.run("2", [])
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not (session_dir / RUN_MARKERS / str(os.getpid())).exists()
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,13 @@ SECRETS = [
     "sk-SYNTHETICopenaikey1234567890",
     "xai-SYNTHETICgrokkey1234567890",
     "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ.c2ln",
+    "ghp_SYNTHETICgithubtoken0123456789",
+    "github_pat_SYNTHETIC_finegrained_0123",
+    "AKIAIOSFODNN7EXAMPLE",
+    "xoxb-SYNTHETIC-slack-token",
+    "AIzaSYNTHETICgooglekey0123456789ab",
+    "sk_live_SYNTHETICstripe12345",
+    "-----BEGIN RSA PRIVATE KEY-----\nSYNTHETICkeymaterial\n-----END RSA PRIVATE KEY-----",
 ]
 
 
@@ -113,12 +120,20 @@ def test_caps_and_redaction(project):
     _write(handoff.claude_project_dirs()[0] / _encoded(project) / "a.jsonl", recs)
     text = open(handoff.run("claude", str(project))["path"], encoding="utf-8").read()
     for s in SECRETS:
-        assert s not in text
+        assert s not in text and handoff.redact(s) == "[redacted]"
     assert "msg 0" not in text  # only the last 3 follow-ups
     assert text.count("- Bash:") == 15
     transcript_part = text.split("## Working tree now")[0]
     assert len(transcript_part) < handoff.TRANSCRIPT_CAP + 600
-    assert handoff.redact('"access_token": "abc"  refresh_token=xyz').count("[redacted]") == 2
+    assert handoff.redact('"access_token": "abc"  refresh_token=xyz id_token=j').count("[redacted]") == 3
+    ordinary = r"edit C:\Users\dev\my.proj\src\app.py, then mail dev@example.com"
+    assert handoff.redact(ordinary) == ordinary
+    assert "MIIE" not in handoff.redact("secret_key=" + SECRETS[-1].replace("SYNTHETICkeymaterial", "MIIEsynthetic"))
+    assert handoff.redact("-----BEGIN PRIVATE KEY-----\nMIIEtruncated") == "[redacted]"
+    # Quoted values (TOML, .env, JSON) are redacted whole, spaces included.
+    for quoted in ('password = "hunter two"', "access_token = 'abc def'", '{"api_key": "abc 123"}'):
+        out = handoff.redact(quoted)
+        assert "hunter" not in out and "abc" not in out, out
 
 
 def test_git_missing(project, monkeypatch):

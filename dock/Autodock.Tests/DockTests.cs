@@ -134,7 +134,30 @@ public class RedactionTests
     [InlineData("Authorization: Bearer abcdefghijklmnopqrstuvwxyz", "Authorization: [redacted]")]
     [InlineData("{\"refreshToken\": \"sk-ant-ort01-zzz\"}", "{[redacted]}")]
     [InlineData("{\"access_token\":\"xyz\"}", "{[redacted]}")]
+    [InlineData("{\"id_token\": \"abc\"}", "{[redacted]}")]
+    [InlineData("jwt eyJhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ.c2ln end", "jwt [redacted] end")]
+    [InlineData("key sk-proj-SYNTHETIC0000000000 x", "key [redacted] x")]
+    [InlineData("key xai-SYNTHETIC0000000000 x", "key [redacted] x")]
+    [InlineData("refresh_token=SYNTHETIC; rest", "[redacted]; rest")]
+    [InlineData("OPENAI_API_KEY=SYNTHETIC123 next", "OPENAI_[redacted] next")]
+    [InlineData("password: hunter2", "[redacted]")]
+    [InlineData("password = \"hunter 2\" next", "[redacted] next")]
+    [InlineData("access_token = \"abc\"", "[redacted]")]
+    [InlineData("OPENAI_API_KEY=\"sk-short\"", "OPENAI_[redacted]")]
+    [InlineData("{\"api_key\": \"abc123\"}", "{\"[redacted]}")]
+    [InlineData("{\"password\": \"hunter2\"}", "{\"[redacted]}")]
+    [InlineData("{'access_token': 'abc'}", "{'[redacted]}")]
+    [InlineData("gh ghp_SYNTHETIC000000000000000000000000000", "gh [redacted]")]
+    [InlineData("gh github_pat_SYNTHETIC_0000000000000000", "gh [redacted]")]
+    [InlineData("aws AKIAIOSFODNN7EXAMPLE", "aws [redacted]")]
+    [InlineData("slack xoxb-0000000000-SYNTHETIC", "slack [redacted]")]
+    [InlineData("gcp AIzaSYNTHETIC-synthetic-synthetic-000", "gcp [redacted]")]
+    [InlineData("stripe rk_test_SYNTHETIC0000000000", "stripe [redacted]")]
+    [InlineData("x -----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC\n-----END RSA PRIVATE KEY----- y", "x [redacted] y")]
+    [InlineData("x\n-----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETIC", "x\n[redacted]")]
     [InlineData("Switched to #2 b@example.com", "Switched to #2 b@example.com")]
+    [InlineData(@"Saved C:\Users\me\AppData\Local\autodock\settings.json for a.b@example.com",
+        @"Saved C:\Users\me\AppData\Local\autodock\settings.json for a.b@example.com")]
     public void RedactsSecrets(string input, string expected) => Assert.Equal(expected, Engine.Redact(input));
 }
 
@@ -201,6 +224,17 @@ public class StorageTests
         var file = Path.Combine(t.Path, "settings.json");
         File.WriteAllText(file, "{ not json");
         Assert.False(DockSettings.Load(file).AutoSwitch);
+    }
+
+    [Fact]
+    public void PurgesEnrollmentLeftovers()
+    {
+        using var t = new TempDir();
+        Directory.CreateDirectory(Path.Combine(t.Path, "abc", "sub"));
+        File.WriteAllText(Path.Combine(t.Path, "abc", ".credentials.json"), "{\"synthetic\":true}");
+        ClaudeCli.PurgeEnrollLeftovers(t.Path);
+        Assert.Empty(Directory.GetDirectories(t.Path));
+        ClaudeCli.PurgeEnrollLeftovers(Path.Combine(t.Path, "missing")); // absent root is fine
     }
 
     [Fact]
@@ -368,6 +402,45 @@ public class RenderTests
                     settings.DrawToBitmap(sb, new Rectangle(0, 0, settings.Width, settings.Height));
                     sb.Save(sOut);
                 }
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        if (failure != null) throw failure;
+    }
+
+    /// Regression: a refresh re-renders (disposing every row) while a row's menu is open.
+    /// Clicking an item then closed the menu through the disposed row, which threw before the click ran.
+    [Fact]
+    public void MenuOfDisposedRowStillClicksAndIsDisposed()
+    {
+        var snap = new Snapshot(1, 1,
+        [
+            new Account(1, "a@example.com", true, "ok", null),
+            new Account(2, "b@example.com", false, "ok", null),
+        ]);
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                using var form = new DashboardForm { Location = new Point(-10000, -10000) };
+                Account? opened = null;
+                form.TerminalRequested += a => opened = a;
+                form.Render(snap, null);
+                form.Show();
+                Application.DoEvents();
+                var rows = FindRows(form).ToList();
+                var menu = rows[0].ShowMenu(Point.Empty);
+                form.Render(snap, null);
+                Assert.All(rows, r => Assert.True(r.IsDisposed));
+
+                menu.Items.Cast<ToolStripItem>().First(i => i.Text == "Open terminal").PerformClick();
+                Application.DoEvents();
+                Assert.Equal(1, opened?.Number); // still reaches the dashboard's handler
+                Assert.True(menu.IsDisposed);
             }
             catch (Exception e) { failure = e; }
         });

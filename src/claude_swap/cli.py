@@ -1005,6 +1005,9 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    if sys.platform == "win32":
+        # shutil.which must not pick up a claude/codex/grok planted in the cwd.
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
@@ -1470,6 +1473,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
+            if sys.platform == "win32":
+                # The tray polls this: seal profiles whose terminal window was
+                # closed (no exit seal ran). Silent, so --json stays clean.
+                from claude_swap.session import SessionManager
+
+                SessionManager(switcher).seal_idle_profiles()
             switcher.force_usage_refresh = args.refresh
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

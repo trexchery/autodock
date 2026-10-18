@@ -45,7 +45,8 @@ and encrypted credential storage.
   limits (whichever your plan has), Grok's weekly or monthly pool.
 - **Continue in another CLI.** Hit a limit or a crash mid-task? *Continue in* starts a new Codex, Claude or Grok
   session in the same folder with notes from the interrupted one (request, recent steps, git status). It is a
-  fresh start, not a resume: unfinished reasoning can't be transferred. Notes stay local and are deleted after 7 days.
+  fresh start, not a resume: unfinished reasoning can't be transferred. autodock builds the notes locally and sends
+  nothing, but the new agent reads them and sends them to its provider like any prompt. Notes are deleted after 7 days.
 - **Optional auto-switch.** Off by default, Claude accounts only. Moves to the account with the most headroom before you reach a
   threshold you choose.
 - **Stays out of the way.** A dot in the tray, a dashboard that follows the Windows light or dark theme,
@@ -130,6 +131,10 @@ never refreshes their tokens itself, because those tokens are single-use.
   requests go to Anthropic's OAuth, profile and usage endpoints, and to the usage endpoints the Codex and Grok
   CLIs themselves use.
 - **Encrypted at rest.** Saved logins are encrypted with Windows DPAPI, tied to your Windows user on this PC.
+  A terminal opened with **Terminal** or `cswap run` holds a plaintext login in its profile, because Claude Code
+  needs one, normally only while the terminal uses it: autodock moves it back into the encrypted store when the
+  terminal closes (or at the tray's next refresh if the window was closed). A profile that logged into a different
+  account inside Claude Code keeps that login until its next launch.
 - **Locked-down folders.** On every start, `.claude-swap-backup` and `%LOCALAPPDATA%\autodock` are restricted
   to your user and SYSTEM.
 - **Safe writes.** Credential writes are atomic, and token refreshes use Claude Code's own lock files, so a

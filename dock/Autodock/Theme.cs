@@ -322,6 +322,11 @@ public sealed class MenuRenderer(Palette pal) : ToolStripProfessionalRenderer(ne
         }
     }
 
+    /// One-shot menu: disposed after it closes and the clicked item's handler has run. Queued on
+    /// the menu itself (it has a handle once shown): the control that opened it may be gone by
+    /// then, since a dashboard refresh disposes every row.
+    public static void DisposeOnClose(ContextMenuStrip menu) => menu.Closed += (_, _) => menu.BeginInvoke(menu.Dispose);
+
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
     {
         e.TextColor = e.Item.Enabled ? pal.Text : pal.Muted;

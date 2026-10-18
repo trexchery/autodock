@@ -15,17 +15,21 @@ plaintext file at all and would render as "no credentials" while logged in.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import sys
 from pathlib import Path
 
 import pytest
 
+from claude_swap import dpapi
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
     CredentialStore,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.session import keychain_service_name
 
@@ -271,3 +275,47 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
+class TestLegacyBackupReseal:
+    """A legacy plain-base64 ``.enc`` (upstream/older builds) is re-sealed with
+    DPAPI on its first read with the store lock free; the read is unaffected."""
+
+    EMAIL = "legacy@example.com"
+
+    def _store_with_legacy(self, tmp_path: Path) -> tuple[CredentialStore, Path, str]:
+        host = _Host(tmp_path / "backups" / "credentials")
+        host.platform = Platform.WINDOWS
+        host.lock_file = tmp_path / "backups" / ".lock"
+        store = CredentialStore(host)
+        enc = store._backup_enc_path("1", self.EMAIL)
+        enc.parent.mkdir(parents=True)
+        legacy = base64.b64encode(DEFAULT_PROFILE_CREDS.encode()).decode()
+        enc.write_text(legacy, encoding="utf-8")
+        return store, enc, legacy
+
+    def test_read_reseals_legacy_file(self, tmp_path: Path):
+        store, enc, _ = self._store_with_legacy(tmp_path)
+
+        assert store._read_account_credentials("1", self.EMAIL) == DEFAULT_PROFILE_CREDS
+
+        sealed = enc.read_text(encoding="utf-8")
+        assert sealed.startswith(dpapi.PREFIX)
+        assert dpapi.unseal(sealed) == DEFAULT_PROFILE_CREDS
+
+    def test_held_lock_or_failed_write_leaves_file_and_read_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        store, enc, legacy = self._store_with_legacy(tmp_path)
+
+        with FileLock(store._host.lock_file):
+            assert store._read_account_credentials("1", self.EMAIL) == DEFAULT_PROFILE_CREDS
+        assert enc.read_text(encoding="utf-8") == legacy
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(store, "_atomic_b64_write", boom)
+        assert store._read_account_credentials("1", self.EMAIL) == DEFAULT_PROFILE_CREDS
+        assert enc.read_text(encoding="utf-8") == legacy

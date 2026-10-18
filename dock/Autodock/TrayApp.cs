@@ -12,7 +12,8 @@ public sealed class TrayApp : ApplicationContext
     string? _error;
     // Codex / Grok: polled on the same tick, each failure kept to its own section.
     readonly Dictionary<string, (Snapshot? Snap, string? Error)> _others = [];
-    bool _busy, _refreshPending;
+    bool _busy;
+    bool? _pending; // a request made during a busy pass: null none, else whether it forces a refresh
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
 
@@ -56,6 +57,7 @@ public sealed class TrayApp : ApplicationContext
             try { if (!Directory.Exists(dir) || !StoreSecurity.IsHardened(dir)) StoreSecurity.Harden(dir); }
             catch (Exception e) { Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning); }
         }
+        ClaudeCli.PurgeEnrollLeftovers(ClaudeCli.EnrollRoot);
     }
 
     void ToggleDashboard()
@@ -85,7 +87,7 @@ public sealed class TrayApp : ApplicationContext
     {
         if (_busy)
         {
-            _refreshPending |= refresh; // run it right after the current pass
+            _pending = refresh || _pending == true; // one re-run right after the current pass
             return;
         }
         _busy = true;
@@ -116,10 +118,10 @@ public sealed class TrayApp : ApplicationContext
         if (old != TrayIcons.App) old?.Dispose();
         _tray.Text = Format.Tooltip(basis, _settings.AutoSwitch);
         if (_dash.Visible) RenderDash();
-        if (_refreshPending)
+        if (_pending is { } again)
         {
-            _refreshPending = false;
-            _ = TickAsync(runAuto: false, refresh: true);
+            _pending = null;
+            _ = TickAsync(runAuto: false, refresh: again);
         }
     }
 
@@ -145,7 +147,7 @@ public sealed class TrayApp : ApplicationContext
         foreach (var p in installed.Prepend("claude"))
             menu.Items.Add(ProviderCli.Title(p) + " account…", null, (_, _) => _ = EnrollAsync(null, p));
         MenuRenderer.Apply(menu);
-        menu.Closed += (_, _) => _dash.BeginInvoke(menu.Dispose);
+        MenuRenderer.DisposeOnClose(menu);
         menu.Show(Cursor.Position);
     }
 
@@ -228,7 +230,8 @@ public sealed class TrayApp : ApplicationContext
                 $"{running} Claude Code process(es) are running.\n\n" +
                 "Switching never stops them. A response already in progress finishes on the current account; " +
                 "sessions on the default login use the new account from their next message (the first one may " +
-                "use extra quota while its cache rebuilds). Terminals opened with “Terminal” keep their own account.\n\n" +
+                "use extra quota while its cache rebuilds). Terminals opened for another account keep it; " +
+                "one opened for the active account follows switches.\n\n" +
                 $"Switch to #{a.Number} {a.Email}?",
                 "autodock", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
             return;
@@ -253,15 +256,17 @@ public sealed class TrayApp : ApplicationContext
                 else _engine.LaunchConsole(title, folder, a.Provider, "run", a.Number.ToString());
                 return;
             }
-            // `cswap run N` pins this console to account N via an isolated profile;
-            // global switches and auto-switch never touch it.
+            // `cswap run N` pins this console to account N via an isolated profile; global switches
+            // and auto-switch never touch it. When N is the active login, the engine runs plain `claude`
+            // instead (no second copy of the refresh token), which follows later switches.
             _engine.LaunchConsole($"Claude · {(string.IsNullOrEmpty(a.Alias) ? a.Email : a.Alias)}", folder, "run", a.Number.ToString());
         }
         catch (Exception e) { Error("Could not open terminal", e); }
     }
 
     /// Starts a new session in `target` with notes from the interrupted `source` session.
-    /// Not a resume: the notes are built locally and nothing is sent anywhere.
+    /// Not a resume: the notes are built locally and autodock sends nothing; the
+    /// target agent reads them like any prompt.
     async Task ContinueAsync(string source, string target)
     {
         if (PickFolder($"Folder of the interrupted {ProviderCli.Title(source)} work") is not { } folder) return;
@@ -393,7 +398,8 @@ public sealed class TrayApp : ApplicationContext
                 "• It never bypasses a limit: an exhausted account stays exhausted until it resets.\n" +
                 "• Excluded accounts, accounts whose login has expired, and API-key accounts are never chosen.\n" +
                 "• Sessions on the default login move to the new account from their next message; a response in " +
-                "progress is not interrupted. Pinned terminals keep their account.\n" +
+                "progress is not interrupted. Terminals opened for another account keep it; one opened for the " +
+                "active account follows switches.\n" +
                 "• Polling is conservative: the engine spaces out usage checks per account.\n\n" +
                 "autodock is an independent project, not affiliated with or endorsed by Anthropic.\n\nEnable auto-switch?",
                 "autodock — auto-switch", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes;

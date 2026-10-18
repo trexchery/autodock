@@ -138,7 +138,8 @@ public sealed class DashboardForm : Form
     {
         ApplyTheme();
         _list.SuspendLayout();
-        foreach (Control c in _list.Controls) c.Dispose();
+        // Copy first: Dispose removes the control, so enumerating live would skip every other one.
+        foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
         _list.Controls.Clear();
         var sections = new List<(string Provider, Snapshot? Snap, string? Error)> { ("claude", snap, error) };
         sections.AddRange((others ?? []).Where(o => o.Snap is { Accounts.Count: > 0 } || o.Error != null));

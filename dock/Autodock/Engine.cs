@@ -22,11 +22,10 @@ public sealed partial class Engine(string exe)
         if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return new Engine(env);
         var bundled = Path.Combine(AppContext.BaseDirectory, "engine", "cswap.exe");
         if (File.Exists(bundled)) return new Engine(bundled);
-        var onPath = FindOnPath("cswap.exe");
-        if (onPath != null) return new Engine(onPath);
+        // No PATH fallback: an upstream claude-swap there lacks DPAPI sealing and providers.
         throw new EngineException(
-            "Engine not found. Expected engine\\cswap.exe next to autodock.exe " +
-            "(or set AUTODOCK_ENGINE).");
+            "Engine not found. Expected engine\\cswap.exe next to autodock.exe; " +
+            "reinstall autodock (developers: set AUTODOCK_ENGINE).");
     }
 
     internal static string? FindOnPath(string file) =>
@@ -34,6 +33,9 @@ public sealed partial class Engine(string exe)
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Select(d => Path.Combine(d.Trim('"'), file))
             .FirstOrDefault(File.Exists);
+
+    /// Absolute, so cmd is never resolved through the current directory or PATH.
+    internal static string Cmd => Path.Combine(Environment.SystemDirectory, "cmd.exe");
 
     public async Task<EngineResult> RunAsync(IEnumerable<string> args, TimeSpan? timeout = null, string? input = null, CancellationToken ct = default)
     {
@@ -154,13 +156,13 @@ public sealed partial class Engine(string exe)
         var wt = FindOnPath("wt.exe");
         var psi = wt != null
             ? new ProcessStartInfo(wt) { UseShellExecute = false }
-            : new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = false };
+            : new ProcessStartInfo(Cmd) { UseShellExecute = false, CreateNoWindow = false };
         if (wt != null)
         {
             // One argv item per token: wt re-joins them for cmd.exe, quoting only
             // what needs it. wt may hand the tab to an already-running Terminal process, which
             // ignores our WorkingDirectory: pass it explicitly.
-            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", "cmd.exe", "/k", Exe }.Concat(args))
+            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", Cmd, "/k", Exe }.Concat(args))
                 psi.ArgumentList.Add(a.Replace(";", "\\;")); // wt splits subcommands on a bare ';'
         }
         else
@@ -181,7 +183,19 @@ public sealed partial class Engine(string exe)
 
     // Defense in depth: the engine never prints tokens, but anything we surface
     // (balloons, dialogs, the dock log) goes through this first.
-    [GeneratedRegex(@"sk-ant-[A-Za-z0-9_\-]{6,}|(?i:bearer)\s+[A-Za-z0-9._\-]{12,}|(?i:""(access|refresh)_?token""\s*:\s*""[^""]*"")")]
+    [GeneratedRegex(@"sk-ant-[A-Za-z0-9_\-]{6,}"
+        + @"|(?i:bearer)\s+[A-Za-z0-9._\-]{12,}"
+        + @"|(?i:""(access|refresh|id)_?token""\s*:\s*""[^""]*"")"
+        + @"|(?i:(access|refresh|id)_?token[""']?\s*[=:]\s*(?:""[^""]*""|'[^']*'|[^\s""',;]+))"
+        + @"|(?i:(api_?key|secret|password)\w*[""']?\s*[=:]\s*(?:""[^""]*""|'[^']*'|[^\s""',;]+))"
+        + @"|\b(sk|xai)-[A-Za-z0-9_\-]{16,}"
+        + @"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"
+        + @"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"
+        + @"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+        + @"|xox[abprs]-[A-Za-z0-9-]{10,}"
+        + @"|AIza[0-9A-Za-z_\-]{30,}"
+        + @"|\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"
+        + @"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)")]
     private static partial Regex SecretPattern();
 
     public static string Redact(string s) => SecretPattern().Replace(s, "[redacted]");

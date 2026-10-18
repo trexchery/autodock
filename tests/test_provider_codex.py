@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from claude_swap import dpapi
+from claude_swap import dpapi, poll_policy
 from claude_swap.providers import codex
 
 SECRET = "SYNTHETIC-SECRET"
@@ -249,3 +249,29 @@ def test_list_sweeps_orphaned_run_home(env, capsys):
     run(capsys, "list")
     assert not (home / "auth.json").exists()
     assert codex._unseal_auth(1)["tokens"]["access_token"].endswith("-b2")
+
+
+def test_list_paces_network_fetches(env, capsys, monkeypatch):
+    home, calls = env
+    set_live(home, make_auth("a@example.com"))
+    run(capsys, "add-current")
+    codex._import(make_auth("b@example.com", account_id="acct-b", tag="b"))
+    codex._import(make_auth("c@example.com", account_id="acct-c", tag="c"))
+    monkeypatch.setattr(poll_policy, "USAGE_GAP_S", (2.0, 7.0))
+    monkeypatch.setattr(poll_policy.random, "uniform", lambda a, b: b)
+    monkeypatch.setattr(poll_policy.time, "sleep", calls.append)  # gaps land between requests
+    t = [1000.0]
+    monkeypatch.setattr(codex.time, "time", lambda: t[0])
+    seq = lambda: ["get" if isinstance(c, str) else c for c in calls]  # noqa: E731
+    run(capsys, "list")
+    assert seq() == ["get", 7.0, "get", 7.0, "get"]  # the first goes at once
+    run(capsys, "list")
+    assert len(calls) == 5  # all cached: no request, no wait
+    t[0] += 200
+    cache_path = codex.store_dir() / "cache.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache["b@example.com|acct-b"]["attemptAt"] = t[0]  # b fresh, a and c due
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    del calls[:]
+    run(capsys, "list")
+    assert seq() == ["get", 7.0, "get"]  # b's cache hit neither waits nor counts

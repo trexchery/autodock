@@ -80,19 +80,29 @@ public static class ClaudeCli
         return LoginInTempHomeAsync(engine, claude, ["auth", "login"], "CLAUDE_CONFIG_DIR", ".credentials.json", ["enroll"], null);
     }
 
+    internal static string EnrollRoot => Path.Combine(DockSettings.Dir, "enroll");
+
+    /// Deletes login dirs left behind when the tray exited or crashed mid-login.
+    /// Startup only: the single-instance mutex means no enrollment is running.
+    internal static void PurgeEnrollLeftovers(string root)
+    {
+        try { foreach (var d in Directory.GetDirectories(root)) try { Directory.Delete(d, recursive: true); } catch { } }
+        catch { } // best-effort; usually the folder doesn't exist
+    }
+
     /// Runs `exe args` in a visible console with `homeVar` pointing at a fresh,
     /// hardened temp dir, then `cswap <enrollArgs> <dir>`; the dir is always deleted.
     internal static async Task<string> LoginInTempHomeAsync(Engine engine, string exe, string[] args, string homeVar,
         string expectedFile, string[] enrollArgs, Action<string, ProcessStartInfo>? prepare)
     {
-        var root = Path.Combine(DockSettings.Dir, "enroll");
+        var root = EnrollRoot;
         StoreSecurity.Harden(root);
         var dir = Path.Combine(root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
         {
             var psi = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
-                ? new ProcessStartInfo("cmd.exe") { ArgumentList = { "/c", exe } }
+                ? new ProcessStartInfo(Engine.Cmd) { ArgumentList = { "/c", exe } }
                 : new ProcessStartInfo(exe);
             foreach (var a in args) psi.ArgumentList.Add(a);
             psi.UseShellExecute = false;

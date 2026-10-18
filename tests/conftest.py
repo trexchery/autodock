@@ -724,6 +724,13 @@ def _deterministic_poll_jitter(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_usage_gap(monkeypatch):
+    """Zero the gap between successive usage requests so the suite never
+    sleeps; the pacing tests restore ``USAGE_GAP_S`` and patch the sleep."""
+    monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", ())
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_colour(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 

@@ -115,7 +115,7 @@ public sealed class AccountRow : Control
         if (e.Y < Collapsed) ExpandRequested?.Invoke(this);
     }
 
-    void ShowMenu(Point at)
+    internal ContextMenuStrip ShowMenu(Point at)
     {
         var menu = new ContextMenuStrip();
         if (!_a.Active) menu.Items.Add("Switch to this account", null, (_, _) => SwitchClicked?.Invoke(_a));
@@ -137,8 +137,9 @@ public sealed class AccountRow : Control
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Remove…", null, (_, _) => MenuAction?.Invoke(_a, "remove"));
         MenuRenderer.Apply(menu);
-        menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
+        MenuRenderer.DisposeOnClose(menu);
         menu.Show(this, at);
+        return menu;
     }
 
     protected override void OnPaint(PaintEventArgs e)

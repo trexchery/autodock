@@ -2036,6 +2036,60 @@ class TestUsageFetchStamps:
         assert stamps["2"] is None
 
 
+class TestUsageFetchSpacing:
+    """`_run_usage_fetches`: the first request starts at once, each next one a
+    fresh random gap later (also across passes), and the whole pass stays
+    under the spread cap. Fresh rows never reach it (``UsageStore.reserve``
+    filters them)."""
+
+    def _sleeps(self, monkeypatch, n, draw, barrier=None, passes=1):
+        monkeypatch.setattr("claude_swap.poll_policy.USAGE_GAP_S", (2.0, 7.0))
+        monkeypatch.setattr("claude_swap.poll_policy.random.uniform", draw)
+        slept: list[float] = []
+        monkeypatch.setattr(
+            "claude_swap.switcher.time.sleep",
+            lambda s: (slept.append(s), barrier and barrier.wait()),
+        )
+        infos = [(i, f"a{i}@example.com", "", "", False, "", "") for i in range(1, n + 1)]
+        s = ClaudeAccountSwitcher()
+        out = []
+        with patch.object(s, "_fetch_account_usage", return_value=FetchRecord(error="timeout")):
+            for _ in range(passes):
+                assert len(s._run_usage_fetches(infos)) == n
+                out.append(sorted(slept))
+                slept.clear()
+        return out[0] if passes == 1 else out
+
+    def test_first_goes_at_once_then_random_gaps(self, temp_home, monkeypatch):
+        draws = iter([2.0, 7.0, 4.5, 3.0])
+        slept = self._sleeps(monkeypatch, 4, lambda a, b: next(draws))
+        assert slept == [2.0, 9.0, 13.5]  # offsets of requests 2-4; 1 never sleeps
+
+    def test_next_pass_waits_a_gap_after_the_last_launch(self, temp_home, monkeypatch):
+        # One auto tick runs baseline, escalation and consume-first passes
+        # back to back on one switcher.
+        draws = iter([2.0, 7.0, 4.5, 3.0])
+        first, second = self._sleeps(monkeypatch, 2, lambda a, b: next(draws), passes=2)
+        assert first == [2.0]
+        # pass 2 starts 7.0 after pass 1's last launch (at 2.0), then +4.5
+        assert second == [pytest.approx(9.0, abs=0.5), pytest.approx(13.5, abs=0.5)]
+
+    def test_spread_is_capped_and_every_offset_runs_at_once(self, temp_home, monkeypatch):
+        import threading
+
+        from claude_swap.poll_policy import USAGE_SPREAD_MAX_S
+
+        # 40 accounts outnumber the default pool (<= 32): every delayed task
+        # must be sleeping at the same time, or its offset starts late.
+        n = 40
+        slept = self._sleeps(
+            monkeypatch, n, lambda a, b: b,  # 39 x 7 s = 273 s raw
+            barrier=threading.Barrier(n - 1, timeout=5),
+        )
+        assert len(slept) == n - 1 and max(slept) == pytest.approx(USAGE_SPREAD_MAX_S)
+        assert USAGE_SPREAD_MAX_S <= 30.0
+
+
 class TestActiveAccountRefresh:
     """`_fetch_active_usage`: an expired active token is refreshed under
     Claude Code's own lock protocol — owner or no owner. CC 2.1.218 adopts an
