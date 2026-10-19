@@ -22,7 +22,7 @@ for each issue, in rank order (your order first, then urgent and bug labels, the
 4. autodock pushes the branch and opens a pull request (`For #36`).
 5. failing checks, merge conflicts and review comments on that pull request get another pass. a merged or closed pull request finishes the item.
 
-no new issue starts while two pull requests wait for your review; follow-ups on those always may.
+no new issue starts while ten pull requests wait for your review; follow-ups on those always may.
 
 when an issue needs your decision, its question is posted on the issue, autodock moves on to other work, and your reply there (or in the terminal) brings the issue back where it stopped.
 
