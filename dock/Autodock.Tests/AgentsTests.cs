@@ -91,11 +91,14 @@ public class AgentScheduleTests
     }
 
     [Fact]
-    public void TwoPullRequestsAwaitingReviewHoldNewWorkButNotFollowUps()
+    public void TenPullRequestsAwaitingReviewHoldNewWorkButNotFollowUps()
     {
-        var repo = new RepoAgents { Items = [Item("1"), Item("2", ItemState.Open, pr: 8), Item("3", ItemState.Open, pr: 9)] };
+        var repo = new RepoAgents { Items = [Item("1")] };
+        for (var n = 0; n < 10; n++)
+            repo.Items.Add(Item((n + 2).ToString(), ItemState.Open, pr: n + 8));
+        Assert.Equal(10, Supervisor.MaxOpenPrs);
         Assert.Null(Supervisor.Next(repo));
-        repo.Items[1].State = ItemState.Queued; // feedback on #8
+        repo.Items[1].State = ItemState.Queued; // feedback on the first PR
         Assert.Equal("2", Supervisor.Next(repo)!.Id);
         repo.Items[1].State = ItemState.Done; // merged
         Assert.Equal("1", Supervisor.Next(repo)!.Id);
@@ -106,7 +109,10 @@ public class AgentScheduleTests
     {
         var repo = new RepoAgents { Items = [Item("1", wt: @"C:\wt\1"), Item("2", ItemState.Open, pr: 8), Item("3", ItemState.Open, pr: 9), Item("4")] };
         repo.Items[0].Guidance = "formal";
-        Assert.Null(Supervisor.Next(repo));
+        Assert.Equal("1", Supervisor.Next(repo)!.Id); // two open PRs leave room
+        for (var n = 0; n < 8; n++)
+            repo.Items.Add(Item((n + 100).ToString(), ItemState.Open, pr: n + 100));
+        Assert.Null(Supervisor.Next(repo)); // ten open PRs block even resumed work
         repo.Items[2].State = ItemState.Done;
         Assert.Equal("1", Supervisor.Next(repo)!.Id);
     }

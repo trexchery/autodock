@@ -24,7 +24,7 @@ public sealed class AgentsException(string message) : Exception(message);
 /// time: a headless Claude Code run in the item's own git worktree and account profile, a fresh
 /// read-only review of the change, the repository's verification command, then a pushed branch and
 /// a pull request, which it watches for failing checks, conflicts and review comments. A question
-/// for the owner parks its item and work moves on; at most two pull requests wait for review.
+/// for the owner parks its item and work moves on; at most ten pull requests wait for review.
 /// No model supervises any of this, and it does nothing while nothing needs doing: one timer, armed
 /// only for the next real deadline. A repository works only while its agents terminal is open.
 ///
@@ -32,7 +32,7 @@ public sealed class AgentsException(string message) : Exception(message);
 /// UI thread); awaits are the only interleaving points.
 public sealed partial class Supervisor : IDisposable
 {
-    public const int MaxOpenPrs = 2, MaxFailures = 3, MaxFollowups = 3, MaxReviews = 2;
+    public const int MaxOpenPrs = 10, MaxFailures = 3, MaxFollowups = 3, MaxReviews = 2;
     /// Rank of work the owner named (prioritized issues, requests): above anything found by scanning.
     const int OwnerRank = 10_000;
     /// Claude's own safety classifier approves routine actions; anything else is denied, never asked.
@@ -257,7 +257,7 @@ public sealed partial class Supervisor : IDisposable
 
     /// The repository's next item: the one already under way, then pull request follow-ups, then new
     /// work by rank (answered questions first). Anything that would open another pull request waits
-    /// while two are waiting for review; follow-ups on those never wait.
+    /// while ten are waiting for review; follow-ups on those never wait.
     internal static WorkItem? Next(RepoAgents repo)
     {
         var ordered = repo.Items.Where(i => i.State == ItemState.Queued)

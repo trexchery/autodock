@@ -197,21 +197,15 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 12).State == ItemState.Open, "and to issue 12");
         Assert.Contains("Needs you: #10 Greeting tone: Should the greeting be formal?", await Tool("agents_status", "{}"));
 
-        // The owner answers on GitHub. The next scan brings #10 back, but two pull requests already
-        // wait for review: nothing new opens until one of them is merged.
+        // The owner answers on GitHub. Two open pull requests leave capacity for more work.
         Issues("""[{"number":10,"title":"Greeting tone","body":"[fake:blocked] Pick a tone.","labels":[],"assignees":[],"author":{"login":"owner"}},{"number":13,"title":"New","body":"","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
         await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
-        await Until(r => Item(r, 10).State == ItemState.Queued && Item(r, 10).Guidance != null, "the answer brings issue 10 back");
-        await Task.Delay(1500);
-        Assert.Equal(ItemState.Queued, await On(r => Item(r, 10).State));
-        Assert.Contains("Holding new work: 2 pull requests are waiting for review.", await Tool("agents_status", "{}"));
-
-        File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"MERGED"}""");
-        await Until(r => Item(r, 10).State == ItemState.Open, "after a merge, the answered issue reaches a pull request");
+        await Until(r => Item(r, 10).State == ItemState.Open, "the answered issue reaches a pull request without a merge");
         Assert.Contains("owner: Formal, please.", File.ReadAllText(_log + ".prompts"));
         Assert.Contains(Runs, r => r.Contains("--resume")); // in its own conversation
-        Assert.Equal(ItemState.Queued, await On(r => Item(r, 13).State)); // two waiting again
+        await Until(r => Item(r, 13).State == ItemState.Open, "the next issue also reaches a pull request");
+        Assert.DoesNotContain("Holding new work", await Tool("agents_status", "{}"));
         _sup!.Dispose();
     }
 
