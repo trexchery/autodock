@@ -95,12 +95,20 @@ class TestFileLock:
         lock.release()  # Should not raise
 
 
-def _hold_lock_process(lock_path: str, duration: float, ready_event, done_event):
-    """Helper function to hold a lock in a subprocess."""
+def _hold_lock_process(
+    lock_path: str, duration: float, ready_event, done_event, release_event=None
+):
+    """Helper function to hold a lock in a subprocess.
+
+    Holds for ``duration`` seconds, or until ``release_event`` is set if given.
+    """
     lock = FileLock(Path(lock_path))
     if lock.acquire(timeout=5.0):
         ready_event.set()  # Signal that lock is held
-        time.sleep(duration)
+        if release_event is None:
+            time.sleep(duration)
+        else:
+            release_event.wait(timeout=60.0)
         lock.release()
     done_event.set()
 
@@ -114,25 +122,27 @@ class TestFileLockConcurrency:
 
         ready_event = multiprocessing.Event()
         done_event = multiprocessing.Event()
+        release_event = multiprocessing.Event()
 
-        # Start process that holds the lock
+        # Start process that holds the lock until we release it, so a slow
+        # (spawned, loaded) child cannot make this race the holder.
         p = multiprocessing.Process(
             target=_hold_lock_process,
-            args=(str(lock_path), 2.0, ready_event, done_event),
+            args=(str(lock_path), 0.0, ready_event, done_event, release_event),
         )
         p.start()
+        try:
+            # Wait for the subprocess to acquire the lock
+            assert ready_event.wait(timeout=60.0), "holder never acquired the lock"
 
-        # Wait for the subprocess to acquire the lock
-        ready_event.wait(timeout=5.0)
+            # Now try to acquire - should fail fast
+            lock = FileLock(lock_path)
+            result = lock.acquire(timeout=0.5)
 
-        # Now try to acquire - should fail fast
-        lock = FileLock(lock_path)
-        result = lock.acquire(timeout=0.5)
-
-        assert result is False
-
-        # Clean up
-        p.join(timeout=5.0)
+            assert result is False
+        finally:
+            release_event.set()
+            p.join(timeout=10.0)
         if p.is_alive():
             p.terminate()
 
@@ -151,8 +161,8 @@ class TestFileLockConcurrency:
         p.start()
 
         # Wait for subprocess to finish
-        done_event.wait(timeout=5.0)
-        p.join(timeout=5.0)
+        assert done_event.wait(timeout=60.0), "holder never finished"
+        p.join(timeout=10.0)
 
         # Now we should be able to acquire
         lock = FileLock(lock_path)

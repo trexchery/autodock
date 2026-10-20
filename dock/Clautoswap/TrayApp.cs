@@ -17,7 +17,8 @@ public sealed partial class TrayApp : ApplicationContext
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
     string? _lastBlockedNotice;
-    readonly Dictionary<string, DateTime> _resumed = []; // session id → when it was last reopened
+    readonly Dictionary<string, DateTime> _resumed = ResumeStopped.LoadMoves(MovesPath); // session id → when it was last reopened
+    double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
@@ -33,7 +34,7 @@ public sealed partial class TrayApp : ApplicationContext
         _menu.Opening += (_, _) => BuildMenu();
 
         _dash.SwitchRequested += a => _ = SwitchAsync(a);
-        _dash.TerminalRequested += a => OpenTerminal(a, null);
+        _dash.TerminalRequested += a => _ = AccountActionAsync(a, "terminal-folder");
         _dash.AccountAction += (a, act) => _ = AccountActionAsync(a, act);
         _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
         _dash.SettingsRequested += () => _ = ShowSettingsAsync();
@@ -213,34 +214,50 @@ public sealed partial class TrayApp : ApplicationContext
         }
     }
 
-    /// Reopens windows stopped at a usage limit (see ResumeStopped) on an account with room.
+    /// Reopens windows stopped at a usage limit, and moves `cswap run` windows whose account reached the
+    /// switch threshold once their turn is done (see ResumeStopped), onto an account with room.
     async Task ResumeStoppedAsync(Snapshot snap)
     {
         List<StoppedSession> stopped;
         try { stopped = await Task.Run(() => ResumeStopped.Scan(ResumeStopped.ConfigDirs(snap.ActiveAccountNumber), DateTime.UtcNow)); }
         catch (Exception e) { Program.Log(e); return; }
-        var done = new List<string>();
+        if (stopped.Count > 0 && _engineThreshold == null) await ReadEngineThresholdAsync();
+        var (threshold, hysteresis) = (_engineThreshold ?? 90, _engineHysteresis ?? 10);
+        var resumed = new List<string>();
+        var moved = new List<string>();
         foreach (var s in stopped)
         {
-            // One try per session per ten minutes: a reopened window that stops again waits for room, not a loop.
+            // The default login switches account in place; only a stop at the limit reopens its windows.
+            // A finished turn waits until nobody is at the keyboard, so a prompt being typed is never closed.
+            if (!s.AtLimit && (s.ConfigDir == ResumeStopped.DefaultDir || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60))) continue;
+            // One try per session per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             if (_resumed.TryGetValue(s.SessionId, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10)) continue;
-            if (ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null) is not { } target) continue;
+            if (ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis) is not { } target) continue;
+            if (!ResumeStopped.Unchanged(s)) continue; // someone typed, or a turn started, since the scan
             var account = snap.Accounts.First(a => a.Number == target);
             var dir = account.Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(target)!;
             _resumed[s.SessionId] = DateTime.UtcNow;
+            try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
             try
             {
+                // Copied before the window closes (a failed copy leaves it untouched), then again after claude
+                // exits so nothing it writes on the way out is left behind.
                 await Task.Run(() => ResumeStopped.CopyTranscript(s, dir));
                 await ResumeStopped.CloseAsync(s.Pid);
-                _engine.LaunchConsole($"Claude · {account.ShortName} · resumed", s.Cwd,
-                    Launch.Run(target, _settings.PreserveRemoteControl, "--resume", s.SessionId, ResumeStopped.Prompt(target != s.Account)));
-                done.Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{target}");
+                try { await Task.Run(() => ResumeStopped.CopyTranscript(s, dir)); } catch (Exception e) { Program.Log(e); }
+                _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
+                    Launch.Run(target, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, target != s.Account)));
+                (s.AtLimit ? resumed : moved).Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{target}");
             }
             catch (Exception e) { Program.Log(e); Error("Could not reopen a stopped window", e); }
         }
-        if (done.Count > 0)
-            Notify(done.Count == 1 ? "Reopened a window stopped at a limit" : $"Reopened {done.Count} windows stopped at a limit", string.Join(", ", done));
+        if (resumed.Count > 0)
+            Notify(resumed.Count == 1 ? "Reopened a window stopped at a limit" : $"Reopened {resumed.Count} windows stopped at a limit", string.Join(", ", resumed));
+        if (moved.Count > 0)
+            Notify(moved.Count == 1 ? "Moved a window before its limit" : $"Moved {moved.Count} windows before their limit", string.Join(", ", moved));
     }
+
+    static string MovesPath => Path.Combine(DockSettings.Dir, "resumed.json");
 
     static string Name(AccountRef? r) => r == null ? "(none)" : $"#{r.Number} {r.Email}";
 
@@ -447,7 +464,7 @@ public sealed partial class TrayApp : ApplicationContext
                     await ContinueAsync(a.Provider, action["continue:".Length..]);
                     return;
                 case "terminal-folder":
-                    if (PickFolder($"Open a terminal as #{a.Number} in…") is { } f)
+                    if (PickFolder($"Open a terminal as #{a.Number} in…", _settings.TerminalFolder ?? StoreSecurity.UserProfile) is { } f)
                         OpenTerminal(a.Provider == "claude" ? MappedAccount(f) ?? a : a, f);
                     return;
                 case "map":
@@ -585,6 +602,7 @@ public sealed partial class TrayApp : ApplicationContext
         f.Startup.Checked = Startup.IsEnabled();
         f.PreserveRc.Checked = _settings.PreserveRemoteControl;
         f.AutoProject.Checked = _settings.AutoProjectAccount;
+        f.TerminalFolder.Text = _settings.TerminalFolder ?? "";
         f.QuotaNotify.Checked = _settings.QuotaNotifications;
         f.AutoPrime.Checked = _settings.AutoPrime;
         f.AgentIssues.Value = Math.Clamp(_settings.AgentIssues, (int)f.AgentIssues.Minimum, (int)f.AgentIssues.Maximum);
@@ -604,6 +622,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.RefreshSeconds = (int)f.RefreshInterval.Value;
             _settings.PreserveRemoteControl = f.PreserveRc.Checked;
             _settings.AutoProjectAccount = f.AutoProject.Checked;
+            _settings.TerminalFolder = f.TerminalFolder.Text.Trim() is { Length: > 0 } tf ? tf : null;
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
             _settings.QuotaNotifications = f.QuotaNotify.Checked;
             _settings.AutoPrime = f.AutoPrime.Checked;
@@ -618,9 +637,10 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e) { Error("Could not save settings", e); }
     }
 
-    static string? PickFolder(string description)
+    static string? PickFolder(string description, string? start = null)
     {
         using var d = new FolderBrowserDialog { Description = description, UseDescriptionForTitle = true };
+        if (Directory.Exists(start)) d.InitialDirectory = start;
         return d.ShowDialog() == DialogResult.OK ? d.SelectedPath : null;
     }
 

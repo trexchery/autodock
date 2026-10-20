@@ -6,6 +6,7 @@ public sealed class SettingsForm : Form
     public readonly NumericUpDown Threshold = new() { Minimum = 50, Maximum = 99, Value = 90 };
     public readonly NumericUpDown RefreshInterval = new() { Minimum = DockSettings.MinRefreshSeconds, Maximum = 3600, Increment = 30, Value = 180 };
     public readonly TextBox Models = new() { PlaceholderText = "none" };
+    public readonly TextBox TerminalFolder = new() { PlaceholderText = "your user folder" };
     public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     public readonly Toggle Startup = new("");
     public readonly Toggle PreserveRc = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new("");
@@ -38,6 +39,7 @@ public sealed class SettingsForm : Form
         Row("Start with Windows", null, Startup, Ui.S(34));
         Row("Refresh every", null, RefreshInterval, Ui.S(72), "s");
         Row("Preserve Remote Control", "New terminals turn Remote Control back on only if their last session used it", PreserveRc, Ui.S(34));
+        Row("Terminal folder", "Where Open terminal starts browsing", TerminalFolderPicker(), Ui.S(200));
         Row("Use project accounts automatically", "Terminals and Continue in use the account assigned to the folder", AutoProject, Ui.S(34));
         Row("Quota notifications", "When a limit is near, reached or reset", QuotaNotify, Ui.S(34));
         Row("Auto-Prime", "Track 5-hour windows; prime fresh ones early from the tray menu, and automatically while agents run", AutoPrime, Ui.S(34));
@@ -98,6 +100,26 @@ public sealed class SettingsForm : Form
         if (suffix != null)
             Controls.Add(new Label { Text = suffix, Tag = "muted", AutoSize = true, Location = new Point(right + Ui.S(6), _y + Ui.S(3)) });
         _y += Math.Max(Math.Max(hintHeight, Ui.S(20)), input.Height) + Ui.S(14);
+    }
+
+    /// The terminal folder box with its Browse button; an empty box means the user folder.
+    Control TerminalFolderPicker()
+    {
+        var browse = new Pill("…") { Width = Ui.S(32) };
+        var panel = new Panel { Height = Math.Max(TerminalFolder.PreferredHeight, browse.Height) };
+        panel.Layout += (_, _) =>
+        {
+            browse.Location = new Point(panel.Width - browse.Width, 0);
+            TerminalFolder.Width = panel.Width - browse.Width - Ui.S(6);
+        };
+        browse.Click += (_, _) =>
+        {
+            using var d = new FolderBrowserDialog { Description = "Open terminal starts browsing in…", UseDescriptionForTitle = true };
+            if (Directory.Exists(TerminalFolder.Text)) d.InitialDirectory = TerminalFolder.Text;
+            if (d.ShowDialog(this) == DialogResult.OK) TerminalFolder.Text = d.SelectedPath;
+        };
+        panel.Controls.AddRange([TerminalFolder, browse]);
+        return panel;
     }
 
     /// Engine values for the strategy picker.

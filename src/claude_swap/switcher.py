@@ -5683,7 +5683,7 @@ class ClaudeAccountSwitcher:
                 groups: dict[tuple[str, str], dict[str, int]] = {}
                 for session in sessions:
                     label = entrypoint_label(session.entrypoint)
-                    cwd = abbreviate_path(session.cwd)
+                    cwd = abbreviate_path(session.cwd) if session.cwd else "(folder unknown)"
                     key = (label, cwd)
                     counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                     counts["sessions"] += 1

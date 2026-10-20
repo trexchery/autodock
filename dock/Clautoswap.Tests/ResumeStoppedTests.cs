@@ -67,6 +67,181 @@ public class ResumeStoppedTests
         }
         finally { Directory.Delete(root, true); }
     }
+
+    const string ToolCall = """{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}""";
+    const string ToolResult = """{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}""";
+
+    [Fact]
+    public void FinishedReplyEndsTheTurn()
+    {
+        Assert.True(ResumeStopped.EndsTurn([Typed, ToolCall, ToolResult, Done, Meta]));
+        Assert.True(ResumeStopped.EndsTurn(["{\"type\":\"assis", Done])); // a line cut by the tail window is skipped
+    }
+
+    [Fact]
+    public void SlashCommandsAfterTheReplyStillEndTheTurn() =>
+        Assert.True(ResumeStopped.EndsTurn([Done,
+            """{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}""",
+            """{"type":"user","message":{"role":"user","content":"<command-name>/usage</command-name>"}}""",
+            """{"type":"user","message":{"role":"user","content":"<local-command-stdout>83% used</local-command-stdout>"}}""",
+            """{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}"""]));
+
+    [Fact]
+    public void RunningOrCutOffTurnsDoNotEnd()
+    {
+        Assert.False(ResumeStopped.EndsTurn([Done, Typed]));            // a message waiting for its answer
+        Assert.False(ResumeStopped.EndsTurn([Typed, ToolCall]));        // a tool call still open
+        Assert.False(ResumeStopped.EndsTurn([ToolCall, ToolResult]));   // the reply to a tool not written yet
+        Assert.False(ResumeStopped.EndsTurn([Done, Limit]));            // stopped at the limit: the other path
+        Assert.False(ResumeStopped.EndsTurn([
+            """{"type":"assistant","message":{"role":"assistant","stop_reason":"max_tokens","content":[{"type":"text","text":"cut"}]}}"""]));
+        Assert.False(ResumeStopped.EndsTurn([Meta]));
+        Assert.False(ResumeStopped.EndsTurn([]));
+    }
+
+    static StoppedSession Done3 => On(3) with { AtLimit = false };
+
+    [Fact]
+    public void FinishedTurnMovesOnlyOnceItsAccountReachesTheThreshold()
+    {
+        Assert.Null(ResumeStopped.Target(Done3, [A(1, 0), A(3, 89)], _ => true, threshold: 90, hysteresis: 10));
+        Assert.Equal(1, ResumeStopped.Target(Done3, [A(1, 0), A(3, 90)], _ => true, threshold: 90, hysteresis: 10));
+    }
+
+    [Fact]
+    public void FinishedTurnTargetIsBelowTheThresholdByTheHysteresis()
+    {
+        // 85 is below the line but only 7 points better: no move, or two near-full accounts would trade the window.
+        Assert.Null(ResumeStopped.Target(Done3, [A(1, 85), A(2, 95), A(3, 92)], _ => true, threshold: 90, hysteresis: 10));
+        Assert.Equal(4, ResumeStopped.Target(Done3, [A(1, 85), A(3, 92), A(4, 60), A(5, 20)], n => n != 5, threshold: 90, hysteresis: 10));
+    }
+
+    [Fact]
+    public void FinishedTurnStaysWhenItsOwnUsageIsUnreadable()
+    {
+        Assert.Null(ResumeStopped.Target(Done3, [A(1, 0), A(3, 95, status: "token_expired")], _ => true, threshold: 90, hysteresis: 10));
+        Assert.Null(ResumeStopped.Target(Done3 with { Account = null }, [A(1, 0)], _ => true, threshold: 90, hysteresis: 10));
+    }
+
+    [Fact]
+    public void LimitStopIgnoresTheThreshold() // hard-limit recovery: any room at all will do
+        => Assert.Equal(1, ResumeStopped.Target(On(3), [A(1, 95), A(3, 100)], _ => true, threshold: 90, hysteresis: 10));
+
+    [Fact]
+    public void FinishedTurnReopensWithoutAPrompt()
+    {
+        Assert.Equal(["--resume", "id"], ResumeStopped.ResumeArgs(Done3, moved: true));
+        Assert.Equal(["--resume", "id", ResumeStopped.Prompt(true)], ResumeStopped.ResumeArgs(On(3), moved: true));
+    }
+
+    [Fact]
+    public void CheckpointsAndTodosMoveWithTheTranscript()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var a = Path.Combine(root, "a");
+            var src = Path.Combine(a, "projects", "C--w");
+            Directory.CreateDirectory(src);
+            File.WriteAllText(Path.Combine(src, "sid.jsonl"), Done);
+            Directory.CreateDirectory(Path.Combine(a, "file-history", "sid"));
+            File.WriteAllText(Path.Combine(a, "file-history", "sid", "abc@v1"), "old");
+            Directory.CreateDirectory(Path.Combine(a, "todos"));
+            File.WriteAllText(Path.Combine(a, "todos", "sid-agent-sid.json"), "[]");
+            File.WriteAllText(Path.Combine(a, "todos", "other-agent-other.json"), "[]");
+            ResumeStopped.CopyTranscript(new StoppedSession(1, "sid", @"C:\w", a, 3, Path.Combine(src, "sid.jsonl")), Path.Combine(root, "b"));
+            Assert.Equal("old", File.ReadAllText(Path.Combine(root, "b", "file-history", "sid", "abc@v1")));
+            Assert.True(File.Exists(Path.Combine(root, "b", "todos", "sid-agent-sid.json")));
+            Assert.False(File.Exists(Path.Combine(root, "b", "todos", "other-agent-other.json")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void AnyChangeSinceTheScanCancelsTheMove()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var t = Path.Combine(root, "sid.jsonl");
+            var rec = Path.Combine(root, "1.json");
+            File.WriteAllText(t, Done);
+            File.WriteAllText(rec, """{"status":"idle"}""");
+            var s = new StoppedSession(1, "sid", root, root, 3, t, false, rec, File.GetLastWriteTimeUtc(t));
+            Assert.True(ResumeStopped.Unchanged(s));
+            File.WriteAllText(rec, """{"status":"busy"}""");
+            Assert.False(ResumeStopped.Unchanged(s));
+            File.WriteAllText(rec, """{"status":"idle"}""");
+            File.AppendAllText(t, "\n" + Typed);
+            File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(1));
+            Assert.False(ResumeStopped.Unchanged(s));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void MoveGuardSurvivesARestartAndForgetsOldEntries()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var path = Path.Combine(root, "sub", "resumed.json");
+            var now = new DateTime(2026, 10, 20, 12, 0, 0, DateTimeKind.Utc);
+            ResumeStopped.SaveMoves(path, new() { ["new"] = now.AddMinutes(-5), ["old"] = now.AddDays(-2) }, now);
+            var back = ResumeStopped.LoadMoves(path);
+            Assert.Equal(["new"], back.Keys);
+            Assert.Equal(now.AddMinutes(-5), back["new"].ToUniversalTime());
+            File.WriteAllText(path, "not json");
+            Assert.Empty(ResumeStopped.LoadMoves(path));
+            Assert.Empty(ResumeStopped.LoadMoves(Path.Combine(root, "missing.json")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// The whole move on real files and a real process named claude: scan finds the finished turn on the
+    /// account at the threshold, picks the target, closes the window, and the target profile can resume it.
+    [Fact]
+    public async Task FinishedTurnAtTheThresholdMovesEndToEnd()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        var exe = Path.Combine(root, "claude.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), exe);
+        using var claude = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, "-n 120 127.0.0.1")
+            { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
+        try
+        {
+            var from = Path.Combine(root, "sessions", "3-c_example.com");
+            var to = Path.Combine(root, "sessions", "1-a_example.com");
+            var project = Path.Combine(from, "projects", "C--w");
+            Directory.CreateDirectory(project);
+            Directory.CreateDirectory(Path.Combine(from, "sessions"));
+            Directory.CreateDirectory(to);
+            var transcript = Path.Combine(project, "sid.jsonl");
+            File.WriteAllLines(transcript, [Typed, ToolCall, ToolResult, Done]);
+            var record = Path.Combine(from, "sessions", $"{claude.Id}.json");
+            File.WriteAllText(record, $$"""{"pid":{{claude.Id}},"sessionId":"sid","cwd":"C:\\w","status":"idle","kind":"interactive"}""");
+            var now = File.GetLastWriteTimeUtc(transcript).AddMinutes(1);
+
+            var busy = ResumeStopped.Scan([(from, 3)], File.GetLastWriteTimeUtc(transcript)); // not quiet yet
+            Assert.Empty(busy);
+            var s = Assert.Single(ResumeStopped.Scan([(from, 3)], now));
+            Assert.False(s.AtLimit);
+            Assert.Equal(1, ResumeStopped.Target(s, [A(1, 20), A(3, 93)], _ => true, threshold: 90, hysteresis: 10));
+            Assert.True(ResumeStopped.Unchanged(s));
+
+            await ResumeStopped.CloseAsync(s.Pid);
+            Assert.True(claude.HasExited);
+            ResumeStopped.CopyTranscript(s, to);
+            Assert.Equal(File.ReadAllText(transcript), File.ReadAllText(Path.Combine(to, "projects", "C--w", "sid.jsonl")));
+            Assert.Equal(["run", "1", "--", "--resume", "sid"], Launch.Run(1, false, ResumeStopped.ResumeArgs(s, moved: true)));
+        }
+        finally
+        {
+            if (!claude.HasExited) claude.Kill();
+            claude.WaitForExit();
+            Directory.Delete(root, true);
+        }
+    }
 }
 
 /// Read-only scan of this machine's real Claude windows; set CLAUTOSWAP_LIVE_SCAN=1. Passes trivially otherwise.

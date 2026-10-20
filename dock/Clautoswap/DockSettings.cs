@@ -22,6 +22,7 @@ public sealed class DockSettings
     public int AgentOpenPrs { get; set; } = 10;
     public bool AgentDraftPrs { get; set; }
     public DateTimeOffset? AgentSummaryAt { get; set; }
+    public string? TerminalFolder { get; set; } // where "Open terminal" starts browsing; null: the user folder
 
     public const int MinRefreshSeconds = 60;
 

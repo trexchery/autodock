@@ -368,6 +368,26 @@ class TestListSessions:
         assert len(result) == 1
         assert result[0].pid == 1001
 
+    def test_counts_keyed_sessions_without_record(self, tmp_path):
+        """A live claude may leave only `{pid}.<hash>.key` (seen with --resume);
+        it still counts. A pid that started after its key was written is recycled."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 1001)
+        for pid in (1001, 1002, 1003):
+            (sessions_dir / f"{pid}.{'ab' * 32}.key").write_text("synthetic")
+        key_time = (sessions_dir / f"1003.{'ab' * 32}.key").stat().st_mtime
+
+        def started(pid):
+            return key_time + 3600 if pid == 1003 else key_time - 60
+
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), \
+             patch("claude_swap.process_detection._started_epoch", side_effect=started):
+            result = list_sessions(tmp_path)
+
+        assert sorted(s.pid for s in result) == [1001, 1002]
+        assert next(s for s in result if s.pid == 1002).cwd == ""
+
     def test_filters_recycled_pids(self, tmp_path):
         """A crashed claude's record survives it; the OS may hand its pid to
         something else. Only a process that started when the record says its

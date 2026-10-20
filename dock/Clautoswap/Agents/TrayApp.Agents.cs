@@ -41,16 +41,20 @@ public sealed partial class TrayApp
         _agents.Poke();
     }
 
-    /// Runs use the engine's own auto-switch threshold and strategy, so both agree on "near the limit".
+    /// Runs and window moves use the engine's own auto-switch threshold and strategy, so all agree on "near the limit".
     async Task ReadEngineThresholdAsync()
     {
-        if (_agents == null) return;
         try
         {
             var cfg = await _engine.ConfigAsync();
             if (double.TryParse(cfg.GetValueOrDefault("autoswitch.threshold"), NumberStyles.Float, CultureInfo.InvariantCulture, out var t))
-                _agents.Config.Threshold = t;
-            _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";
+            {
+                _engineThreshold = t;
+                if (_agents != null) _agents.Config.Threshold = t;
+            }
+            if (double.TryParse(cfg.GetValueOrDefault("autoswitch.hysteresisPct"), NumberStyles.Float, CultureInfo.InvariantCulture, out var h))
+                _engineHysteresis = h;
+            if (_agents != null) _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";
         }
         catch (Exception e) when (e is EngineException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException) { }
     }

@@ -5,13 +5,17 @@ using System.Text.Json;
 
 namespace Clautoswap;
 
-/// A Claude Code window that stopped on a usage-limit error and is waiting for someone to type.
-public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript);
+/// A Claude Code window waiting for someone to type: stopped on a usage-limit error (`AtLimit`), or done
+/// with its turn. `Record` and `Seen` (the transcript's write time) let the move check nothing changed since.
+public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
+    bool AtLimit = true, string? Record = null, DateTime Seen = default);
 
 /// With auto-switch on: windows stopped at a limit are reopened (`claude --resume`) on an account with
-/// room, the default login's own when it has some again, so their work carries on unattended.
-/// Only an idle session whose transcript ends on the limit error and has been quiet a while is touched:
-/// nothing that is working, or that someone has typed into since, is ever stopped.
+/// room, the default login's own when it has some again, so their work carries on unattended. A `cswap run`
+/// window whose account is at the switch threshold is moved the same way once its turn is done, before the
+/// limit stops it. (The default login needs no move: the engine switches its account in place.)
+/// Only an idle session, quiet a while, is touched: nothing that is working, or that someone has typed
+/// into since, is ever stopped.
 public static class ResumeStopped
 {
     /// A reading at or above this is no room: the engine's own at-limit line.
@@ -20,6 +24,11 @@ public static class ResumeStopped
     public static string Prompt(bool moved) =>
         "This session stopped at a usage limit and clautoswap reopened it" + (moved ? " on another account" : " now that the limit has reset") +
         ". Continue exactly where you left off.";
+
+    /// Claude args that reopen `s` on another account: a stopped turn is told to carry on, a finished one
+    /// just waits for its user again.
+    public static string[] ResumeArgs(StoppedSession s, bool moved) =>
+        s.AtLimit ? ["--resume", s.SessionId, Prompt(moved)] : ["--resume", s.SessionId];
 
     public static string DefaultDir => Path.Combine(StoreSecurity.UserProfile, ".claude");
     static string ProfilesDir => Path.Combine(StoreSecurity.BackupRoot, "sessions");
@@ -57,8 +66,11 @@ public static class ResumeStopped
                     var pid = pidEl.GetInt32();
                     if (!IsLiveClaude(pid, Str(r, "procStart"))) continue;
                     if (TranscriptOf(dir, id) is not { } t) continue;
-                    if (nowUtc - File.GetLastWriteTimeUtc(t) < Quiet) continue;
-                    if (EndsAtLimit(Tail(t))) found.Add(new StoppedSession(pid, id, cwd, dir, account, t));
+                    var seen = File.GetLastWriteTimeUtc(t);
+                    if (nowUtc - seen < Quiet) continue;
+                    var tail = Tail(t).ToList();
+                    if (EndsAtLimit(tail) || EndsTurn(tail))
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, EndsAtLimit(tail), rec, seen));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
@@ -87,15 +99,90 @@ public static class ResumeStopped
         return false;
     }
 
-    /// The account to reopen on: the session's own once it has room again, else the one with the most room
-    /// (not excluded, usage readable) whose profile exists, or the default login. Null: nowhere has room yet.
-    public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile)
+    /// Whether the conversation's last message is Claude's own finished reply: no tool call left open, no
+    /// error, nobody's message after it. A turn still running, or one cut off, never matches.
+    public static bool EndsTurn(IEnumerable<string> lines)
     {
-        bool Room(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Format.Peak(a) < Full;
-        if (accounts.FirstOrDefault(a => a.Number == s.Account) is { } own && Room(own)) return own.Number;
+        foreach (var line in lines.Reverse())
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var r = doc.RootElement;
+                var type = Str(r, "type");
+                if (type is not ("assistant" or "user") || type == "user" && IsLocal(r)) continue;
+                if (type == "user" || r.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True) return false;
+                if (!r.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object) return false;
+                if (Str(m, "stop_reason") is "tool_use" or "max_tokens" or "pause_turn") return false;
+                return !m.TryGetProperty("content", out var c) || c.ValueKind != JsonValueKind.Array
+                    || !c.EnumerateArray().Any(b => b.ValueKind == JsonValueKind.Object && Str(b, "type") is "tool_use" or "server_tool_use");
+            }
+            catch (JsonException) { } // a line cut by the tail window, or one being written
+        }
+        return false;
+    }
+
+    /// A user line Claude never answers: a local slash command (/usage, /model…), its output, or a /compact summary.
+    static bool IsLocal(JsonElement r) =>
+        r.TryGetProperty("isMeta", out var meta) && meta.ValueKind == JsonValueKind.True
+        || r.TryGetProperty("isCompactSummary", out var cs) && cs.ValueKind == JsonValueKind.True
+        || r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text
+           && (text.StartsWith("<command-name>") || text.StartsWith("<local-command-"));
+
+    /// How long since the last keyboard or mouse input anywhere in this session. A finished turn is only
+    /// moved after a quiet spell, so a prompt someone is still typing is never closed under them.
+    public static TimeSpan UserIdle()
+    {
+        var info = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
+        return GetLastInputInfo(ref info) ? TimeSpan.FromMilliseconds(unchecked((uint)Environment.TickCount - info.dwTime)) : TimeSpan.Zero;
+    }
+
+    /// The account to reopen on. Stopped at a limit: the session's own once it has room again, else the one
+    /// with the most room (not excluded, usage readable) whose profile exists, or the default login.
+    /// Done with a turn: only when its own account reads at or above `threshold`, onto one below it by at
+    /// least `hysteresis` points, so two accounts near the line never trade a window back and forth.
+    /// Null: stay put (nowhere has room yet, or no move is due).
+    public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
+        double threshold = Full, double hysteresis = 0)
+    {
+        bool Read(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null;
+        bool Room(Account a) => Read(a) && Format.Peak(a) < Full;
+        var own = accounts.FirstOrDefault(a => a.Number == s.Account);
+        if (s.AtLimit && own != null && Room(own)) return own.Number;
+        if (!s.AtLimit && (own == null || !Read(own) || Format.Peak(own) < threshold)) return null;
         return accounts.Where(a => a.Number != s.Account && Room(a) && (a.Active || hasProfile(a.Number)))
+            .Where(a => s.AtLimit || Format.Peak(a) < threshold && Format.Peak(own!) - Format.Peak(a) >= hysteresis)
             .OrderBy(Format.Peak).ThenByDescending(a => a.Active)
             .Select(a => (int?)a.Number).FirstOrDefault();
+    }
+
+    /// Whether `s` is exactly as the scan saw it: still idle, transcript untouched. Checked right before the
+    /// window is closed, so a turn started (or a message sent) since the scan is never cut off.
+    public static bool Unchanged(StoppedSession s)
+    {
+        try
+        {
+            if (File.GetLastWriteTimeUtc(s.Transcript) != s.Seen) return false;
+            if (s.Record == null) return true;
+            using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
+            return Str(doc.RootElement, "status") == "idle";
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
+    }
+
+    /// When each session was last reopened, kept across tray restarts so a restart never re-arms a move.
+    public static Dictionary<string, DateTime> LoadMoves(string path)
+    {
+        try { return JsonSerializer.Deserialize<Dictionary<string, DateTime>>(File.ReadAllText(path)) ?? []; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return []; }
+    }
+
+    /// Saves `moves`, dropping entries a day old: by then no guard needs them.
+    public static void SaveMoves(string path, Dictionary<string, DateTime> moves, DateTime nowUtc)
+    {
+        foreach (var k in moves.Where(m => nowUtc - m.Value > TimeSpan.FromDays(1)).Select(m => m.Key).ToList()) moves.Remove(k);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(moves));
     }
 
     public static string? ProfileDir(int account)
@@ -104,7 +191,8 @@ public static class ResumeStopped
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
 
-    /// Copies the transcript (and its subagents/tool-results folder) into `targetDir`, where `--resume` finds it.
+    /// Copies the transcript (and its subagents/tool-results folder), file checkpoints and todos into
+    /// `targetDir`, where `--resume` finds them.
     public static void CopyTranscript(StoppedSession s, string targetDir)
     {
         if (Path.GetFullPath(targetDir).TrimEnd('\\').Equals(Path.GetFullPath(s.ConfigDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return;
@@ -114,6 +202,15 @@ public static class ResumeStopped
         File.Copy(s.Transcript, Path.Combine(dest, Path.GetFileName(s.Transcript)), overwrite: true);
         var extra = Path.Combine(Path.GetDirectoryName(s.Transcript)!, s.SessionId);
         if (Directory.Exists(extra)) CopyDir(extra, Path.Combine(dest, s.SessionId));
+        var history = Path.Combine(s.ConfigDir, "file-history", s.SessionId);
+        if (Directory.Exists(history)) CopyDir(history, Path.Combine(targetDir, "file-history", s.SessionId));
+        var todos = Path.Combine(s.ConfigDir, "todos");
+        if (Directory.Exists(todos))
+            foreach (var f in Directory.GetFiles(todos, s.SessionId + "*.json"))
+            {
+                Directory.CreateDirectory(Path.Combine(targetDir, "todos"));
+                File.Copy(f, Path.Combine(targetDir, "todos", Path.GetFileName(f)), overwrite: true);
+            }
     }
 
     /// Ends the stopped claude, lets a `cswap run` wrapper around it exit on its own (it seals the profile's
@@ -127,7 +224,12 @@ public static class ResumeStopped
             if (name is not ("cswap" or "cmd" or "powershell" or "pwsh")) break;
             chain.Add((parent, name));
         }
-        using (var claude = Process.GetProcessById(pid)) { claude.Kill(); await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
+        using (var claude = Process.GetProcessById(pid))
+        {
+            claude.Kill();
+            try { await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
+            catch (OperationCanceledException) { } // slow to go: the window is still reopened
+        }
         foreach (var (p, name) in chain)
         {
             try
@@ -217,4 +319,9 @@ public static class ResumeStopped
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool Process32First(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Process32Next(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LASTINPUTINFO { public uint cbSize, dwTime; }
+
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
 }
