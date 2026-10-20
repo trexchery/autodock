@@ -342,6 +342,8 @@ public sealed partial class Supervisor
         item.State = ItemState.Done;
         item.Note = how;
         item.Followup = null;
+        // A verification still running there would keep the worktree from going, and run on for nothing.
+        if (_verifying.Remove(item, out var v)) await v.Proc.StopAsync(TimeSpan.FromSeconds(5));
         if (item.Worktree is { } wt)
         {
             await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
@@ -388,10 +390,12 @@ public sealed partial class Supervisor
 
         // Closed issues: unstarted and parked work goes, and so does work under way that has no pull
         // request yet. A full page may not list every open issue, so only a complete list counts.
+        bool Gone(WorkItem i) => i.Issue is { } n && !open.Contains(n) && i.State != ItemState.Checking
+                                 && (i.State == ItemState.Done ? i.Worktree == null : i.Pr == null);
         if (issues.Count < 100)
-            foreach (var gone in repo.Items.Where(i => i.Issue is { } n && !open.Contains(n) && i.State != ItemState.Checking
-                         && (i.State == ItemState.Done ? i.Worktree == null : i.Pr == null)).ToList())
+            foreach (var gone in repo.Items.Where(Gone).ToList())
             {
+                if (!Gone(gone)) continue; // its run ended while an earlier one was stopping, and its check took over
                 if (gone.State != ItemState.Done)
                 {
                     await StopWorkerAsync(gone, "skipped");

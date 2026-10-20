@@ -63,6 +63,9 @@ public sealed partial class Supervisor : IDisposable
     readonly HashSet<WorkItem> _interrupted = [];
     readonly HashSet<RepoAgents> _rebaseline = [];
     DateTimeOffset _started = DateTimeOffset.Now, _lastLaunch;
+    /// Where the next launch starts looking: just past the repository served last, so one with a long
+    /// queue cannot take every account.
+    int _turn;
     readonly SemaphoreSlim _gitGate = new(1, 1);
     readonly System.Threading.Timer _timer;
     IReadOnlyList<Account>? _accounts;
@@ -258,19 +261,23 @@ public sealed partial class Supervisor : IDisposable
         if (_launching || _stopping || _accounts == null) return;
         string? waiting = null;
         var started = false;
-        foreach (var repo in _state.Repos.Where(r => Active(r) && !_baseline.Contains(r)).ToList())
+        foreach (var repo in _state.Repos.Skip(_turn).Concat(_state.Repos.Take(_turn)).Where(r => Active(r) && !_baseline.Contains(r)).ToList())
         {
             if (_disposed || _launching) break;
             var cap = Config.MaxConcurrent > 0 ? Config.MaxConcurrent : Math.Max(1, _accounts.Count(AccountPicker.Usable)); // automatic: one per account, verifying included
+            // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest.
+            Func<WorkItem, bool>? resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now : null;
             while (!_disposed && !_launching && repo.Items.Count(i => i.State is ItemState.Working or ItemState.Checking) < cap)
             {
-                if (_workers.Count > 0 && DateTimeOffset.Now - _lastLaunch < Config.Ramp) break;
-                if (Next(repo, Config.MaxOpenPrs) is not { } item) break;
+                if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
                 var (account, why) = PickAccount(repo, item);
-                if (account == null) { waiting ??= why; break; }
+                // A reason only the owner can fix wins over one that passes by itself, whichever folder came first.
+                if (account == null) { waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why; break; }
+                // Spaced out after the last start; judged after the pick, so every folder's reason stays current.
+                if (_workers.Count > 0 && DateTimeOffset.Now - _lastLaunch < Config.Ramp) break;
                 await LaunchAsync(repo, item, account);
-                _lastLaunch = DateTimeOffset.Now;
+                (_lastLaunch, _turn) = (DateTimeOffset.Now, _state.Repos.IndexOf(repo) + 1);
                 if (item.State == ItemState.Queued) break; // paused or backed off while preparing
                 started = true;
             }
@@ -279,8 +286,10 @@ public sealed partial class Supervisor : IDisposable
         Waiting = waiting;
 
         // Every account out of usage: hold (nothing starts, running work ends at its own limit and moves on),
-        // say so once, and come back at the earliest reset with a fresh reading. Resumes by itself.
-        var allOut = waiting?.StartsWith(AccountPicker.AllNearLimits) == true;
+        // say so once, and come back at the earliest reset with a fresh reading. Resumes by itself. Judged on
+        // every account, not on the one a waiting folder is assigned to.
+        var allOut = waiting != null && AccountPicker.Pick(_accounts, Config.Threshold, new Dictionary<string, int>(), _cooled, DateTimeOffset.Now)
+            .Why?.StartsWith(AccountPicker.AllNearLimits) == true;
         if (allOut && !_allOut)
         {
             var back = AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now);
@@ -292,30 +301,37 @@ public sealed partial class Supervisor : IDisposable
     }
 
     /// The repository's next item: the one already under way, then pull request follow-ups, then new
-    /// work by rank (answered questions first). Anything that would open another pull request waits
-    /// while the limit of pull requests is waiting for review; follow-ups on those never wait.
-    internal static WorkItem? Next(RepoAgents repo, int maxPrs = MaxOpenPrs)
+    /// work by rank (answered questions first), passing over items `resting` after a failed start.
+    /// Anything that would open another pull request waits while the limit of pull requests is waiting
+    /// for review or would be with the changes under way; follow-ups on those never wait.
+    internal static WorkItem? Next(RepoAgents repo, int maxPrs = MaxOpenPrs, Func<WorkItem, bool>? resting = null)
     {
-        var ordered = repo.Items.Where(i => i.State == ItemState.Queued)
+        var ordered = repo.Items.Where(i => i.State == ItemState.Queued && resting?.Invoke(i) != true)
             .OrderByDescending(i => i.Guidance != null).ThenByDescending(i => i.Rank)
             .ThenBy(i => i.Issue ?? int.MaxValue).ThenBy(i => i.Created).ToList();
-        var full = repo.Items.Count(i => i.Pr != null && i.State != ItemState.Done) >= maxPrs;
+        var prs = repo.Items.Count(i => i.Pr != null && i.State != ItemState.Done);
         var underway = ordered.FirstOrDefault(i => i.InFlight);
-        if (underway != null && !full) return underway;
+        if (underway != null && prs < maxPrs) return underway;
         if (ordered.FirstOrDefault(i => i.Pr != null) is { } followup) return followup;
-        return full || underway != null ? null : ordered.FirstOrDefault();
+        // Each change under way opens a pull request too: new work counts them.
+        return underway != null || prs + repo.Items.Count(i => i.InFlight && i.Pr == null) >= maxPrs ? null : ordered.FirstOrDefault();
     }
 
     /// The folder's assigned account if it has one (work code stays on its account), otherwise the best
-    /// of the rest. Never the login in use at the keyboard: runs only happen in isolated profiles.
+    /// of the rest, leaving other open folders' assigned accounts to them while another fits. Never the
+    /// login in use at the keyboard: runs only happen in isolated profiles.
     (Account?, string?) PickAccount(RepoAgents repo, WorkItem item)
     {
         var accounts = _accounts ?? [];
-        var mapped = ProjectMap.AccountFor(repo.Path, accounts, _maps);
-        var pool = mapped != null ? [mapped] : accounts;
         var busy = _workers.Values.GroupBy(w => w.Account).ToDictionary(g => g.Key, g => g.Count());
         var prefer = !item.ReviewNext && item.Session is { } s ? s.Email + "|" + s.Org : null;
-        return AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst);
+        (Account?, string?) From(IReadOnlyList<Account> pool) =>
+            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst);
+        if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped) return From([mapped]);
+        // Held only for a folder that would start something, or has not read its issues yet.
+        var theirs = _state.Repos.Where(r => r != repo && Active(r) && (r.LastScan == null || Next(r, Config.MaxOpenPrs) != null)).Select(r => ProjectMap.AccountFor(r.Path, accounts, _maps)).OfType<Account>().ToList();
+        var pick = From(accounts.Where(a => !theirs.Contains(a) || AccountPicker.Key(a) == prefer).ToList()); // a session resumes where it lives
+        return pick.Item1 != null || theirs.Count == 0 ? pick : From(accounts);
     }
 
     // -- runs ---------------------------------------------------------------

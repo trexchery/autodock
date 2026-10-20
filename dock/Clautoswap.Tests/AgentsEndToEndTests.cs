@@ -14,7 +14,7 @@ public sealed class AgentsEndToEndTests : IDisposable
 {
     readonly TempDir _tmp = new();
     readonly Loop _loop = new();
-    readonly string _repo, _origin, _gh, _log;
+    readonly string _repo, _gh, _log;
     readonly Cli _cli;
     readonly Engine _engine;
     readonly AgentStore _store;
@@ -34,27 +34,33 @@ public sealed class AgentsEndToEndTests : IDisposable
 
     public AgentsEndToEndTests()
     {
-        _origin = P("origin.git");
-        _repo = P("repo");
         _gh = P("gh");
         _log = P("cswap.log");
         Directory.CreateDirectory(_gh);
         Environment.SetEnvironmentVariable("FAKE_LOG", _log);
         Environment.SetEnvironmentVariable("FAKE_GH", _gh);
         Environment.SetEnvironmentVariable("CLAUTOSWAP_DATA", P("data")); // logs stay out of the real profile
-        Git(_tmp.Path, "init", "--quiet", "--bare", "-b", "main", _origin);
-        Git(_tmp.Path, "clone", "--quiet", _origin, _repo);
-        Git(_repo, "config", "user.email", "agents@example.com");
-        Git(_repo, "config", "user.name", "clautoswap test");
-        File.WriteAllText(Path.Combine(_repo, "README.md"), "hello\n");
-        Git(_repo, "add", ".");
-        Git(_repo, "commit", "--quiet", "-m", "init");
-        Git(_repo, "push", "--quiet", "-u", "origin", "main");
-        Git(_repo, "remote", "set-head", "origin", "main");
+        _repo = NewRepo("repo");
         var fakes = Path.Combine(AppContext.BaseDirectory, "fakes");
         _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd"));
         _engine = new Engine(Path.Combine(fakes, "cswap.cmd"));
         _store = new AgentStore(P("agents"));
+    }
+
+    /// A repository with one commit on main and its own local bare origin (`name`.git).
+    string NewRepo(string name)
+    {
+        var repo = P(name);
+        Git(_tmp.Path, "init", "--quiet", "--bare", "-b", "main", repo + ".git");
+        Git(_tmp.Path, "clone", "--quiet", repo + ".git", repo);
+        Git(repo, "config", "user.email", "agents@example.com");
+        Git(repo, "config", "user.name", "clautoswap test");
+        File.WriteAllText(Path.Combine(repo, "README.md"), "hello\n");
+        Git(repo, "add", ".");
+        Git(repo, "commit", "--quiet", "-m", "init");
+        Git(repo, "push", "--quiet", "-u", "origin", "main");
+        Git(repo, "remote", "set-head", "origin", "main");
+        return repo;
     }
 
     static string Git(string cwd, params string[] args)
@@ -91,19 +97,19 @@ public sealed class AgentsEndToEndTests : IDisposable
         return _sup = s;
     });
 
-    Task Terminal(bool open) => _loop.Run(() =>
+    Task Terminal(bool open, string? repo = null) => _loop.Run(() =>
     {
-        if (open) _sup!.Attach(_repo);
-        else _sup!.Detach(_repo);
+        if (open) _sup!.Attach(repo ?? _repo);
+        else _sup!.Detach(repo ?? _repo);
         return 0;
     });
 
     void Issues(string json) => File.WriteAllText(Path.Combine(_gh, "issues.json"), json);
 
-    Task<string> Tool(string tool, string args) =>
-        _loop.Run(() => _sup!.HandleAsync(tool, JsonDocument.Parse(args).RootElement.Clone(), _repo));
+    Task<string> Tool(string tool, string args, string? repo = null) =>
+        _loop.Run(() => _sup!.HandleAsync(tool, JsonDocument.Parse(args).RootElement.Clone(), repo ?? _repo));
 
-    Task<T> On<T>(Func<RepoAgents, T> read) => _loop.Run(() => read(_sup!.RepoFor(_repo)!));
+    Task<T> On<T>(Func<RepoAgents, T> read, string? repo = null) => _loop.Run(() => read(_sup!.RepoFor(repo ?? _repo)!));
 
     WorkItem Item(RepoAgents r, int issue) => r.Items.Single(i => i.Issue == issue);
 
@@ -445,6 +451,75 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.InRange(Runs.Length, 1, 2); // at most one each (a run killed early may not have logged), and neither came back
         Assert.Empty(Git(_repo, "branch", "--list", "clautoswap/*"));
         Assert.DoesNotContain("pr create", Read(Path.Combine(_gh, "gh.log")));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task SkippingAnItemDuringVerificationStopsItAndRemovesTheWorktree()
+    {
+        Issues("""[{"number":90,"title":"Gated","body":"Do it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var verifying = P("verifying");
+        await StartAsync();
+        // Passes on main (the baseline); in the item's worktree it hangs until something stops it.
+        await Tool("agents_control", JsonSerializer.Serialize(new { action = "start", verify = $"if exist issue-90.txt (type nul > \"{verifying}\" & ping -n 120 127.0.0.1 >nul) else (exit 0)" }));
+        await AgentProcessTests.WaitUntil(() => File.Exists(verifying));
+        var wt = await On(r => Item(r, 90).Worktree!);
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#90"}"""));
+        await Until(r => r.Items.Count == 0 && !Directory.Exists(wt), "the verification stops and its worktree goes", 30);
+        Assert.Empty(Git(_repo, "branch", "--list", "clautoswap/*"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task RepositoriesTakeTurnsAndAnAssignedFolderKeepsItsAccount()
+    {
+        Issues("""
+        [
+          {"number":80,"title":"One","body":"[fake:slow] a","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":81,"title":"Two","body":"[fake:slow] b","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":82,"title":"Three","body":"[fake:slow] c","labels":[],"assignees":[],"author":{"login":"owner"}}
+        ]
+        """);
+        var other = NewRepo("other");
+        var config = Fast();
+        config.MaxConcurrent = 0; // automatic: three usable accounts, up to three runs per repository
+        config.Ramp = TimeSpan.FromSeconds(1);
+        await StartAsync(config, terminal: false);
+        // #2, the best account, is this folder's own. The other folder, listed and served first, has three
+        // items of its own: it must neither take #2 nor every turn.
+        await _loop.Run(() => { _sup!.UpdateAccounts([.. Accounts, A(4, 50)], [new ProjectMapping(_repo, "a2@example.com", "")]); return 0; });
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await _loop.Run(() => { _sup!.Attach(other); _sup.Attach(_repo); return 0; });
+        await Until(r => r.Items.Any(i => i.State == ItemState.Working && i.Run is { Email: "a2@example.com" }), "this folder runs on its own account");
+        Assert.True(await On(r => r.Items.Any(i => i.State is ItemState.Working or ItemState.Checking), other), "while the other folder runs on the rest");
+        Assert.DoesNotContain("a2@example.com", await On(r => r.Items.Select(i => i.Run?.Email).ToList(), other));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AFolderWaitingForItsOwnAccountNeitherAlarmsNorFlickersWhileOthersWork()
+    {
+        Issues("""[{"number":85,"title":"Slow","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var other = NewRepo("other");
+        var config = Fast();
+        config.Ramp = TimeSpan.FromSeconds(2);
+        await StartAsync(config);
+        // This folder's account is out of usage; #3 still has room for the other folder.
+        await _loop.Run(() => { _sup!.UpdateAccounts([A(1, 0, active: true), A(2, 95), A(3, 30)], [new ProjectMapping(_repo, "a2@example.com", "")]); return 0; });
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(_ => _sup!.Waiting?.StartsWith(AccountPicker.AllNearLimits) == true, "this folder waits for its account");
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Terminal(open: true, other);
+        var until = DateTime.UtcNow.AddSeconds(90);
+        while (!await On(r => r.Items.Any(i => i.State == ItemState.Open), other))
+        {
+            Assert.NotNull(await _loop.Run(() => _sup!.Waiting)); // the gap between starts forgets nobody
+            Assert.True(DateTime.UtcNow < until, "the other folder reaches a pull request");
+            await Task.Delay(100);
+        }
+        Assert.Equal("a3@example.com", await On(r => Item(r, 85).Run!.Email, other));
+        Assert.DoesNotContain(_notes, n => n.StartsWith("Agents waiting for usage") || n.StartsWith("Agents resumed")); // #3 was never out
         _sup!.Dispose();
     }
 

@@ -53,13 +53,17 @@ public sealed class WorkItem
     public Session? Session { get; set; }
     /// The latest process (work or review).
     public Run? Run { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Label => Issue is { } n ? $"#{n} {Title}" : $"{Id} {Title}";
     /// Started and not yet handed to review or parked: the repository's one active item.
     [JsonIgnore] public bool InFlight => State is ItemState.Working or ItemState.Checking || (State == ItemState.Queued && Worktree != null && Pr == null);
 }
 
-public sealed record Session(string Id, string Email, string Org);
+public sealed record Session(string Id, string Email, string Org)
+{
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
 
 /// A worker process: enough to re-attach after a restart.
 public sealed class Run
@@ -78,6 +82,7 @@ public sealed class Run
     public DateTimeOffset Started { get; set; }
     /// The process may still be running (cleared once its outcome is handled).
     public bool Live { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 /// A repository the owner authorized for continuous operation.
@@ -96,6 +101,7 @@ public sealed class RepoAgents
     public List<int> Skipped { get; set; } = [];
     public List<WorkItem> Items { get; set; } = [];
     public int NextLocal { get; set; } = 1;
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Leaf => System.IO.Path.GetFileName(Path.TrimEnd('\\', '/')) is { Length: > 0 } n ? n : Path;
 
@@ -108,6 +114,9 @@ public sealed class RepoAgents
 public sealed class AgentsState
 {
     public List<RepoAgents> Repos { get; set; } = [];
+    /// Fields an older or newer build wrote, here and on every level below: saved back as they were,
+    /// so neither build erases the other's.
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 /// state.json plus each run's files, under the tray's private folder. The tray is the only writer

@@ -140,6 +140,29 @@ public class AgentScheduleTests
         repo.Items[2].Guidance = "yes, formal";
         Assert.Equal("3", Supervisor.Next(repo)!.Id);
     }
+
+    [Fact]
+    public void AnItemRestingAfterAFailedStartHoldsNoneOfTheRest()
+    {
+        var repo = new RepoAgents { Items = [Item("1", wt: @"C:\wt\1"), Item("2", rank: 100), Item("3"), Item("4", ItemState.Queued, pr: 9)] };
+        Assert.Equal("1", Supervisor.Next(repo)!.Id); // under way
+        Assert.Equal("4", Supervisor.Next(repo, resting: i => i.Id == "1")!.Id); // then follow-ups
+        Assert.Equal("2", Supervisor.Next(repo, resting: i => i.Id is "1" or "4")!.Id); // then rank
+        Assert.Equal("3", Supervisor.Next(repo, resting: i => i.Id is "1" or "2" or "4")!.Id);
+        Assert.Null(Supervisor.Next(repo, resting: _ => true));
+    }
+
+    [Fact]
+    public void ChangesUnderWayCountTowardThePullRequestLimit()
+    {
+        var repo = new RepoAgents { Items = [Item("1", ItemState.Open, pr: 8), Item("2", ItemState.Working, wt: @"C:\wt\2"), Item("3")] };
+        Assert.Null(Supervisor.Next(repo, 2)); // one waiting for review and one on its way: two pull requests
+        Assert.Equal("3", Supervisor.Next(repo, 3)!.Id);
+        repo.Items[1].State = ItemState.Queued; // its review is next: still under way, and it goes on
+        Assert.Equal("2", Supervisor.Next(repo, 2)!.Id);
+        Assert.Null(Supervisor.Next(repo, 2, i => i.Id == "2")); // resting, it keeps its place
+        Assert.Equal("3", Supervisor.Next(repo, 3, i => i.Id == "2")!.Id);
+    }
 }
 
 public class AccountPickerTests
@@ -457,7 +480,8 @@ public class AgentProcessTests
         return new StreamReader(fs).ReadToEnd();
     }
 
-    internal static async Task WaitUntil(Func<bool> condition, int seconds = 20)
+    /// Generous by default: a below-normal child process on a loaded machine (a full test run) can take seconds to start.
+    internal static async Task WaitUntil(Func<bool> condition, int seconds = 60)
     {
         var until = DateTime.UtcNow.AddSeconds(seconds);
         while (true)
@@ -490,6 +514,59 @@ public class AgentStoreTests
         File.WriteAllText(Path.Combine(tmp.Path, "state.json"), "{ torn");
         Assert.Empty(store.Load().Repos);
         Assert.Equal("{ torn", File.ReadAllText(Path.Combine(tmp.Path, "state.json.corrupt")));
+    }
+
+    [Fact]
+    public void AnEarlierStateLoadsAndKeepsWhatThisBuildDoesNotKnow()
+    {
+        using var tmp = new TempDir();
+        // 0.5.x's shape, plus fields from another build at every level.
+        const string json = """
+            {
+              "repos": [{
+                "path": "C:\\r", "base": "main", "verify": "dotnet test", "authorized": true, "authorizedAt": "2026-10-01T09:00:00+02:00",
+                "paused": false, "note": null, "lastScan": "2026-10-19T08:00:00+02:00", "skipped": [4], "nextLocal": 2,
+                "items": [
+                  {"id":"1","issue":1,"title":"Queued","body":"b","rank":100,"state":"Queued","created":"2026-10-18T10:00:00+02:00","failures":1,"note":"`npm test` failed","evidence":{"checks":["unit"],"passed":true}},
+                  {"id":"2","issue":2,"title":"Working","state":"Working","branch":"clautoswap/2-working","worktree":"C:\\wt\\2","session":{"id":"s2","email":"a2@example.com","org":""},
+                   "run":{"attempt":2,"kind":"work","job":"Local\\clautoswap-agent-k-2-2-abcdef","pid":1234,"created":5678,"sessionId":"s2","email":"a2@example.com","org":"","head":"abc","started":"2026-10-19T09:00:00+02:00","live":true,"tokens":42}},
+                  {"id":"3","issue":3,"title":"Checking","state":"Checking","summary":"did it","reviewedHead":"def","worktree":"C:\\wt\\3"},
+                  {"id":"4","issue":4,"title":"Open","state":"Open","pr":7,"prUrl":"https://github.com/o/r/pull/7","prSeen":"2026-10-19T10:00:00+02:00","followups":1},
+                  {"id":"5","issue":5,"title":"Held","state":"NeedsOwner","holdFor":"workflow","note":"the change touches .github/x.yml","reviewNotes":"n"},
+                  {"id":"w1","title":"Asked","state":"NeedsOwner","askedAt":"2026-10-19T11:00:00+02:00","reviewNext":true,"reviews":1},
+                  {"id":"w2","title":"Merged","state":"Done","note":"pull request #8 merged"}
+                ],
+                "goals": [{"text":"ship the tray","done":false}]
+              }],
+              "memory": {"facts": ["prefers small pull requests"]}
+            }
+            """;
+        File.WriteAllText(Path.Combine(tmp.Path, "state.json"), json);
+        var store = new AgentStore(tmp.Path);
+        var repo = Assert.Single(store.Load().Repos);
+        Assert.Equal((@"C:\r", "dotnet test", true, 2, 4), (repo.Path, repo.Verify, repo.Authorized, repo.NextLocal, Assert.Single(repo.Skipped)));
+        Assert.Equal([ItemState.Queued, ItemState.Working, ItemState.Checking, ItemState.Open, ItemState.NeedsOwner, ItemState.NeedsOwner, ItemState.Done], repo.Items.Select(i => i.State));
+        Assert.Equal((1, "`npm test` failed"), (repo.Items[0].Failures, repo.Items[0].Note));
+        Assert.Equal(new Session("s2", "a2@example.com", ""), repo.Items[1].Session);
+        Assert.Equal((2, 1234, 5678L, true, "abc"), (repo.Items[1].Run!.Attempt, repo.Items[1].Run!.Pid, repo.Items[1].Run!.Created, repo.Items[1].Run!.Live, repo.Items[1].Run!.Head));
+        Assert.Equal(("did it", "def"), (repo.Items[2].Summary, repo.Items[2].ReviewedHead));
+        Assert.Equal((7, "https://github.com/o/r/pull/7", 1), (repo.Items[3].Pr, repo.Items[3].PrUrl, repo.Items[3].Followups));
+        Assert.Equal(("workflow", "n"), (repo.Items[4].HoldFor, repo.Items[4].ReviewNotes));
+        Assert.True(repo.Items[5] is { ReviewNext: true, Reviews: 1, AskedAt: not null, Issue: null });
+        Assert.Equal("pull request #8 merged", repo.Items[6].Note);
+
+        store.Save(store.Load());
+        using var before = JsonDocument.Parse(json);
+        using var after = JsonDocument.Parse(File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
+        foreach (var at in new Func<JsonElement, JsonElement>[]
+                 {
+                     s => s.GetProperty("memory"),
+                     s => s.GetProperty("repos")[0].GetProperty("goals"),
+                     s => s.GetProperty("repos")[0].GetProperty("items")[0].GetProperty("evidence"),
+                     s => s.GetProperty("repos")[0].GetProperty("items")[1].GetProperty("run").GetProperty("tokens"),
+                 })
+            Assert.Equal(JsonSerializer.Serialize(at(before.RootElement)), JsonSerializer.Serialize(at(after.RootElement)));
+        Assert.Equal(ItemState.Done, store.Load().Repos[0].Items[6].State); // and the known fields still read back
     }
 
     [Fact]
