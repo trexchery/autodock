@@ -3,7 +3,7 @@
 Builds local hand-off notes from the newest session transcript a CLI left for a
 project folder, so a *different* agent can start a new session with that
 context. The notes are built locally as a Markdown file under
-``%LOCALAPPDATA%\\autodock\\handoff`` and autodock sends nothing, but the target
+``%LOCALAPPDATA%\\clautoswap\\handoff`` and clautoswap sends nothing, but the target
 agent reads them and sends them to its provider like any prompt. Unfinished
 reasoning can't be transferred; this is a fresh start with notes, not a resume.
 """
@@ -271,7 +271,7 @@ def build_notes(source: str, project: str, transcript: Path, users: list[str], t
 
 def handoff_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    return Path(base) / "autodock" / "handoff"
+    return Path(base) / "clautoswap" / "handoff"
 
 
 def cleanup(directory: Path, now: float | None = None) -> None:

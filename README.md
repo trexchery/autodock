@@ -1,11 +1,11 @@
-# autodock
+# clautoswap
 
 multi-account switcher for claude code, codex, and grok build. live usage, reset timers, and one-click switching.
 
-**[download for windows](https://github.com/trexchery/autodock/releases/latest)**
+**[download for windows](https://github.com/trexchery/clautoswap/releases/latest)**
 
 <p align="center">
-  <img src="assets/autodock.png" width="420" alt="autodock tray dashboard listing claude, codex, and grok build accounts with 5-hour and weekly usage">
+  <img src="assets/clautoswap.png" width="420" alt="clautoswap tray dashboard listing claude, codex, and grok build accounts with 5-hour and weekly usage">
 </p>
 
 ## features
@@ -24,8 +24,8 @@ multi-account switcher for claude code, codex, and grok build. live usage, reset
 
 **windows 11 (64-bit)** and [claude code](https://docs.anthropic.com/en/docs/claude-code) required. codex and grok build optional.
 
-1. download `autodock-win-x64.zip` from the [latest release](https://github.com/trexchery/autodock/releases/latest).
-2. extract the zip and run `autodock\autodock.exe`.
+1. download `clautoswap-win-x64.zip` from the [latest release](https://github.com/trexchery/clautoswap/releases/latest).
+2. extract the zip and run `clautoswap\clautoswap.exe`.
 3. open the tray icon and use **+** to add accounts through official cli sign-in.
 
 no installer or admin access required. unsigned releases may trigger windows smartscreen; a `.sha256` checksum is included with the download.
@@ -34,9 +34,9 @@ no installer or admin access required. unsigned releases may trigger windows sma
 
 - automatic switching is **off by default** and currently supports claude accounts only.
 - switching updates the default cli login. running codex/grok sessions need restarting to use the newly selected account; pinned claude terminals remain on their assigned account.
-- claude stops remote control when the signed-in account changes, and autodock never reconnects or types into a running session. pinned terminals keep their account, so their remote control is unaffected.
-- **continue in...** notes are built locally and autodock sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
-- saved credentials are encrypted locally with windows dpapi. a pinned claude terminal holds a plaintext login only while it's open; autodock moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
+- claude stops remote control when the signed-in account changes, and clautoswap never reconnects or types into a running session. pinned terminals keep their account, so their remote control is unaffected.
+- **continue in...** notes are built locally and clautoswap sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
+- saved credentials are encrypted locally with windows dpapi. a pinned claude terminal holds a plaintext login only while it's open; clautoswap moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
 - grok build support has only been tested with synthetic data so far.
 - auto-prime is off by default and never sends on a schedule: each prime is one click of yours. that click doesn't make it allowed: anthropic's consumer terms (§3) restrict automated or scripted access to a subscription, so whether to use it is your call. it skips excluded, api-key and paid-extra-usage accounts and any near a weekly or model limit, which makes a charge unlikely but can't rule one out. when it can't tell whether a prime went out, or can't record one, it stops rather than send again.
 
@@ -45,9 +45,9 @@ no installer or admin access required. unsigned releases may trigger windows sma
 requires [uv](https://docs.astral.sh/uv/), the [.net 8 sdk](https://dotnet.microsoft.com/download/dotnet/8.0), and powershell 7.
 
 ```powershell
-git clone https://github.com/trexchery/autodock.git
-cd autodock
+git clone https://github.com/trexchery/clautoswap.git
+cd clautoswap
 pwsh dock\build.ps1
 ```
 
-built on [claude-swap](https://github.com/realiti4/claude-swap) by onur cetinkol. autodock additions by trexchery. [mit license](LICENSE). independent project, not affiliated with anthropic, openai, or xai; provider terms apply.
+built on [claude-swap](https://github.com/realiti4/claude-swap) by onur cetinkol. clautoswap additions by trexchery. [mit license](LICENSE). independent project, not affiliated with anthropic, openai, or xai; provider terms apply.

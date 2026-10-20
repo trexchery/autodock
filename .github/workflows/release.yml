@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build, test and publish autodock-win-x64.zip.
+# Push a tag like v0.1.0 to build, test and publish clautoswap-win-x64.zip.
 on:
   push:
     tags: ['v*']
@@ -31,10 +31,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = 'dist/autodock-win-x64.zip'
+          $zip = 'dist/clautoswap-win-x64.zip'
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           # LF line ending so `sha256sum -c` works on Linux/macOS too
-          [IO.File]::WriteAllText("$PWD/dist/autodock-win-x64.zip.sha256", "$hash  autodock-win-x64.zip`n")
-          gh release create $env:GITHUB_REF_NAME $zip dist/autodock-win-x64.zip.sha256 `
-            --title "autodock $env:GITHUB_REF_NAME" `
-            --notes "Portable build. Unzip and run autodock.exe. SHA-256: $hash"
+          [IO.File]::WriteAllText("$PWD/dist/clautoswap-win-x64.zip.sha256", "$hash  clautoswap-win-x64.zip`n")
+          gh release create $env:GITHUB_REF_NAME $zip dist/clautoswap-win-x64.zip.sha256 `
+            --title "clautoswap $env:GITHUB_REF_NAME" `
+            --notes "Portable build. Unzip and run clautoswap.exe. SHA-256: $hash"

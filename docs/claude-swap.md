@@ -1,4 +1,4 @@
-> This is the upstream claude-swap v0.27.2 documentation for the engine bundled in autodock (`engine\cswap.exe`). autodock adds `cswap enroll DIR` and DPAPI-sealed backups on Windows.
+> This is the upstream claude-swap v0.27.2 documentation for the engine bundled in clautoswap (`engine\cswap.exe`). clautoswap adds `cswap enroll DIR` and DPAPI-sealed backups on Windows.
 
 # claude-swap
 

@@ -52,7 +52,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Build engine + autodock and run all tests (synthetic credentials only)
+      - name: Build engine + clautoswap and run all tests (synthetic credentials only)
         shell: pwsh
         run: ./dock/build.ps1
 
