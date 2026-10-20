@@ -306,6 +306,12 @@ public sealed partial class Supervisor
             if (!r.Ok || PullRequestState.Parse(r.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me) is not { } pr) continue;
             if (pr.State is "MERGED" or "CLOSED")
             {
+                var merged = pr.State == "MERGED";
+                item.Merged = merged;
+                Memory.Add(repo.Memory, merged
+                    ? $"Merged #{item.Pr} ({item.Label}){(item.Summary is { } s ? ": " + s : "")}"
+                    : $"Closed without merging: #{item.Pr} ({item.Label}). The owner did not want this change as made{(item.Summary is { } c ? ": " + c : "")}",
+                    "pull request", false, DateTimeOffset.Now);
                 await FinishAsync(repo, item, pr.State == "MERGED" ? $"pull request #{item.Pr} merged" : $"pull request #{item.Pr} closed without merging");
                 continue;
             }
@@ -421,9 +427,11 @@ public sealed partial class Supervisor
         {
             var v = await _cli.GhAsync(repo.Path, "issue", "view", item.Issue!.Value.ToString(), "--json", "comments");
             if (!v.Ok) continue;
-            var answers = IssueInfo.Comments(v.Out, item.AskedAt!.Value, _me).Where(c => !c.Contains(QuestionMark)).ToList();
+            if (item.State != ItemState.NeedsOwner || item.AskedAt is not { } asked || Dropped(repo, item)) continue; // changed during the await
+            var answers = IssueInfo.Comments(v.Out, asked, _me).Where(c => !c.Contains(QuestionMark)).ToList();
             if (answers.Count == 0) continue;
             item.Guidance = Engine.Redact(string.Join("\n\n", answers));
+            Memory.Add(repo.Memory, $"#{item.Issue}: {item.Guidance}", "issue", true, DateTimeOffset.Now);
             (item.State, item.AskedAt, item.Failures, item.Note) = (ItemState.Queued, null, 0, null);
         }
         Save();

@@ -158,6 +158,10 @@ public sealed class AgentsEndToEndTests : IDisposable
         var body = File.ReadAllText(Path.Combine(_gh, "pr-body-7.md"));
         Assert.Contains("For #1.", body);
         Assert.DoesNotContain("Closes", body);
+        // Without memory the review prompt is as it was: no blank line before the verdict instructions.
+        var review = Read(_log + ".prompts").Split("---- account").First(r => r.Contains("You are reviewing")).ReplaceLineEndings("\n");
+        Assert.DoesNotContain("\n\n\n", review);
+        Assert.Contains("Ignore style preferences.\nEnd with one line:", review);
         Assert.Contains("`git --version` passed", body);
 
         // A work run, then a fresh review run; never the signed-in account, never without isolation.
@@ -262,6 +266,40 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains(Runs, r => r.Contains("--resume")); // in its own conversation
         await Until(r => Item(r, 13).State == ItemState.Open, "the next issue also reaches a pull request");
         Assert.DoesNotContain("Holding new work", await Tool("agents_status", "{}"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task MemoryCarriesAnOwnerNoteIntoTheNextPromptAndLearnedLinesBecomeAgentNotes()
+    {
+        Issues("""[{"number":40,"title":"Learn","body":"[fake:learn] Do it.","labels":[],"assignees":[],"author":{"login":"owner"}},{"number":41,"title":"After","body":"[fake:learn] Plain.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync(terminal: false); // nothing runs until the notes are in
+        Assert.Contains("never started", await Tool("agents_memory", """{"action":"add","text":"x"}"""));
+        await Tool("agents_control", """{"action":"start"}""");
+        Assert.Equal("Noted for this repository.", await Tool("agents_memory", """{"action":"add","text":"Always use tabs in this repository."}"""));
+        await Tool("agents_memory", """{"action":"add","text":"Shared rule for every repository.","global":true}""");
+        await Terminal(true);
+        await Until(r => Item(r, 40).State == ItemState.Open && Item(r, 41).State == ItemState.Open, "both items reach a pull request");
+
+        var prompts = Read(_log + ".prompts");
+        // An item's own agent notes stay out of its review; the next item's work prompt carries them.
+        var runs = prompts.Split("---- account", StringSplitOptions.RemoveEmptyEntries);
+        Assert.All(runs.Where(r => r.Contains("You are reviewing")), r => Assert.DoesNotContain(r.Contains("issue #40") ? "#40 Learn] " : "#41 After] ", r));
+        Assert.Contains("#40 Learn] the build needs the fake toolchain", runs.First(r => r.Contains("Resolve GitHub issue #41"))); // (the log is not UTF-8, so the dot is left out)
+        Assert.Contains("- [owner] Always use tabs in this repository.", prompts);
+        Assert.Contains("- [owner] Shared rule for every repository.", prompts);
+        Assert.True(prompts.IndexOf("Shared memory of clautoswap agents", StringComparison.Ordinal) < prompts.IndexOf("How to work:", StringComparison.Ordinal));
+        // The LEARNED lines became agent notes and did not leak into the pull request's summary.
+        var listed = await Tool("agents_memory", """{"action":"list"}""");
+        Assert.Contains("[agent · #41 After] the build needs the fake toolchain", listed);
+        Assert.Contains("[agent · #41 After] tests live next to the code", listed);
+        Assert.Equal("added issue-40.txt", await On(r => Item(r, 40).Summary));
+        Assert.Contains("Memory: 3 notes here, 1 shared", await Tool("agents_status", """{"detail":true}"""));
+
+        Assert.Equal("Forgot 1 note.", await Tool("agents_memory", """{"action":"forget","text":"tabs"}"""));
+        Assert.Equal("No such note; the numbers are those agents_memory list prints.", await Tool("agents_memory", """{"action":"forget","text":"12"}"""));
+        Assert.Equal("Forgot 1 note.", await Tool("agents_memory", """{"action":"forget","text":"G1."}"""));
+        Assert.DoesNotContain("tabs", await Tool("agents_memory", """{"action":"list"}"""));
         _sup!.Dispose();
     }
 

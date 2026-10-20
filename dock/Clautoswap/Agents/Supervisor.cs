@@ -530,6 +530,10 @@ public sealed partial class Supervisor : IDisposable
         if (w == null && result == null) reason ??= "restart";
         item.State = ItemState.Queued;
         if (started && !review) item.Guidance = null; // delivered
+        if (!review)
+            foreach (var l in LearnedLine.Matches(text).Take(3))
+                Memory.Add(repo.Memory, l.Groups[1].Value, item.Label, false, DateTimeOffset.Now);
+        text = StripLearned(text); // what a note mentions is not the run's verdict or summary
 
         if (reason == "stalled") Charge(repo, item, "it stopped making progress");
         else if (reason == "limit") item.Note = "its account became unavailable; continuing on another";
@@ -704,12 +708,19 @@ public sealed partial class Supervisor : IDisposable
         }
     }
 
+    static readonly Regex LearnedLine = new(@"^[ \t]*CLAUTOSWAP:[ \t]*LEARNED\b[ \t:]*(\S.*)$\r?\n?", RegexOptions.Multiline);
+
+    internal static string StripLearned(string text) => LearnedLine.Replace(text, "");
+
     /// What follows the run's last `CLAUTOSWAP: <kind>` line (to the end of its output).
     internal static string? Marker(string text, string kind)
     {
         var m = Regex.Matches(text, @"CLAUTOSWAP:\s*" + kind + @"\b[ \t:]*").LastOrDefault();
         if (m == null) return null;
-        var rest = text[(m.Index + m.Length)..].Trim();
+        var rest = text[(m.Index + m.Length)..];
+        // Another marker line (a LEARNED note before the final line) is not part of this one's text.
+        if (Regex.Match(rest, @"^[ \t]*CLAUTOSWAP:", RegexOptions.Multiline) is { Success: true } next) rest = rest[..next.Index];
+        rest = rest.Trim();
         return rest.Length > 0 ? Engine.Redact(rest) : kind.ToLowerInvariant();
     }
 

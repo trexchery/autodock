@@ -40,6 +40,31 @@ public sealed partial class Supervisor
                 if (repo == null) return "Agents were never started for this repository.";
                 return await QueueCommandAsync(repo, Str("action"), args, Str("item"), Str("text"), Str("title"));
 
+            case "agents_memory":
+                var shared = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("global", out var g) && g.ValueKind == JsonValueKind.True;
+                var notes = shared ? _state.Memory : repo?.Memory;
+                var what = Str("text");
+                switch (Str("action"))
+                {
+                    case "list" or "":
+                        return Memory.List(_state.Memory, repo?.Memory ?? []);
+                    case "add" or "forget" when notes == null:
+                        return "Agents were never started for this repository; use global to note something for every repository.";
+                    case "add":
+                        if (what.Length == 0) return "Say what to remember.";
+                        Memory.Add(notes!, what, "owner", true, DateTimeOffset.Now);
+                        Save();
+                        return shared ? "Noted for every repository." : "Noted for this repository.";
+                    case "forget":
+                        // List prints shared notes as g1, g2 …
+                        what = what.Trim();
+                        if (System.Text.RegularExpressions.Regex.IsMatch(what, @"^g\d+\.?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) (notes, what) = (_state.Memory, what[1..].TrimEnd('.'));
+                        var gone = Memory.Forget(notes!, what);
+                        Save();
+                        return gone == 0 ? "No such note; the numbers are those agents_memory list prints." : $"Forgot {gone} note{(gone == 1 ? "" : "s")}.";
+                }
+                return "Unknown action; use list, add or forget.";
+
             case "agents_details":
                 if (repo == null) return "Agents were never started for this repository.";
                 return Find(repo, Str("item")) is { } item ? Details(repo, item) : NoItem;
@@ -148,7 +173,11 @@ public sealed partial class Supervisor
                     Fire(() => CheckAsync(repo, it));
                     return $"{it.Label}: pushing it as it is.";
                 }
-                if (text.Length > 0) it.Guidance = text;
+                if (text.Length > 0)
+                {
+                    it.Guidance = text;
+                    Memory.Add(repo.Memory, $"{it.Label}: {text}", "answer", true, DateTimeOffset.Now);
+                }
                 (it.State, it.Failures, it.Note, it.AskedAt, it.HoldFor, it.Reviews) = (ItemState.Queued, 0, null, null, null, 0);
                 if (it.Followups > MaxFollowups) it.Followups = 0;
                 Save();
@@ -211,6 +240,7 @@ public sealed partial class Supervisor
         {
             sb.AppendLine($"Base {repo.Base}; verification {(repo.Verify is { } v ? $"`{v}`" : "none")}; permission mode {PermissionMode}.");
             foreach (var (k, until) in _cooled.Where(c => c.Value > DateTimeOffset.Now)) sb.AppendLine($"Resting {k.Split('|')[0]} until {until.ToLocalTime():HH:mm}.");
+            if (repo.Memory.Count + _state.Memory.Count > 0) sb.AppendLine($"Memory: {repo.Memory.Count} notes here, {_state.Memory.Count} shared across repositories.");
             if (repo.Skipped.Count > 0) sb.AppendLine("Skipped: " + string.Join(", ", repo.Skipped.Select(s => "#" + s)));
             var done = repo.Items.Where(i => i.State == ItemState.Done).ToList();
             if (done.Count > 0) sb.AppendLine("Done: " + string.Join("; ", done.Select(i => $"{i.Label} ({i.Note})")));
@@ -270,6 +300,7 @@ public sealed partial class Supervisor
         if (item.Guidance != null) sb.AppendLine().AppendLine("The owner's answer to your earlier question:").AppendLine(item.Guidance);
         if (item.Followup != null) sb.AppendLine().AppendLine("This pass must address:").AppendLine(item.Followup);
         if (notes != null) sb.AppendLine().AppendLine($"An earlier session worked on this and stopped. Read its hand-off notes in {notes} first, check the current state of this worktree, and continue from there; do not redo finished work.");
+        if (Memory.Prompt(_state.Memory, repo.Memory) is { } memory) sb.AppendLine().AppendLine(memory);
         sb.AppendLine().AppendLine(Rules(repo, item));
         return sb.ToString();
     }
@@ -279,6 +310,7 @@ public sealed partial class Supervisor
         var sb = new StringBuilder("Continue this task where you left off; your session was interrupted, and the worktree is as you left it.");
         if (item.Guidance != null) sb.AppendLine().AppendLine().AppendLine("The owner's answer to your question:").AppendLine(item.Guidance);
         if (item.Followup != null) sb.AppendLine().AppendLine().AppendLine("Before finishing, address:").AppendLine(item.Followup);
+        if (Memory.Prompt(_state.Memory, repo.Memory) is { } memory) sb.AppendLine().AppendLine().AppendLine(memory);
         sb.AppendLine().AppendLine().Append(Rules(repo, item));
         return sb.ToString();
     }
@@ -291,6 +323,7 @@ public sealed partial class Supervisor
         - Run the relevant tests.{(repo.Verify is { } v ? $" clautoswap runs `{v}` before the pull request opens; make sure it passes." : "")}
         - Commit your work with clear messages. Do not push, open pull requests or use gh: clautoswap does that once the work checks out.
         - Never merge, close issues, deploy, publish packages or releases, spend money, or change billing, secrets or repository settings.
+        - Optionally, before your final line, print up to 3 lines `CLAUTOSWAP: LEARNED <durable fact about this repository>`: only what would save the next agent real time (a build quirk, a convention, where something lives); never secrets.
         - If this needs a decision only the owner can make (product direction, trade-offs the issue leaves open, anything irreversible), is unclear, or cannot be done in code, do not guess. End with one line:
           CLAUTOSWAP: BLOCKED <your question for the owner, self-contained>
         - Otherwise end with one line:
@@ -304,7 +337,7 @@ public sealed partial class Supervisor
         {Clip(item.Body, 6000)}
 
         The change is `git diff origin/{repo.Base}...HEAD` (branch {item.Branch}). Read it and the code around it, and run tests if that helps. Do not modify any file and do not commit.
-        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.
+        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.{(Memory.Prompt(_state.Memory, repo.Memory.Where(n => n.Owner || n.Source != Memory.NormalizeSource(item.Label)).ToList()) is { } memory ? "\n\n" + memory + "\n" : "")}
         End with one line:
         CLAUTOSWAP: APPROVED <one-line verdict>
         or, if something must change:

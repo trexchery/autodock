@@ -1,6 +1,6 @@
 # Fake claude-swap engine for the clautoswap agents tests. Synthetic only: no credentials anywhere.
 # `run N --require-session -- <claude args>` plays a headless Claude Code worker; prompt markers pick
-# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:break].
+# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:break] [fake:learn].
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $a = $args
@@ -92,4 +92,5 @@ elseif (Test-Path broken.txt) { git rm -q broken.txt | Out-Null }
 Add-Content -LiteralPath "issue-$n.txt" -Value "work by account $account"
 git add -A | Out-Null
 git commit -q -m "fake work for $n" | Out-Null
-Finish "Did it.`nCLAUTOSWAP: DONE added issue-$n.txt"
+$learned = if ($prompt -match '\[fake:learn\]') { "CLAUTOSWAP: LEARNED the build needs the fake toolchain`nCLAUTOSWAP: LEARNED tests live next to the code`n" } else { '' }
+Finish "Did it.`n${learned}CLAUTOSWAP: DONE added issue-$n.txt"

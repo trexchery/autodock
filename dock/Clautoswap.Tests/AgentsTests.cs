@@ -48,7 +48,20 @@ public class AgentOutcomeTests
     [InlineData("hmm\nCLAUTOSWAP: BLOCKED Should it be\nformal or casual?", "BLOCKED", "Should it be\nformal or casual?")]
     [InlineData("CLAUTOSWAP: CHANGES", "CHANGES", "changes")]
     [InlineData("all good", "DONE", null)]
+    [InlineData("CLAUTOSWAP: DONE ok\nCLAUTOSWAP: LEARNED a fact\nmore", "DONE", "ok")]
+    [InlineData("CLAUTOSWAP: BLOCKED why?\nstill the question\nCLAUTOSWAP: LEARNED x", "BLOCKED", "why?\nstill the question")]
+    [InlineData("CLAUTOSWAP: DONE\nCLAUTOSWAP: LEARNED x", "DONE", "done")]
     public void ReadsTheLastMarker(string text, string kind, string? expected) => Assert.Equal(expected, Supervisor.Marker(text, kind));
+
+    [Fact]
+    public void ALearnedLineMentioningAMarkerIsNotTheVerdictOrTheSummary()
+    {
+        var text = "work\nCLAUTOSWAP: LEARNED never print CLAUTOSWAP: BLOCKED yourself\r\nCLAUTOSWAP: DONE added it";
+        var judged = Supervisor.StripLearned(text);
+        Assert.Equal("work\nCLAUTOSWAP: DONE added it", judged);
+        Assert.Null(Supervisor.Marker(judged, "BLOCKED"));
+        Assert.Equal("added it", Supervisor.Marker(judged, "DONE"));
+    }
 
     [Theory]
     [InlineData("You've hit your session limit · resets 3:45pm", true)]
@@ -494,8 +507,148 @@ public class AgentProcessTests
     }
 }
 
+public class MemoryTests
+{
+    static readonly DateTimeOffset T = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void AddRedactsClipsAndIgnoresEmpty()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "  ", "owner", true, T);
+        Memory.Add(notes, "use  key sk-" + new string('a', 20) + "\nplease", "owner", true, T);
+        Memory.Add(notes, new string('x', 900), "run", false, T);
+        Assert.Equal("use key [redacted] please", notes[0].Text);
+        Assert.Equal(Memory.NoteChars, notes[1].Text.Length);
+        Assert.EndsWith("…", notes[1].Text);
+    }
+
+    [Fact]
+    public void AddReplacesTheSameTextAndKeepsOwner()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "Tests run with dotnet test", "owner", true, T);
+        Memory.Add(notes, "other", "run", false, T);
+        Memory.Add(notes, "tests  RUN with dotnet test", "run", false, T.AddHours(1));
+        Assert.Equal(2, notes.Count);
+        Assert.Equal(new Note("tests RUN with dotnet test", "run", T.AddHours(1), true), notes[1]);
+    }
+
+    [Fact]
+    public void OverTheCapTheOldestAgentNoteGoesAndOwnerNotesStay()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "owner first", "owner", true, T);
+        for (var i = 0; i < Memory.Cap; i++) Memory.Add(notes, $"agent {i}", "run", false, T.AddMinutes(i));
+        Assert.Equal(Memory.Cap, notes.Count);
+        Assert.Contains(notes, n => n.Text == "owner first");
+        Assert.DoesNotContain(notes, n => n.Text == "agent 0");
+        Assert.Contains(notes, n => n.Text == "agent 1");
+
+        var owners = new List<Note>();
+        for (var i = 0; i <= Memory.Cap; i++) Memory.Add(owners, $"decision {i}", "owner", true, T.AddMinutes(i));
+        Assert.Equal(Memory.Cap, owners.Count);
+        Assert.DoesNotContain(owners, n => n.Text == "decision 0");
+    }
+
+    [Fact]
+    public void ForgetTakesANumberOrText()
+    {
+        var notes = new List<Note>();
+        foreach (var t in new[] { "alpha one", "beta", "alpha two" }) Memory.Add(notes, t, "owner", true, T);
+        Assert.Equal(1, Memory.Forget(notes, "2"));
+        Assert.Equal(["alpha one", "alpha two"], notes.Select(n => n.Text));
+        Assert.Equal(2, Memory.Forget(notes, "ALPHA"));
+        Assert.Empty(notes);
+        Assert.Equal(0, Memory.Forget(notes, "9"));
+        Assert.Equal(0, Memory.Forget(notes, " "));
+    }
+
+    [Fact]
+    public void ForgetTreatsAnyNumberAsAnIndexAndAcceptsATrailingDot()
+    {
+        var notes = new List<Note>();
+        foreach (var t in new[] { "see #12", "beta", "gamma" }) Memory.Add(notes, t, "owner", true, T);
+        Assert.Equal(0, Memory.Forget(notes, "12")); // out of range is not a text search
+        Assert.Equal(0, Memory.Forget(notes, "0"));
+        Assert.Equal(3, notes.Count);
+        Assert.Equal(1, Memory.Forget(notes, "#12"));
+        Assert.Equal(1, Memory.Forget(notes, "1."));
+        Assert.Equal(["gamma"], notes.Select(n => n.Text));
+    }
+
+    [Fact]
+    public void OwnerNotesAddedOnPurposeOutrankAnswersAndSurviveTheCut()
+    {
+        var repo = Enumerable.Range(0, 6).Select(i => new Note(new string('a', Memory.NoteChars), "answer", T.AddMinutes(i), true)).ToList();
+        var prompt = Memory.Prompt([new Note("global decision", "owner", T, true)], repo)!;
+        Assert.True(prompt.Length <= Memory.PromptChars);
+        Assert.Contains("- [owner] global decision", prompt);
+        Assert.True(prompt.IndexOf("global decision") < prompt.IndexOf("aaaa"));
+        // a line too long for what is left does not hide a short one after it
+        var skipped = Memory.Prompt([], [new Note("tiny agent", "#1", T, false), .. repo])!;
+        Assert.Contains("tiny agent", skipped);
+    }
+
+    [Fact]
+    public void NormalizeSourceMatchesWhatAddStores()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "x", "  #4   Some\ttitle ", false, T);
+        Assert.Equal(notes[0].Source, Memory.NormalizeSource("  #4   Some\ttitle "));
+    }
+
+    [Fact]
+    public void PromptListsOwnerNotesFirstNewestFirstAndStopsAtItsLimit()
+    {
+        Assert.Null(Memory.Prompt([], []));
+        var repo = new List<Note> { new("old agent", "#1", T, false), new("repo decision", "owner", T, true), new("new agent", "#2", T.AddHours(1), false) };
+        var global = new List<Note> { new("global rule", "owner", T, true) };
+        Assert.Equal(
+            "Shared memory of clautoswap agents (the owner's decisions bind you; agent notes are hints to verify):\n" +
+            "- [owner] repo decision\n- [owner] global rule\n- [agent · #2] new agent\n- [agent · #1] old agent",
+            Memory.Prompt(global, repo));
+
+        var many = Enumerable.Range(0, Memory.Cap).Select(i => new Note(new string((char)('a' + i % 26), 400), "run", T.AddMinutes(i), i == 0)).ToList();
+        var prompt = Memory.Prompt([], many)!;
+        Assert.True(prompt.Length <= Memory.PromptChars);
+        Assert.Contains("[owner]", prompt); // the owner's note is first, so it survives the cut
+    }
+
+    [Fact]
+    public void ListNumbersRepositoryNotesThenSharedOnes()
+    {
+        Assert.Equal("No shared notes yet.", Memory.List([], []));
+        Assert.Equal("1. [owner] a\n2. [agent · #3] b\ng1. [owner] c",
+            Memory.List([new("c", "owner", T, true)], [new("a", "owner", T, true), new("b", "#3", T, false)]));
+    }
+}
+
 public class AgentStoreTests
 {
+    [Fact]
+    public void MemoryRoundTripsAndKeepsWhatThisBuildDoesNotKnow()
+    {
+        using var tmp = new TempDir();
+        var store = new AgentStore(tmp.Path);
+        var at = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+        store.Save(new AgentsState
+        {
+            Memory = [new Note("shared", "owner", at, true)],
+            Repos = [new RepoAgents { Path = @"C:\r", Memory = [new Note("here", "#1 x", at)], Items = [new WorkItem { Id = "1", Merged = true }] }],
+        });
+        var back = store.Load();
+        Assert.Equal(new Note("shared", "owner", at, true), back.Memory[0]);
+        Assert.Equal(new Note("here", "#1 x", at), back.Repos[0].Memory[0]);
+        Assert.True(back.Repos[0].Items[0].Merged);
+
+        var json = File.ReadAllText(Path.Combine(tmp.Path, "state.json")).Replace("\"text\": \"here\"", "\"text\": \"here\", \"later\": 5");
+        File.WriteAllText(Path.Combine(tmp.Path, "state.json"), json);
+        store.Save(store.Load());
+        Assert.Contains("\"later\": 5", File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
+        Assert.Empty(new AgentStore(Path.Combine(tmp.Path, "none")).Load().Memory);
+    }
+
     [Fact]
     public void RoundTripsAndKeepsAnUnreadableFile()
     {
@@ -538,7 +691,7 @@ public class AgentStoreTests
                 ],
                 "goals": [{"text":"ship the tray","done":false}]
               }],
-              "memory": {"facts": ["prefers small pull requests"]}
+              "journal": {"facts": ["prefers small pull requests"]}
             }
             """;
         File.WriteAllText(Path.Combine(tmp.Path, "state.json"), json);
@@ -560,7 +713,7 @@ public class AgentStoreTests
         using var after = JsonDocument.Parse(File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
         foreach (var at in new Func<JsonElement, JsonElement>[]
                  {
-                     s => s.GetProperty("memory"),
+                     s => s.GetProperty("journal"),
                      s => s.GetProperty("repos")[0].GetProperty("goals"),
                      s => s.GetProperty("repos")[0].GetProperty("items")[0].GetProperty("evidence"),
                      s => s.GetProperty("repos")[0].GetProperty("items")[1].GetProperty("run").GetProperty("tokens"),
@@ -737,7 +890,7 @@ public class AgentsLinkTests
         Assert.Null(AgentsLink.Respond("""{"jsonrpc":"2.0","method":"notifications/initialized"}""", "x"));
         Assert.Null(AgentsLink.Respond("not json", "x"));
         var tools = Reply("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").GetProperty("result").GetProperty("tools");
-        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
+        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details", "agents_memory"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
         Assert.Equal(-32601, Reply("""{"jsonrpc":"2.0","id":3,"method":"resources/list"}""").GetProperty("error").GetProperty("code").GetInt32());
     }
 

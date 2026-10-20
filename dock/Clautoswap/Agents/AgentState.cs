@@ -34,6 +34,8 @@ public sealed class WorkItem
     public string? Worktree { get; set; }
     public int? Pr { get; set; }
     public string? PrUrl { get; set; }
+    /// Its pull request was merged (a closed one was not).
+    public bool Merged { get; set; }
     /// PR feedback after this moment is new.
     public DateTimeOffset? PrSeen { get; set; }
     public int Failures { get; set; }
@@ -61,6 +63,13 @@ public sealed class WorkItem
 }
 
 public sealed record Session(string Id, string Email, string Org)
+{
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
+
+/// A note in the agents' shared memory. Owner notes are the owner's own words or decisions and bind every
+/// agent; agent notes are what runs learned: hints to verify.
+public sealed record Note(string Text, string Source, DateTimeOffset At, bool Owner = false)
 {
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
@@ -101,6 +110,8 @@ public sealed class RepoAgents
     public List<int> Skipped { get; set; } = [];
     public List<WorkItem> Items { get; set; } = [];
     public int NextLocal { get; set; } = 1;
+    /// What the owner and runs noted about this repository.
+    public List<Note> Memory { get; set; } = [];
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Leaf => System.IO.Path.GetFileName(Path.TrimEnd('\\', '/')) is { Length: > 0 } n ? n : Path;
@@ -114,6 +125,8 @@ public sealed class RepoAgents
 public sealed class AgentsState
 {
     public List<RepoAgents> Repos { get; set; } = [];
+    /// Notes that hold in every repository.
+    public List<Note> Memory { get; set; } = [];
     /// Fields an older or newer build wrote, here and on every level below: saved back as they were,
     /// so neither build erases the other's.
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
