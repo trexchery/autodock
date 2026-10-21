@@ -212,10 +212,16 @@ public sealed partial class Supervisor
         if (!r.Ok || IssueInfo.ParseList(r.Out) is not { } issues) return null;
         var covered = await _cli.GhAsync(repo.Path, "pr", "list", "--state", "open", "--limit", "100", "--json", "number,closingIssuesReferences") is { Ok: true } prs
             ? IssueInfo.ClosedByOpenPullRequests(prs.Out) : [];
-        var open = issues.Select(i => i.Number).ToHashSet();
-        open.ExceptWith(sequenced ?? new HashSet<int>()); // a blocker the plan itself sequences is left to `after`
         var (skip, only) = IssueInfo.Routing(issues, me);
-        return issues.Where(i => WantedBy(repo, i, me, open, covered, skip, only)).ToList();
+        var items = repo.Items.Select(i => i.Issue).OfType<int>().ToHashSet();
+        var left = (sequenced ?? new HashSet<int>()).ToHashSet(); // a blocker the plan itself sequences is left to `after`: only while it is taken
+        while (true)
+        {
+            var open = issues.Select(i => i.Number).ToHashSet();
+            open.ExceptWith(left);
+            var wanted = issues.Where(i => WantedBy(repo, i, me, open, covered, skip, only)).ToList();
+            if (left.RemoveWhere(n => !items.Contains(n) && wanted.All(w => w.Number != n)) == 0) return wanted; // one not taken still blocks what waits on it
+        }
     }
 
     /// The owner's open pull requests (clautoswap's included). Anyone can open one on a public repository,
@@ -342,10 +348,15 @@ public sealed partial class Supervisor
                 if (item.Issue is { } num && item.Goal == key) planned[num] = item;
             }
             // GitHub's "Blocked by" between issues the plan names was left to `after` (OwnIssuesAsync): make it one.
+            WorkItem? Blocker(int b) => planned.GetValueOrDefault(b) ?? repo.Items.FirstOrDefault(i => i.Issue == b && i.State != ItemState.Done);
+            bool Reaches(WorkItem from, string target, HashSet<string> seen) => from.After.Any(k => k == target || seen.Add(k) && ItemByKey(repos, k) is { } p && Reaches(p, target, seen));
+            var openIssues = planned.Keys.Concat(repo.Items.Where(i => i.State != ItemState.Done).Select(i => i.Issue).OfType<int>()).ToHashSet();
             foreach (var (num, item) in planned.Where(p => p.Value is { State: ItemState.Queued, Worktree: null }))
                 if (issues.TryGetValue(num, out var info))
-                    foreach (var blocker in info.BlockedBy(planned.Keys.ToHashSet()).Select(b => planned[b]))
-                        if (!item.After.Contains(Key(repo, blocker)) && !blocker.After.Contains(Key(repo, item))) item.After.Add(Key(repo, blocker));
+                    foreach (var blocker in info.BlockedBy(openIssues).Select(Blocker).OfType<WorkItem>().Where(b => b != item))
+                        if (item.After.Contains(Key(repo, blocker))) continue;
+                        else if (Reaches(blocker, Key(repo, item), [])) AddLog(goal, now, $"ignored GitHub's \"blocked by\": {blocker.Label} already waits on {item.Label}");
+                        else item.After.Add(Key(repo, blocker));
         }
         var settled = repos.SelectMany(r => r.Items).Where(i => i.Goal == key).All(i => i.State == ItemState.Done);
         var quiet = added + dropped == 0 && settled; // waiting on its own work is not idle
@@ -367,13 +378,13 @@ public sealed partial class Supervisor
     }
 
     /// The goal's work that has not started stops serving it: planned requests go, adopted issues stay as ordinary work.
-    static int Unplan(RepoAgents repo, string goalKey, IEnumerable<WorkItem> which)
+    internal static int Unplan(RepoAgents repo, string goalKey, IEnumerable<WorkItem> which)
     {
         var n = 0;
-        foreach (var i in which.Where(i => i.Goal == goalKey && i is { State: ItemState.Queued, Worktree: null, Pr: null }).ToList())
+        foreach (var i in which.Where(i => i.Goal == goalKey && (i is { State: ItemState.Queued, Worktree: null, Pr: null } || Held(i))).ToList())
         {
             if (i.Issue == null) repo.Items.Remove(i);
-            else { i.Goal = null; i.After = []; if (i.OwnRank is { } own) i.Rank = own; i.OwnRank = null; } // planner rank off, an owner's pick keeps its own
+            else { if (Held(i)) (i.State, i.Note) = (ItemState.Queued, null); i.Goal = null; i.After = []; if (i.OwnRank is { } own) i.Rank = own; i.OwnRank = null; } // planner rank off, an owner's pick keeps its own
             n++;
         }
         return n;
@@ -473,7 +484,7 @@ public sealed partial class Supervisor
             if (Still() && e is AgentsException { Transient: true }) // offline is no failure: back off and try again, the dot stays dark
             {
                 _notBefore[goal] = DateTimeOffset.Now + Config.LaunchBackoff;
-                AddLog(goal, DateTimeOffset.Now, "check postponed: " + Engine.Redact(e.Message));
+                if (goal.Log.LastOrDefault()?.Contains("check postponed") != true) AddLog(goal, DateTimeOffset.Now, "check postponed: " + Engine.Redact(e.Message)); // not a line per retry: they would push the history out
             }
             else if (Still()) GoalFailed(repo, goal, "checking", Engine.Redact(e.Message));
         }

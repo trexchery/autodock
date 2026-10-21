@@ -1186,6 +1186,29 @@ public class AgentGoalTests
         Assert.Null(Supervisor.Next(repo)); // it does not start
         Assert.True(goal.Replan);
         Assert.DoesNotContain(request, repo.Items);
+        Assert.False(Supervisor.Problem(adopted)); // a question, not a failure
+        Assert.Empty(adopted.After); // answered, it runs
+        Supervisor.Unplan(repo, key, [adopted]); // a replan that drops it releases it
+        Assert.Equal((ItemState.Queued, null), (adopted.State, adopted.Goal));
+    }
+
+    [Fact]
+    public void AGitHubBlockerThatIsAnExistingItemOrWouldLoopIsHandled()
+    {
+        var i5 = I("5");
+        var repo = Repo(i5);
+        Ingest(repo, G(), """{"status":"working","items":[{"key":"a","issue":6},{"key":"b","issue":7,"after":["a"]},{"key":"c","issue":8,"after":["b"]}]}""",
+            new() { [6] = new IssueInfo(6, "Six", "Blocked by #5. Blocked by #8.", [], [], [], "owner"), [7] = new IssueInfo(7, "Seven", "", [], [], [], "owner"), [8] = new IssueInfo(8, "Eight", "", [], [], [], "owner") });
+        var (i6, i8) = (repo.Items.Single(i => i.Issue == 6), repo.Items.Single(i => i.Issue == 8));
+        Assert.Equal([Supervisor.Key(repo, i5)], i6.After); // #5 is no plan step, but an item: still waited for
+        Assert.DoesNotContain(Supervisor.Key(repo, i8), i6.After); // #8 waits on #7 on #6: no loop
+    }
+
+    [Fact]
+    public void OnlyANetworkFailureOfAFetchIsOffline()
+    {
+        Assert.Matches(Supervisor.Offline, "fatal: unable to access 'x': Could not resolve host: github.com");
+        Assert.DoesNotMatch(Supervisor.Offline, "fatal: couldn't find remote ref main");
     }
 
     [Fact]

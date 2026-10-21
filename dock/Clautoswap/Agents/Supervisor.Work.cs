@@ -28,13 +28,16 @@ public sealed partial class Supervisor
 
     async Task<bool> HasOriginAsync(RepoAgents repo) => (await GitAsync(repo.Path, "remote", "get-url", "origin")).Ok;
 
+    /// A fetch that failed for want of a network; a deleted base or revoked credentials are the owner's to fix.
+    internal static readonly Regex Offline = new(@"resolve host|timed out|timeout|refused|unreachable|connection reset|failed to connect|no route", RegexOptions.IgnoreCase);
+
     async Task<string> StartPointAsync(RepoAgents repo, bool strict = false)
     {
         if (!await HasOriginAsync(repo)) return repo.Base;
         if (Due(_fetched.GetValueOrDefault(repo), TimeSpan.FromMinutes(2)))
         {
             var fetch = await GitAsync(repo.Path, "fetch", "--quiet", "origin", repo.Base);
-            if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: true); // a stale base proves nothing
+            if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: Offline.IsMatch(fetch.Why)); // a stale base proves nothing
             _fetched[repo] = DateTimeOffset.Now;
         }
         return "origin/" + repo.Base;

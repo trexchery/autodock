@@ -95,7 +95,7 @@ public sealed partial class Supervisor : IDisposable
 
     /// Parked after retries ran out or a check, push or pull request failed; not a hold, a question or a no-op.
     internal static bool Problem(WorkItem i) =>
-        i is { State: ItemState.NeedsOwner, HoldFor: null, AskedAt: null } && i.Note?.StartsWith(NoChange) != true;
+        i is { State: ItemState.NeedsOwner, HoldFor: null, AskedAt: null } && i.Note?.StartsWith(NoChange) != true && !Held(i);
 
     /// Anything the tray shows may have changed.
     public event Action? Changed;

@@ -201,11 +201,17 @@ public sealed partial class Supervisor
             foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
                 if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
                 {
-                    (d.State, d.Note) = (ItemState.NeedsOwner, $"it was planned after {skip.Label}, which you skipped; answer to run it anyway");
+                    (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
+                    d.After.Remove(Key(repo, s)); // answered, it must not wait for what the owner skipped
                     if (repos.SelectMany(r => r.Goals.Where(g => Key(r, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
                 }
                 else if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
     }
+
+    /// An adopted issue held because a step it was planned after was skipped: a question for the owner, no problem.
+    const string SkipHold = "it was planned after ";
+
+    static bool Held(WorkItem i) => i is { State: ItemState.NeedsOwner, Worktree: null, Pr: null } && i.Note?.StartsWith(SkipHold) == true;
 
     const string NoItem = "No such item; name it as #12 (issue) or w3 (request).";
 
