@@ -482,11 +482,15 @@ public sealed partial class TrayApp : ApplicationContext
             || ResumeStopped.ProfileDir(n) is not { } dir)
             return false;
         List<StoppedSession> windows;
+        var account = snap.Accounts.First(a => a.Number == n);
+        bool agents;
         try
         {
             windows = await Task.Run(() => ResumeStopped.Scan([(dir, n)], DateTime.UtcNow, includeBusy: true, agentLimits: _agentLimits));
             var (records, runs) = await Task.Run(() => ResumeStopped.LiveCounts(dir));
-            if (!ResumeStopped.Releasable(windows, records, runs))
+            // Every window idle and each run without one an agent's: the agents yield the account, as at a usage limit.
+            agents = ResumeStopped.AgentsOnly(windows, records, runs, _agents?.RunsOn(account) ?? 0);
+            if (!agents && !ResumeStopped.Releasable(windows, records, runs))
             {
                 // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
                 if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && !_heldNotice.Contains(n))
@@ -495,13 +499,19 @@ public sealed partial class TrayApp : ApplicationContext
                         : $"It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner."));
                 return false;
             }
-            if (ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
+            if (windows.Count > 0 && ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
                 || windows.Any(w => ResumeStopped.MovesInLastHour(_resumed, w.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour))
                 return false;
             foreach (var w in windows) ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); // a failed copy closes nothing
         }
         catch (Exception e) { Program.Log(e); return false; }
-        Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)");
+        Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)" + (agents ? ", agent runs yield it" : ""));
+        if (agents)
+        {
+            _freed[n] = DateTime.UtcNow; // the agents rest #n as long: one yield per half hour, never a loop
+            try { await _agents!.YieldAsync(account, TimeSpan.FromMinutes(30)); }
+            catch (Exception e) { Program.Log(e); return false; }
+        }
         var closed = new List<StoppedSession>();
         foreach (var w in windows)
         {
@@ -511,15 +521,15 @@ public sealed partial class TrayApp : ApplicationContext
             try { await ResumeStopped.CloseAsync(w.Pid); closed.Add(w); }
             catch (Exception e) { Program.Log(e); break; }
         }
-        if (closed.Count == 0) return false; // nothing closed: no lockout, the next idle poll tries again
+        if (closed.Count == 0 && !agents) return false; // nothing closed: no lockout, the next idle poll tries again
         _freed[n] = DateTime.UtcNow;
+        // Each wrapper's exit seal hands the login back first: the default login never runs a second live copy of it.
         var free = false;
         for (var i = 0; i < 60 && !(free = await Task.Run(() => ResumeStopped.LiveProfiles([(dir, n)]).Count == 0)); i++) await Task.Delay(500);
         SwitchResult? sw = null;
         if (free)
             try { sw = await _engine.SwitchNowAsync(n); }
             catch (Exception e) { Program.Log($"free #{n}: switch refused: {Engine.Redact(e.Message)}"); }
-        var account = snap.Accounts.First(a => a.Number == n);
         foreach (var w in closed)
         {
             try { ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); } catch (Exception e) { Program.Log(e); } // what it wrote on the way out
@@ -532,9 +542,11 @@ public sealed partial class TrayApp : ApplicationContext
         if (sw is { Switched: true })
         {
             _lastBlockedNotice = null;
-            // One balloon (a second replaces the first): the switch, and that these windows are no longer pinned.
-            Notify(closed.Count == 1 ? "Moved a pinned window to the default login" : $"Moved {closed.Count} pinned windows to the default login",
-                $"{Format.SwitchNotice(sw.From, sw.To)}. {string.Join(", ", closed.Select(w => Path.GetFileName(w.Cwd.TrimEnd('\\'))))} now follow the default login, no longer pinned to #{n}.");
+            // One balloon (a second replaces the first): the switch, that these windows are no longer pinned, and where the agents went.
+            var yielded = agents ? $" Agents gave #{n} up and continue their work on another account." : "";
+            if (closed.Count == 0) Notify($"Agents freed #{n} for the default login", $"{Format.SwitchNotice(sw.From, sw.To)}.{yielded}");
+            else Notify(closed.Count == 1 ? "Moved a pinned window to the default login" : $"Moved {closed.Count} pinned windows to the default login",
+                $"{Format.SwitchNotice(sw.From, sw.To)}. {string.Join(", ", closed.Select(w => Path.GetFileName(w.Cwd.TrimEnd('\\'))))} now follow the default login, no longer pinned to #{n}.{yielded}");
             if (_snap is { } s) _snap = s with { ActiveAccountNumber = n, Accounts = [.. s.Accounts.Select(a => a with { Active = a.Number == n })] };
         }
         return true;

@@ -698,6 +698,23 @@ public sealed partial class Supervisor : IDisposable
         Pump();
     }
 
+    /// Runs under way on `account` (stopping ones included: their wrappers still hold its profile).
+    public int RunsOn(Account account) => _workers.Values.Count(w => w.Account == AccountPicker.Key(account));
+
+    /// The owner's login needs `account`: its runs stop as at a usage limit (each item carries on later on another account, in
+    /// its own worktree and conversation, nothing counted against it) and the account rests `rest`, so nothing starts on it
+    /// meanwhile. Returns once their claudes are gone; each `cswap run` wrapper then exits and seals the profile on its own.
+    public async Task<int> YieldAsync(Account account, TimeSpan rest)
+    {
+        var key = AccountPicker.Key(account);
+        var until = DateTimeOffset.Now + rest;
+        if (_cooled.GetValueOrDefault(key) < until) _cooled[key] = until;
+        var runs = _workers.Where(kv => kv.Value.Account == key && kv.Value.StopReason == null).Select(kv => kv.Key).ToList();
+        await Task.WhenAll(runs.Select(k => StopWorkerAsync(k, "limit")));
+        Pump();
+        return runs.Count;
+    }
+
     Task StopWorkersAsync(RepoAgents? only, string reason) =>
         Task.WhenAll(_workers.Where(kv => only == null || kv.Value.Repo == only).Select(kv => kv.Key).ToList().Select(k => StopWorkerAsync(k, reason)));
 

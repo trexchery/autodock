@@ -417,6 +417,17 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public void OnlyAgentRunsBesideIdleWindowsAreAskedToYieldTheProfile()
+    {
+        Assert.True(ResumeStopped.AgentsOnly([], records: 0, runs: 2, agentRuns: 2));
+        Assert.True(ResumeStopped.AgentsOnly([Window("idle")], records: 1, runs: 2, agentRuns: 1));
+        Assert.False(ResumeStopped.AgentsOnly([], records: 0, runs: 2, agentRuns: 1)); // a headless run the owner started: never stopped
+        Assert.False(ResumeStopped.AgentsOnly([Window("busy")], records: 1, runs: 2, agentRuns: 1)); // a working window holds it anyway
+        Assert.False(ResumeStopped.AgentsOnly([], records: 1, runs: 2, agentRuns: 1)); // a window the scan did not see as done
+        Assert.False(ResumeStopped.AgentsOnly([Window("idle")], records: 1, runs: 1, agentRuns: 0)); // no run holds it: Releasable's
+    }
+
+    [Fact]
     public void WhatHoldsAProfileIsNamedForTheUser()
     {
         Assert.Empty(ResumeStopped.Holders([Window("idle")], records: 1, runs: 1));
