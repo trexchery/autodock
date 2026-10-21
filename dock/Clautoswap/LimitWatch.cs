@@ -20,6 +20,7 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
     readonly Dictionary<string, FileSystemWatcher> _watchers = [];
     readonly HashSet<long> _seen = []; // error timestamps: a transcript the tray copies carries the same error again
     readonly object _lock = new();
+    bool _disposed; // under _lock: a Sync or Read still running at exit adds no watcher and posts no hit
 
     public bool Watching(string configDir) { lock (_lock) return _watchers.ContainsKey(configDir); }
 
@@ -43,7 +44,11 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
                 w.Renamed += (_, e) => Read(e.FullPath, dir);
                 w.Error += (_, e) => Fail(dir, e.GetException());
                 w.EnableRaisingEvents = true;
-                lock (_lock) _watchers[dir] = w;
+                lock (_lock)
+                {
+                    if (_disposed) { w.Dispose(); return; }
+                    _watchers[dir] = w;
+                }
             }
             catch (Exception e) when (e is ArgumentException or IOException or UnauthorizedAccessException) { log($"limit watch on {dir}: {e.Message}; the poll covers it"); }
         }
@@ -72,6 +77,7 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
         {
             lock (_lock)
             {
+                if (_disposed) return;
                 using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 var len = f.Length;
                 var known = _read.TryGetValue(path, out var at) && at <= len; // shorter than last time: rewritten, look again
@@ -98,6 +104,7 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
             }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return; } // locked a moment: the poll retries
+        lock (_lock) if (_disposed) return;
         foreach (var h in hits) onHit(h);
     }
 
@@ -107,7 +114,8 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
     {
         lock (_lock)
         {
-            if (_seen.Count > 1000) _seen.Clear(); // ponytail: forgetting is safe, the freshness window and the switch's own dedupe cover it
+            // Only errors older than the freshness window go: they can never be a hit again, so a burst's copies stay known (ponytail: a burst of 1000 inside two minutes grows it, fine)
+            if (_seen.Count > 1000) _seen.RemoveWhere(t => t < ((clock ?? (() => DateTimeOffset.UtcNow))() - Fresh).UtcTicks);
             return _seen.Add(at.UtcTicks);
         }
     }
@@ -116,6 +124,7 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
     {
         lock (_lock)
         {
+            _disposed = true;
             foreach (var w in _watchers.Values) w.Dispose();
             _watchers.Clear();
         }
@@ -136,7 +145,10 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
     /// Accounts the API refused, until their reset: no reading, however fresh it looks, puts one back before then.
     public Dictionary<int, DateTimeOffset> RefusedUntil { get; } = [];
     readonly HashSet<string> _handled = [];
+    DateTimeOffset _lastTry; // when every try last failed
     readonly SemaphoreSlim _one = new(1, 1); // one move at a time; separate from the engine's own gate on purpose
+    /// A switch is running: a window move planned before it must not launch a profile of the account it moves to.
+    public bool Switching { get; private set; }
 
     public async Task<LimitOutcome?> OnLimitAsync(LimitHit hit)
     {
@@ -148,24 +160,25 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
             var l = hit.Limit;
             var reset = l.ResetsAt!.Value; // LimitWatch hands over only errors that say when
             if (snap == null) return null; // not listed yet: nothing is recorded, so the caller can look again
-            var refused = ResumeStopped.Refuser(l, ResumeStopped.ProfileAccount(hit.ConfigDir), snap.Accounts, login(), RefusedUntil);
+            var refused = ResumeStopped.Refuser(l, ResumeStopped.ProfileAccount(hit.ConfigDir), snap.Accounts, login());
             // A refusal seen again is not logged or reported again, but the switch still happens while the default login is on the refuser (it may have come back).
             var again = !_handled.Add($"{refused?.ToString() ?? "?"}:{reset.ToUnixTimeSeconds()}");
-            if (again && !(refused is { } rn && (login().Account ?? snap.ActiveAccountNumber) == rn && RefusedUntil.TryGetValue(rn, out var until0) && until0 > now)) return null;
+            if (again && (now - _lastTry < TimeSpan.FromSeconds(30) || !(refused is { } rn && (login().Account ?? snap.ActiveAccountNumber) == rn && RefusedUntil.TryGetValue(rn, out var until0) && until0 > now))) return null; // a repeat retries at most every 30 s: a burst of agents is not a burst of ungated spawns
             if (!again) log($"limit seen {Path.GetFileName(hit.File)} acct {refused?.ToString() ?? "?"} resets {reset:u}");
             if (refused is not { } n) return new LimitOutcome(); // unattributed: only the windows are looked at
             if (!RefusedUntil.TryGetValue(n, out var until) || until < reset) RefusedUntil[n] = reset;
             try
             {
                 var stand = new StoppedSession(0, "", "", hit.ConfigDir, n, hit.File, Limit: l, OwnRefused: true);
-                if (ResumeStopped.LimitReport([stand], snap.Accounts, now, reported) is { } doc) await report(doc);
+                if (ResumeStopped.LimitReport([stand], snap.Accounts, now, reported) is { } doc) _ = Import(doc); // not awaited: the switch does not need it, and it can wait on the usage store's lock
             }
-            catch (Exception e) { log($"import-usage failed: {e.Message}"); } // the switch does not need it
+            catch (Exception e) { log($"import-usage failed: {e.Message}"); }
             // Only the default login moves here, and only while it is still the refuser: the engine's own check may have moved it already.
             if ((login().Account ?? snap.ActiveAccountNumber) != n) return new LimitOutcome();
             var targets = ResumeStopped.SwitchTargets(snap.Accounts, n, liveProfiles(), RefusedUntil, now, threshold?.Invoke() ?? ResumeStopped.Full);
             if (targets.Count == 0) return new LimitOutcome(NoRoom: true, Earliest: ResumeStopped.EarliestReset(snap.Accounts, RefusedUntil, now));
             var clockMs = Stopwatch.StartNew();
+            Switching = true;
             foreach (var m in targets.Take(3)) // ponytail: three tries, then the engine's own check takes over
             {
                 try
@@ -176,8 +189,15 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
                 }
                 catch (Exception e) { log($"switch {n}->{m} failed: {e.Message}"); } // lock timeout, profile ahead, credential error: the next account
             }
+            _lastTry = now;
             return new LimitOutcome(Error: $"The switch away from #{n} failed; the engine's own check is trying.");
         }
-        finally { _one.Release(); }
+        finally { Switching = false; _one.Release(); }
+    }
+
+    async Task Import(string doc)
+    {
+        try { await report(doc); }
+        catch (Exception e) { log($"import-usage failed: {e.Message}"); }
     }
 }

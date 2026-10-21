@@ -216,16 +216,6 @@ public class ResumeStoppedTests
 
     static string LimitAt(DateTimeOffset t) => LimitV2.Replace("2026-10-20T22:33:03.355Z", t.ToString("O"));
 
-    [Fact]
-    public void AStickyLimitGivesWayToACommandButNotToATypedPrompt()
-    {
-        var err = LimitAt(DateTimeOffset.UtcNow);
-        Assert.NotNull(ResumeStopped.LimitOf([err, Typed], sticky: true));
-        Assert.NotNull(ResumeStopped.LimitOf([err, LocalUsage], sticky: true));
-        Assert.Null(ResumeStopped.LimitOf([err, LocalModel], sticky: true)); // the user fixed it by hand: not stopped any more
-        Assert.Null(ResumeStopped.LimitOf([err, LocalModel, Typed], sticky: true));
-    }
-
     static Clautoswap.Limit LimitStop(DateTimeOffset? resets, DateTimeOffset at, string? window = "five_hour") => new(window, resets, at);
 
     [Fact]
