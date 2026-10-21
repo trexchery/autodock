@@ -157,7 +157,7 @@ public sealed partial class Supervisor
         var probe = PlanProbe(goal);
         try
         {
-            w.Proc.Reap();
+            await w.Proc.ReapAsync();
             if (goal.Run is not { } run) return;
             run.Live = false;
             if (goal.State != GoalState.Active || !repo.Goals.Contains(goal)) return; // ended meanwhile: that decides

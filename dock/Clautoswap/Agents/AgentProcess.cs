@@ -28,6 +28,9 @@ public sealed class AgentProcess : IDisposable
         CreatedTicks = CreationTime(process);
     }
 
+    /// Normal priority for the end-to-end tests' fakes, which a busy machine must not starve past their deadlines.
+    internal static bool BelowNormal = true;
+
     /// Starts `exe args` in `workDir` at below-normal priority. A .cmd/.bat runs through cmd.exe.
     /// `env`: changes to the tray's environment (a null value removes the variable).
     public static AgentProcess Start(string exe, IReadOnlyList<string> args, string workDir, string jobName,
@@ -171,7 +174,7 @@ public sealed class AgentProcess : IDisposable
                 catch (Exception e) when (e is ArgumentException or InvalidOperationException or Win32Exception) { }
             await Task.WhenAny(WaitForExitAsync(), Task.Delay(grace));
         }
-        Reap();
+        await ReapAsync();
         if (!HasExited)
             try { using var p = Process.GetProcessById(Pid); p.Kill(entireProcessTree: true); } // re-attached without its job
             catch (Exception e) when (e is ArgumentException or InvalidOperationException or Win32Exception) { }
@@ -181,6 +184,14 @@ public sealed class AgentProcess : IDisposable
     public void Reap()
     {
         if (JobOpen) TerminateJobObject(_job!, 1);
+    }
+
+    /// Reap, then wait (up to five seconds) until nothing in the job runs: termination is asynchronous, and a
+    /// process still dying keeps its folder, its open files and git's index lock.
+    public async Task ReapAsync()
+    {
+        Reap();
+        for (var i = 0; i < 50 && JobOpen && ProcessIds().Length > 0; i++) await Task.Delay(100);
     }
 
     public void Dispose()
@@ -285,7 +296,7 @@ public sealed class AgentProcess : IDisposable
                     },
                     lpAttributeList = attrs,
                 };
-                var flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
+                var flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | (BelowNormal ? BELOW_NORMAL_PRIORITY_CLASS : 0);
                 if (breakaway) flags |= CREATE_BREAKAWAY_FROM_JOB;
                 if (!CreateProcessW(app, new StringBuilder(cmdline), IntPtr.Zero, IntPtr.Zero, true, flags, env, workDir, ref si, out var pi))
                     throw new Win32Exception();
