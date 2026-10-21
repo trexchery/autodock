@@ -216,6 +216,16 @@ public class ResumeStoppedTests
 
     static string LimitAt(DateTimeOffset t) => LimitV2.Replace("2026-10-20T22:33:03.355Z", t.ToString("O"));
 
+    [Fact]
+    public void AStickyLimitGivesWayToACommandButNotToATypedPrompt()
+    {
+        var err = LimitAt(DateTimeOffset.UtcNow);
+        Assert.NotNull(ResumeStopped.LimitOf([err, Typed], sticky: true));
+        Assert.NotNull(ResumeStopped.LimitOf([err, LocalUsage], sticky: true));
+        Assert.Null(ResumeStopped.LimitOf([err, LocalModel], sticky: true)); // the user fixed it by hand: not stopped any more
+        Assert.Null(ResumeStopped.LimitOf([err, LocalModel, Typed], sticky: true));
+    }
+
     static Clautoswap.Limit LimitStop(DateTimeOffset? resets, DateTimeOffset at, string? window = "five_hour") => new(window, resets, at);
 
     [Fact]
@@ -320,14 +330,13 @@ public class ResumeStoppedTests
     }
 
     [Fact]
-    public void LimitStopNeedsOnlyAShortQuiet()
+    public void LimitStopNeedsNoQuiet()
     {
         var root = Directory.CreateTempSubdirectory().FullName;
         try
         {
             Stage(root, "idle", [Typed, LimitAt(DateTimeOffset.UtcNow)]);
-            Assert.Single(ScanOf(root, 6));
-            Assert.Empty(ScanOf(root, 2));
+            Assert.Single(ScanOf(root, 0)); // an error is final: the record being idle is the whole predicate, no timer
             Stage(root, "idle", [Typed, Done]);
             File.SetLastWriteTimeUtc(Path.Combine(root, "projects", "C--w", "sid.jsonl"), DateTime.UtcNow.AddSeconds(-6));
             Assert.Empty(ScanOf(root, 0)); // a finished turn still waits the longer quiet
