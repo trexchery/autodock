@@ -34,7 +34,8 @@ public sealed partial class Supervisor
     async Task<string> StartPointAsync(RepoAgents repo, bool strict = false)
     {
         if (!await HasOriginAsync(repo)) return repo.Base;
-        if (Due(_fetched.GetValueOrDefault(repo), TimeSpan.FromMinutes(2)))
+        // Strict always fetches itself: a fetch already under way may fail and still count as recent.
+        if (strict || Due(_fetched.GetValueOrDefault(repo), TimeSpan.FromMinutes(2)))
         {
             var fetch = await GitAsync(repo.Path, "fetch", "--quiet", "origin", repo.Base);
             if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: Offline.IsMatch(fetch.Err + fetch.Out)); // a stale base proves nothing
@@ -421,11 +422,27 @@ public sealed partial class Supervisor
         // The owner's own routing (an "clautoswap" section in an issue they wrote) narrows it further.
         var (skip, only) = IssueInfo.Routing(issues, me);
         bool Wanted(IssueInfo i) => WantedBy(repo, i, _me, open, covered, skip, only);
+        var byNumber = issues.ToDictionary(i => i.Number);
+        // The director's unstarted picks (raised from below the owner's rank) are judged as a plan judges them: unwanted now,
+        // they leave their goal and the line below takes them; what was planned on them asks the owner or leaves too.
+        // A blocker that is an item, in any state, is left to `after`: Ready counts a merged one as landed, Tend flags one closed unmerged.
+        var sequenced = open.Except(repo.Items.Select(i => i.Issue).OfType<int>()).ToHashSet();
+        foreach (var i in repo.Items.Where(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null, Goal: not null, OwnRank: < OwnerRank, Issue: { } n }
+                                                && byNumber.TryGetValue(n, out var picked) && !WantedBy(repo, picked, _me, sequenced, covered, skip, only)).ToList())
+        {
+            if (GoalOf(i.Goal) is { } g) { AddLog(g, DateTimeOffset.Now, $"{i.Label} left: agents may no longer take it"); g.Claim = null; }
+            Unplan(repo, i.Goal!, [i]);
+            HoldDependents(_state.Repos, repo, i, "which agents may no longer take");
+        }
         // Unstarted work found by scanning that is no longer wanted (now blocked, a tracker, routed elsewhere,
         // or someone else's pull request covers it) leaves the queue; work the owner named stays.
-        var byNumber = issues.ToDictionary(i => i.Number);
-        repo.Items.RemoveAll(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null } && i.Rank < OwnerRank && i.Goal == null
-                                  && i.Issue is { } n && byNumber.TryGetValue(n, out var issue) && !Wanted(issue));
+        var unwanted = repo.Items.Where(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null } && i.Rank < OwnerRank && i.Goal == null
+                                             && i.Issue is { } n && byNumber.TryGetValue(n, out var issue) && !Wanted(issue)).ToList();
+        foreach (var i in unwanted)
+        {
+            repo.Items.Remove(i);
+            HoldDependents(_state.Repos, repo, i, "which agents may no longer take"); // a missing predecessor reads as landed
+        }
 
         // Closed issues: unstarted and parked work goes, and so does work under way that has no pull
         // request yet. A full page may not list every open issue, so only a complete list counts.
@@ -437,12 +454,15 @@ public sealed partial class Supervisor
             foreach (var gone in repo.Items.Where(Gone).ToList())
             {
                 if (!Gone(gone)) continue; // its run ended while an earlier one was stopping, and its check took over
+                var landed = gone is { State: ItemState.Done } && (gone.Merged || gone.Pr == null); // closing the issue of work that merged changes nothing for what waits on it
                 if (gone.State != ItemState.Done)
                 {
                     await StopWorkerAsync(gone, "skipped");
                     await FinishAsync(repo, gone, "its issue was closed");
                 }
+                if (!landed && GoalOf(gone.Goal) is { } g) g.Claim = null; // ended unmerged: the claim may have counted on it
                 repo.Items.Remove(gone);
+                if (!landed) HoldDependents(_state.Repos, repo, gone, "whose issue was closed"); // a missing predecessor reads as landed
             }
             foreach (var g in repo.Goals.Where(g => g is { State: GoalState.Active or GoalState.NeedsOwner, Issue: { } n } && !open.Contains(n)).ToList())
                 await EndGoalAsync(repo, g, GoalState.Dropped, $"its issue #{g.Issue} was closed");

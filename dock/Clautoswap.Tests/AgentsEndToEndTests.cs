@@ -1030,10 +1030,154 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w4"}"""));
         Assert.Equal(GoalState.NeedsOwner, await On(r => G(r).State)); // the question was about w2: it stays
 
-        // Skipping a step takes what was planned on it out of the goal, so it cannot start without it.
+        // Skipping a step takes what was planned on it out of the goal, so it cannot start without it, and a claim
+        // that counted on it.
+        await _loop.Run(() => G(_sup!.RepoFor(_repo)!).Claim = "done once w2 lands");
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w2"}"""));
         Assert.False(await On(r => r.Items.Any(i => i.Id == "w3"))); // a request planned on it is no longer in the goal
         Assert.Equal(GoalState.Active, await On(r => G(r).State)); // that answered the question about it
+        Assert.Null(await On(r => G(r).Claim));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task SkippingAStepStopsTheGoalsRunningPlanner()
+    {
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Chain", text = "[fake:hold] Plan slowly." });
+        await Until(r => G(r).Run is { Live: true, Pid: > 0 }, "the planner runs");
+        await _loop.Run(() =>
+        {
+            var r = _sup!.RepoFor(_repo)!;
+            r.Items.Add(new WorkItem { Id = "w1", Title = "Step", Goal = r.Key + "/g1", Rank = 10100 });
+            return 0;
+        });
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w1"}"""));
+        await Until(r => G(r).Run is not { Live: true }, "its stale plan is not waited for");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AGoalStepWhoseIssueClosedClearsTheGoalsClaim()
+    {
+        const string docs = """{"number":5,"title":"Write the docs page","body":"Docs.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
+        Issues($"[{docs}]");
+        Plan("""{"status":"working","summary":"docs","items":[{"key":"b","issue":5}]}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Docs" });
+        await Until(r => r.Items.Any(i => i.Issue == 5 && i.Goal != null), "the planned issue is in the goal");
+        await _loop.Run(() => G(_sup!.RepoFor(_repo)!).Claim = "done once #5 lands");
+        Issues("[]");
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
+        await Until(r => !r.Items.Any(i => i.Issue == 5), "the closed issue's item goes");
+        Assert.Equal((null, GoalState.Active), await On(r => (G(r).Claim, G(r).State))); // not Achieved on work that ended unmerged
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task PlannedIssueWorkTheOwnerHoldsLeavesTheGoalAndTheQueue()
+    {
+        const string docs = """{"number":5,"title":"Write the docs page","body":"Docs.","assignees":[],"author":{"login":"owner"},"labels":""";
+        Issues($"[{docs}[]}}]");
+        Plan("""{"status":"working","summary":"docs","items":[{"key":"a","title":"Held one","body":"[fake:hold] one"},{"key":"b","issue":5},{"key":"c","title":"Link the docs","body":"Link them.","after":["b"]}]}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Docs" });
+        await Until(r => W(r, "w1").State == ItemState.Working && Item(r, 5).Goal != null && W(r, "w2").After.Count == 1, "the first step works while the planned issue waits");
+
+        // The owner puts #5 on hold before it starts: the next scan judges it as it judges any work it found.
+        Issues($$"""[{{docs}}[{"name":"on hold"}]}]""");
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
+        await Until(r => !r.Items.Any(i => i.Issue == 5), "the held issue leaves the queue");
+        Assert.False(await On(r => r.Items.Any(i => i.Id == "w2"))); // planned on it, so it goes too, not started without it
+        Assert.Equal(ItemState.Working, await On(r => W(r, "w1").State));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    const string Gh12 = """{"number":12,"title":"Twelve","body":"One.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
+    const string Gh8 = """{"number":8,"title":"Eight","body":"Blocked by #12.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
+
+    /// A busy step holds the only slot; the plan adopts #12 and #8 (blocked by #12), which wait on the ramp.
+    async Task AdoptTwelveAndEightAsync()
+    {
+        Issues($"[{Gh12},{Gh8}]");
+        Plan("""{"status":"working","summary":"three","items":[{"key":"a","title":"Busy","body":"[fake:hold] busy"},{"key":"b","issue":12},{"key":"c","issue":8}]}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Pair" });
+        await Until(r => W(r, "w1").State == ItemState.Working && Item(r, 12).Goal != null && Item(r, 8).Goal != null, "the busy step works while both wait");
+    }
+
+    async Task RescanAsync()
+    {
+        int Lists() => Read(Path.Combine(_gh, "gh.log")).Split('\n').Count(l => l.StartsWith("pr list --state open --limit 100 --json number,closing"));
+        var before = Lists();
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
+        await Until(_ => Lists() > before, "the scan ran");
+        await Until(_ => !_sup!.Pumping, "the scan judged the queue"); // the read starts inside the pass that then judges
+    }
+
+    [Fact]
+    public async Task APlannedStepStaysWhenItsMergedBlockersIssueIsStillOpen()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.State, i.Pr, i.Merged, i.Worktree) = (ItemState.Done, 3, true, null); return 0; });
+        await RescanAsync();
+        Assert.NotNull(await On(r => Item(r, 8).Goal)); // agents' pull requests do not close issues: #12 stays open after it merged
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ClosingAMergedPredecessorsIssueLeavesWhatWaitsOnIt()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.State, i.Pr, i.Merged, i.Worktree, i.Goal) = (ItemState.Done, 3, true, null, null); return 0; });
+        Issues($"[{Gh8.Replace("Blocked by #12.", "")}]"); // the owner closed #12
+        await RescanAsync();
+        Assert.Equal((ItemState.Queued, true), await On(r => (Item(r, 8).State, Item(r, 8).Goal != null)));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AClosedUnmergedPredecessorHoldsWhatWaitsOnIt()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.State, i.Pr, i.Merged, i.Worktree, i.Goal) = (ItemState.Done, 3, false, null, null); return 0; });
+        Issues($"[{Gh8}]"); // the owner closed #12 without its pull request merging
+        await RescanAsync();
+        Assert.Equal(ItemState.NeedsOwner, await On(r => Item(r, 8).State));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task APredecessorPrunedByTheScanHoldsWhatWaitsOnIt()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.Goal, i.OwnRank, i.Rank, i.After) = (null, null, 0, []); return 0; }); // an ordinary find now
+        Issues($"[{Gh12.Replace("\"labels\":[]", "\"labels\":[{\"name\":\"on hold\"}]")},{Gh8}]");
+        await RescanAsync();
+        Assert.False(await On(r => r.Items.Any(i => i.Issue == 12)));
+        Assert.Equal(ItemState.NeedsOwner, await On(r => Item(r, 8).State));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AnsweringAHeldPlannedIssueKeepsItThroughTheNextScan()
+    {
+        await AdoptTwelveAndEightAsync();
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#12"}"""));
+        Assert.Equal(ItemState.NeedsOwner, await On(r => Item(r, 8).State));
+        await Tool("agents_queue", """{"action":"answer","item":"#8"}""");
+        await RescanAsync();
+        Assert.Equal((ItemState.Queued, true), await On(r => (Item(r, 8).State, Item(r, 8).Goal != null))); // the owner chose to run it
+        File.WriteAllText(_log + ".release", "");
         _sup!.Dispose();
     }
 

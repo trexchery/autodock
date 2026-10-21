@@ -202,7 +202,7 @@ public sealed class AgentStore(string root)
 
     public AgentsState Load()
     {
-        try { return JsonSerializer.Deserialize<AgentsState>(File.ReadAllText(StatePath), Options) ?? new(); }
+        try { return Upgrade(JsonSerializer.Deserialize<AgentsState>(File.ReadAllText(StatePath), Options) ?? new()); }
         catch (FileNotFoundException) { return new(); }
         catch (DirectoryNotFoundException) { return new(); }
         catch (JsonException)
@@ -211,6 +211,13 @@ public sealed class AgentStore(string root)
             try { File.Copy(StatePath, StatePath + ".corrupt", overwrite: true); } catch (IOException) { }
             return new();
         }
+    }
+
+    /// State written before `Merged` existed: a finished item whose note says its pull request merged was merged.
+    internal static AgentsState Upgrade(AgentsState s)
+    {
+        foreach (var i in s.Repos.SelectMany(r => r.Items).Where(i => i is { State: ItemState.Done, Merged: false, Pr: { } p } && i.Note == $"pull request #{p} merged")) i.Merged = true;
+        return s;
     }
 
     public void Save(AgentsState s) => AtomicFile.WriteAllText(StatePath, JsonSerializer.Serialize(s, Options));

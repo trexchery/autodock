@@ -334,7 +334,7 @@ public sealed partial class Supervisor : IDisposable
             // planned work waits for what it builds on.
             Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
             // Counted over every working folder: the setting is the tray's, not each repository's; a paused or closed one's checks wait.
-            while (!_disposed && !_launching && _state.Repos.Where(Active).Sum(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)) < cap)
+            while (!_disposed && !_launching && repo.LastScan != null && _state.Repos.Where(Active).Sum(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)) < cap) // not before a scan re-applied what an unplan stripped
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
@@ -754,6 +754,8 @@ public sealed partial class Supervisor : IDisposable
     /// An agents terminal opened for this folder, or linked up again after a restart.
     /// Settings changed: look for work again.
     public void Poke() => Pump();
+
+    internal bool Pumping => _pumping;
 
     public void Attach(string path)
     {

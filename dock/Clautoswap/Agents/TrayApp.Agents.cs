@@ -225,7 +225,7 @@ public sealed partial class TrayApp
         using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
         owner.Show();
         return Task.FromResult(MessageBox.Show(owner,
-            $"Let clautoswap run these commands in a fresh checkout of {repo.Base} to decide whether a goal in {repo.Leaf} is achieved?\n\n" +
+            $"Let clautoswap run these commands unattended, as you, in a fresh checkout of {repo.Base} to decide whether a goal in {repo.Leaf} is achieved?\n\n" +
             string.Join("\n", checks.Select(c => "    " + c)) + "\n\nNothing else asks them to run.",
             "clautoswap — goal checks", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
     }

@@ -220,14 +220,22 @@ public sealed partial class Supervisor
         var covered = await _cli.GhAsync(repo.Path, "pr", "list", "--state", "open", "--limit", "100", "--json", "number,closingIssuesReferences") is { Ok: true } prs
             ? IssueInfo.ClosedByOpenPullRequests(prs.Out) : [];
         var (skip, only) = IssueInfo.Routing(issues, me);
+        return Takeable(repo, issues, me, covered, skip, only, sequenced);
+    }
+
+    /// The issues agents may take, by the scan's rules. A plan and the scan judge alike, or one would undo what the other did.
+    internal static List<IssueInfo> Takeable(RepoAgents repo, List<IssueInfo> issues, string me, HashSet<int> covered, HashSet<int> skip, HashSet<int>? only, IReadOnlySet<int>? sequenced)
+    {
         var items = repo.Items.Where(i => i.State != ItemState.Done).Select(i => i.Issue).OfType<int>().ToHashSet();
+        var finished = repo.Items.Where(i => i is { State: ItemState.Done } && !(i.Merged || i.Pr == null)).Select(i => i.Issue).OfType<int>().ToHashSet();
         var left = (sequenced ?? new HashSet<int>()).ToHashSet(); // a blocker the plan itself sequences is left to `after`: only while it is taken
         while (true)
         {
             var open = issues.Select(i => i.Number).ToHashSet();
             open.ExceptWith(left);
             var wanted = issues.Where(i => WantedBy(repo, i, me, open, covered, skip, only)).ToList();
-            if (left.RemoveWhere(n => !items.Contains(n) && wanted.All(w => w.Number != n)) == 0) return wanted; // one not taken still blocks what waits on it
+            // One not taken still blocks what waits on it, and so does an unlanded finished item's issue that is still open (Ready counts a merged one as landed).
+            if (left.RemoveWhere(n => finished.Contains(n) || !items.Contains(n) && wanted.All(w => w.Number != n)) == 0) return wanted;
         }
     }
 
@@ -287,14 +295,19 @@ public sealed partial class Supervisor
         if (plan.Status == "working") // achieved and blocked plans add and drop nothing
         {
             dropped = (plan.Drop ?? []).Select(Ref).OfType<string>().Select(r => Resolve(repos, repo, r)).OfType<(RepoAgents Repo, WorkItem Item)>()
-                .Distinct().GroupBy(x => x.Repo).Sum(g => Unplan(g.Key, key, g.Select(x => x.Item)));
-            var keys = new Dictionary<string, (RepoAgents Repo, WorkItem Item)>(StringComparer.OrdinalIgnoreCase); // earlier steps only, so `after` cannot loop
+                .Distinct().GroupBy(x => x.Repo).Sum(g => Unplan(g.Key, key, g.Select(x => x.Item))); // the plan kept what it did not list: a removed step reads as landed
+            var keys = new Dictionary<string, (RepoAgents Repo, WorkItem Item)>(StringComparer.OrdinalIgnoreCase); // steps taken so far, so `after` cannot loop
             var declared = (plan.Items ?? []).Take(MaxSteps).Select(x => Ref(x.Key)).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
-            // A step's key never means an existing item: a skipped or later step's key is unknown, not whatever item is named alike.
+            // A step's key never means an existing item: a skipped step's key, or one in a cycle, is unknown, not whatever item is named alike.
             (RepoAgents Repo, WorkItem Item)? Known(string r) => keys.TryGetValue(r, out var k) ? k : declared.Contains(r) ? null : Resolve(repos, repo, r);
             var planned = new Dictionary<int, WorkItem>();
-            foreach (var (step, index) in (plan.Items ?? []).Take(MaxSteps).Select((x, at) => (x, at)))
+            var todo = (plan.Items ?? []).Take(MaxSteps).Select((x, at) => (x, at)).ToList();
+            while (todo.Count > 0)
             {
+                // As listed, except that a step goes after a later one it builds on; a cycle stays as listed and is skipped below.
+                var (step, index) = todo.FirstOrDefault(s => !(s.x.After ?? []).Select(Ref).OfType<string>().Any(r => todo.Any(t => t.at != s.at && string.Equals(Ref(t.x.Key), r, StringComparison.OrdinalIgnoreCase))));
+                if (step is null) (step, index) = todo[0];
+                todo.RemoveAll(t => t.at == index);
                 var title = Brief(step.Title, 120);
                 if (Target(repos, repo, step.Repo) is not { } target)
                 {
@@ -305,7 +318,7 @@ public sealed partial class Supervisor
                 var refs = (step.After ?? []).Select(Ref).OfType<string>().ToList();
                 if (refs.FirstOrDefault(r => Known(r) == null) is { } unknown)
                 {
-                    AddLog(goal, now, $"skipped \"{title}\": it builds on {unknown}, which is not a step or item that exists"); // never start it without its prerequisite
+                    AddLog(goal, now, $"skipped \"{title}\": it builds on {unknown}, which is neither an item nor a step that can go first"); // never start it without its prerequisite
                     continue;
                 }
                 var after = refs.Select(r => Known(r)!.Value).Select(x => Key(x.Repo, x.Item)).Distinct().ToList();
@@ -392,13 +405,15 @@ public sealed partial class Supervisor
     }
 
     /// The goal's work that has not started stops serving it: planned requests go, adopted issues stay as ordinary work.
-    internal static int Unplan(RepoAgents repo, string goalKey, IEnumerable<WorkItem> which)
+    internal static int Unplan(RepoAgents repo, string goalKey, IEnumerable<WorkItem> which, List<WorkItem>? left = null)
     {
         var n = 0;
         foreach (var i in which.Where(i => i.Goal == goalKey && (i is { State: ItemState.Queued, Worktree: null, Pr: null } || Held(i))).ToList())
         {
             if (i.Issue == null) repo.Items.Remove(i);
             else { if (Held(i)) (i.State, i.Note) = (ItemState.Queued, null); i.Goal = null; i.After = []; if (i.OwnRank is { } own) i.Rank = own; i.OwnRank = null; } // planner rank off, an owner's pick keeps its own
+            if (i.Issue != null) repo.LastScan = null; // it may not start before a scan has re-applied its blockers, holds and routing
+            left?.Add(i);
             n++;
         }
         return n;
@@ -539,10 +554,19 @@ public sealed partial class Supervisor
         (goal.State, goal.Note, goal.Claim, goal.Replan) = (state, why, null, false);
         if (state == GoalState.Achieved) (goal.Evidence, goal.AchievedAt) = (why, now);
         AddLog(goal, now, why);
-        var key = Key(repo, goal);
-        var gone = _state.Repos.Sum(r => Unplan(r, key, r.Items));
+        var gone = UnplanEverywhere(_state.Repos, Key(repo, goal));
         Save();
         await StopWorkerAsync(goal, "owner");
+        return gone;
+    }
+
+    /// Stops the goal's unstarted work serving it. What was planned on a step that left must not start without it;
+    /// an adopted issue that stays queued keeps its dependents waiting (Ready), and the scan prunes it if it must go.
+    internal static int UnplanEverywhere(IReadOnlyList<RepoAgents> repos, string key)
+    {
+        var left = new List<(RepoAgents, WorkItem)>();
+        var gone = repos.Sum(r => { var l = new List<WorkItem>(); var n = Unplan(r, key, r.Items, l); left.AddRange(l.Select(i => (r, i))); return n; });
+        foreach (var (r, i) in left.Where(x => !x.Item1.Items.Contains(x.Item2))) HoldDependents(repos, r, i, "which no longer serves its goal");
         return gone;
     }
 
