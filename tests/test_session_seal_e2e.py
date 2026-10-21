@@ -307,8 +307,14 @@ def test_closed_window_is_sealed_by_the_next_list(rig):
     _wait_for(lambda: not is_pid_alive(term.info["pid"]), "fake claude to exit")
     assert _plaintext(term.profile) == (ALICE[0], "synthetic-refresh-a-rotated")
 
-    listed = rig.cswap("list", "--json")
-    assert listed.returncode == 0, listed.stderr
-    json.loads(listed.stdout)
-    assert _plaintext(term.profile) is None
+    # The killed claude's record stays behind, and on Windows it carries no
+    # start stamp: if its PID is reused (a loaded machine spawns plenty), the
+    # sweep rightly holds off. The tray polls `list`, so a later sweep seals.
+    def swept() -> bool:
+        listed = rig.cswap("list", "--json")
+        assert listed.returncode == 0, listed.stderr
+        json.loads(listed.stdout)
+        return _plaintext(term.profile) is None
+
+    _wait_for(swept, "a list to seal the closed window's profile")
     assert rig.backup_refresh(1, ALICE[0]) == "synthetic-refresh-a-rotated"
