@@ -20,7 +20,7 @@ public sealed partial class TrayApp
             return null;
         }
         _agents = new Supervisor(_engine, cli, new AgentStore(AgentStore.DefaultRoot),
-            new AgentsConfig { Threshold = Threshold, MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs });
+            new AgentsConfig { Threshold = Threshold, MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs, Ultracode = _settings.AgentUltracode });
         _agents.Authorize = AuthorizeAgents;
         _agents.ConfirmChecks = ConfirmAgentChecks;
         _agents.Notify = (title, text) => Notify(title, text);
@@ -49,6 +49,7 @@ public sealed partial class TrayApp
         _agents.Config.MaxConcurrent = _settings.AgentIssues;
         _agents.Config.MaxOpenPrs = _settings.AgentOpenPrs;
         _agents.Config.DraftPrs = _settings.AgentDraftPrs;
+        _agents.Config.Ultracode = _settings.AgentUltracode;
         _agents.Poke();
     }
 

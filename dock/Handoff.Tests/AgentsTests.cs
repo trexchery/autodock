@@ -31,7 +31,7 @@ public class AgentStreamTests
             e => Assert.Equal("Edit …/src/deep/a.cs", StreamTail.Describe(e)));
         File.AppendAllText(path, """ess","is_error":false,"result":"done\nHANDOFF: DONE x","total_cost_usd":0.5,"num_turns":3,"usage":{"output_tokens":40}}""" + "\n");
         var result = Assert.IsType<ResultEvent>(Assert.Single(tail.Read()));
-        Assert.Equal(new ResultEvent(false, "success", "done\nHANDOFF: DONE x", 0.5, 3, 40), result);
+        Assert.Equal(new ResultEvent(false, "success", "done\nHANDOFF: DONE x", 0.5, 3, 40, new Tokens(0, 40, 0, 0)), result);
         Assert.Empty(tail.Read());
         Assert.Equal(5, StreamTail.ReadAll(path).Count);
     }
@@ -858,9 +858,17 @@ public class AgentWorkerPolicyTests
         Assert.Contains("--resume", review);
         Assert.Contains("Edit", review);
         Assert.Contains("Write", review);
-        Assert.DoesNotContain("--model", work); // work and review keep the owner's default model
-        var plan = Supervisor.WorkerArgs(3, "sid", resume: false, review: true, model: Supervisor.PlannerModel);
+        var plan = Supervisor.WorkerArgs(3, "sid", resume: false, review: true, Routing.Plan);
         Assert.Equal("opus", plan[Array.IndexOf(plan, "--model") + 1]);
+        // Every run states all three settings; none comes from the profile.
+        var routed = Supervisor.WorkerArgs(3, "sid", resume: true, review: false, new RunSettings("haiku", "max", true));
+        Assert.Equal("haiku", routed[Array.IndexOf(routed, "--model") + 1]);
+        Assert.Equal("max", routed[Array.IndexOf(routed, "--effort") + 1]);
+        using (var settings = JsonDocument.Parse(routed[Array.IndexOf(routed, "--settings") + 1]))
+        {
+            Assert.True(settings.RootElement.GetProperty("ultracode").GetBoolean());
+            Assert.Equal(["haiku", "sonnet", "opus"], settings.RootElement.GetProperty("availableModels").EnumerateArray().Select(m => m.GetString()));
+        }
 
         using var tmp = new TempDir();
         var env = Supervisor.WorkerEnvironment(Path.Combine(tmp.Path, "no-gh"));
@@ -871,6 +879,11 @@ public class AgentWorkerPolicyTests
         Assert.StartsWith("handoff-agent", env["GH_TOKEN"]);
         Assert.Equal("1", env["NoDefaultCurrentDirectoryInExePath"]);
         Assert.True(env.ContainsKey("CLAUDE_CONFIG_DIR") && env["CLAUDE_CONFIG_DIR"] == null);
+        // Without ultracode, workflows are off outright; nothing remaps a model alias or sets thinking.
+        Assert.Equal("1", env["CLAUDE_CODE_DISABLE_WORKFLOWS"]);
+        Assert.True(env.ContainsKey("ANTHROPIC_MODEL") && env["ANTHROPIC_MODEL"] == null);
+        Assert.True(env.ContainsKey("MAX_THINKING_TOKENS") && env["MAX_THINKING_TOKENS"] == null);
+        Assert.Null(Supervisor.WorkerEnvironment(Path.Combine(tmp.Path, "no-gh"), ultracode: true).GetValueOrDefault("CLAUDE_CODE_DISABLE_WORKFLOWS"));
     }
 }
 

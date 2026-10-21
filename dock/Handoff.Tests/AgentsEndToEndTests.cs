@@ -85,6 +85,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         StopGrace = TimeSpan.FromSeconds(5),
         LaunchBackoff = TimeSpan.FromSeconds(1),
         Relink = TimeSpan.FromSeconds(1),
+        Triage = false, // its own tests turn it on: it would take the fake director's plans meant for goals
     };
 
     /// The tray starting, with the repository's agents terminal open (agents work only then) unless `terminal` is false.
@@ -406,6 +407,90 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Equal(3, Runs.Count(r => !r.Contains("NotebookEdit")));
         Assert.Equal(2, Runs.Count(r => r.Contains("--resume")));
         Assert.False(File.Exists(Path.Combine(await On(r => Item(r, 30).Worktree!), "broken.txt")));
+        // Unrouted, it runs on the default route. One failed verification may be a flake: the same route resumes.
+        // The review's findings are a genuine failure: the fix pass gets the stronger model, same effort, same conversation.
+        var work = Runs.Where(r => !r.Contains("NotebookEdit")).ToArray();
+        Assert.All(work[..2], r => Assert.Contains("--model sonnet --effort medium", r));
+        Assert.Contains("--model opus --effort medium", work[2]);
+        Assert.Contains("--resume", work[2]);
+        Assert.All(Runs, r => Assert.Contains("\"ultracode\":false", r)); // the owner never allowed it
+        var route = await On(r => Item(r, 30).Route!);
+        Assert.Equal(("opus", 1, true), (route.Model, route.Escalations, route.VerifyFailed));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task TheTriageRoutesQueuedIssuesAndTheirRunsUseTheRoute()
+    {
+        Issues("""
+        [
+          {"number":40,"title":"Fix typo","body":"Teh -> The in README.","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":41,"title":"Split the parser","body":"Three independent parsers.","labels":[],"assignees":[],"author":{"login":"owner"}}
+        ]
+        """);
+        // The director runs #41 first, on Haiku at high effort with ultracode (the three choices are its own), and #40 after it.
+        Plan("""
+        {"status":"working","summary":"two items","items":[{"title":"invented"}],"route":[
+          {"item":"#41","difficulty":"trivial","model":"haiku","effort":"high","ultracode":true,"why":"parts are independent"},
+          {"item":"#40","difficulty":"trivial","model":"haiku","effort":"low","after":["#41"]}]}
+        """);
+        var config = Fast();
+        (config.Triage, config.Ultracode, config.Ramp) = (true, true, TimeSpan.FromSeconds(1));
+        await StartAsync(config);
+        await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+        await Until(r => r.Items.Any(i => i.Issue == 41 && i.State == ItemState.Open), "#41 reaches a pull request");
+        var director = Assert.Single(DirectorPrompts());
+        Assert.Contains("There is no goal to plan here", director);
+        Assert.Contains("Three independent parsers.", director); // bounded descriptions, not titles alone
+        Assert.Contains("Capacity:", director);
+        // The triage plans nothing and is read-only, without workflows; the work run uses its route, the reviewer is never Haiku.
+        Assert.Equal(2, await On(r => r.Items.Count));
+        Assert.Contains("NotebookEdit", Runs[0]);
+        Assert.Contains("--model opus --effort medium", Runs[0]);
+        Assert.Contains("\"ultracode\":false", Runs[0]);
+        Assert.Contains("issue #41", Read(_log + ".prompts").Split("---- account")[2]);
+        Assert.Contains("--model haiku --effort high", Runs[1]);
+        Assert.Contains("\"ultracode\":true", Runs[1]); // allowed, recommended, and account #2 has room
+        Assert.Contains("--model sonnet --effort low", Runs[2]);
+        // #40 waited for #41 to land, and its prompt says what #41 did.
+        Assert.Equal(ItemState.Queued, await On(r => Item(r, 40).State));
+        File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"MERGED"}""");
+        await Until(r => Item(r, 40).State == ItemState.Open, "#40 starts once #41 merged");
+        Assert.Contains("This builds on work that already landed:\n- #41 Split the parser (merged as #7): added issue-41.txt", Read(_log + ".prompts").ReplaceLineEndings("\n"));
+        // The triage is no goal of the owner's; every run was measured, quota as usage, never as cost.
+        Assert.Equal("No goals yet.", await Tool("agents_goal", """{"action":"list"}"""));
+        Assert.Contains("route haiku · low (trivial, director)", await Tool("agents_details", """{"item":"#40"}"""));
+        var metrics = Read(Path.Combine(P("agents"), "metrics.jsonl")).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.True(metrics.Length >= 5);
+        using var first = JsonDocument.Parse(metrics[0]);
+        Assert.Equal(("plan", "plan", "opus", "fake-model"), (first.RootElement.GetProperty("kind").GetString(), first.RootElement.GetProperty("outcome").GetString(),
+            first.RootElement.GetProperty("model").GetString(), first.RootElement.GetProperty("ran_on").GetString()));
+        Assert.True(first.RootElement.GetProperty("quota_start").GetProperty("fiveHour").GetDouble() >= 0);
+        Assert.DoesNotContain("cost", metrics[0], StringComparison.OrdinalIgnoreCase);
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AnIssueOrderedAfterOneClosedUnmergedAsksTheOwnerInsteadOfWaitingForever()
+    {
+        Issues("""
+        [
+          {"number":40,"title":"Use the parser","body":"Needs the parser.","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":41,"title":"Split the parser","body":"Parser first.","labels":[],"assignees":[],"author":{"login":"owner"}}
+        ]
+        """);
+        Plan("""{"status":"working","route":[{"item":"#41"},{"item":"#40","after":["#41"]}]}""");
+        var config = Fast();
+        (config.Triage, config.Ramp) = (true, TimeSpan.FromSeconds(1));
+        await StartAsync(config);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 41).State == ItemState.Open, "#41 reaches a pull request");
+        File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"CLOSED"}""");
+        await Until(r => Item(r, 40).State == ItemState.NeedsOwner, "#40 asks instead of waiting on a change that will never land");
+        Assert.StartsWith("it was planned after #41 Split the parser, whose pull request was closed without merging", await On(r => Item(r, 40).Note));
+        Assert.False(await On(r => Supervisor.Problem(Item(r, 40)))); // a question, not a broken run: no dot
+        await Tool("agents_queue", """{"action":"answer","item":"#40"}""");
+        await Until(r => Item(r, 40).State == ItemState.Open, "answered, it runs without the prerequisite");
         _sup!.Dispose();
     }
 

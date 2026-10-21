@@ -34,11 +34,23 @@ pausing or stopping also holds any push that was about to happen. closing an iss
 
 ## goals
 
-for an objective bigger than one change, set a goal in the terminal: *"goal: the app has a settings page; `npm test` must pass"*. a read-only director session on Opus reads the whole project (it changes nothing; work and review runs keep your default model, and the director only goes to an account with Opus weekly room left) and plans the next few steps, each one a pull request like any other; steps wait for the ones they build on to be merged. it plans again as steps land, and asks you when only you can decide. ask how goals stand, answer a goal's question, ask for a new plan, drop a goal, or say it's done, all in the terminal.
+for an objective bigger than one change, set a goal in the terminal: *"goal: the app has a settings page; `npm test` must pass"*. a read-only director session on Opus reads the whole project (it changes nothing, and only goes to an account with Opus weekly room left) and plans the next few steps, each one a pull request like any other; steps wait for the ones they build on to be merged. it plans again as steps land, and asks you when only you can decide. ask how goals stand, answer a goal's question, ask for a new plan, drop a goal, or say it's done, all in the terminal.
 
 a goal counts as achieved only on evidence: once its steps are done, handoff runs the checks you gave it (you confirm the exact commands in a handoff dialog) and the verification command in a fresh checkout of the base branch. a claim without a check or merged work is put to you instead. three plans in a row that change nothing, or three failed plans, park the goal for you.
 
 a goal can plan steps in your other repositories that agents work on (by folder name), and a step in one can wait for a step in another. those steps run under that repository's own rules: only while its agents terminal is open, with its verification command and its pull request limit. the director only plans new steps there; issues there are taken up by that repository's own agents.
+
+## models, effort and ultracode
+
+every run states three separate settings: the model (Haiku, Sonnet or Opus; no other model, subagents included), the effort (low to max) and ultracode (on or off). none implies another.
+
+- **who decides.** the director recommends them, with a difficulty (trivial, standard, hard), for each step it plans and for the queued work. issues with no goal get the same: when queued work near the front has no route yet, a short read-only director pass (on Opus when there is room, otherwise Sonnet) orders it, routes it, and may say which issue must land before another. it plans no new work, shows up in no goal list, and an issue waits for it only while it runs. handoff checks every recommendation: Haiku only for trivial work, unknown values fall back by difficulty, reviewers are never Haiku. without a recommendation a run uses Sonnet at medium effort.
+- **quota.** a run goes to an account with room in that model's own weekly window. with no Opus room anywhere, Opus work runs on Sonnet at no less than high effort instead of waiting, unless failures already moved it to Opus.
+- **ultracode** is off unless you turn on **Ultracode** in settings. then a run gets it when the director (or an escalation) asks for it, whatever its model or effort, and only on an account that runs nothing else and is at least 30 points below the switch threshold. it is never used for reviews or the director.
+- **failures.** a review that finds problems moves the fix to a stronger model; verification or pull request checks that fail a second time raise the effort; once both are at the top, ultracode (if allowed). limits, stalls, crashes and a single failing check are not escalated. the worktree, branch and conversation stay.
+- **measured.** each finished run adds a line to `metrics.jsonl` in the agents folder: its settings, the model Claude reports, duration, tokens (subagents included), its account's usage at start and end, and the outcome. quota is read from the usage windows, never from the API-equivalent cost Claude prints. `agents_details` shows an item's route and its last run.
+
+a step that waits on another gets a short summary of what that one did.
 
 ## memory
 

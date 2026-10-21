@@ -123,6 +123,7 @@ public sealed partial class Supervisor
             if (verified is { } failure)
             {
                 item.Followup = $"handoff ran `{repo.Verify}` in this worktree and it failed:\n{failure}";
+                Escalate(repo, item, "verify");
                 Charge(repo, item, $"`{repo.Verify}` failed");
                 return;
             }
@@ -326,6 +327,10 @@ public sealed partial class Supervisor
                 var merged = pr.State == "MERGED";
                 item.Merged = merged;
                 if (!merged && GoalOf(item.Goal) is { } g) g.Claim = null; // the claim may have counted on this change
+                // An issue the director ordered after this one would wait for it forever: it asks the owner (a goal's steps ask through Tend).
+                if (!merged)
+                    foreach (var d in repo.Items.Where(d => d is { Goal: null, Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null } && d.After.Contains(Key(repo, item))))
+                        (d.State, d.Note, d.After) = (ItemState.NeedsOwner, $"{SkipHold}{item.Label}, whose pull request was closed without merging; answer to run it anyway", [.. d.After.Where(k => k != Key(repo, item))]);
                 Memory.Add(repo.Memory, merged
                     ? $"Merged #{item.Pr} ({item.Label}){(item.Summary is { } s ? ": " + s : "")}"
                     : $"Closed without merging: #{item.Pr} ({item.Label}). The owner did not want this change as made{(item.Summary is { } c ? ": " + c : "")}",
@@ -361,6 +366,7 @@ public sealed partial class Supervisor
             }
             item.Followup = string.Join("\n\n", asks);
             item.State = ItemState.Queued;
+            if (pr.FailedChecks.Count > 0) Escalate(repo, item, "verify"); // the owner's comments are requests, not failures
         }
         Save();
     }
@@ -389,6 +395,8 @@ public sealed partial class Supervisor
     // -- issue discovery ----------------------------------------------------
 
     string? _me;
+    /// The owner's open issues as the last scan read them.
+    readonly Dictionary<RepoAgents, List<IssueInfo>> _openIssues = [];
 
     /// Whether agents may take the issue: actionable, no open pull request has it, not skipped or routed elsewhere, not a goal.
     static bool WantedBy(RepoAgents repo, IssueInfo i, string? me, HashSet<int> open, HashSet<int> covered, HashSet<int> skip, HashSet<int>? only) =>
@@ -414,6 +422,8 @@ public sealed partial class Supervisor
         if (!r.Ok) { if (!Offline.IsMatch(r.Err + r.Out)) repo.Note = "could not read issues: " + r.Why; Save(); return; }
         if (repo.Note?.StartsWith("could not") == true) repo.Note = null; // issues read, or a one-off baseline hiccup
         if (IssueInfo.ParseList(r.Out) is not { } issues) { repo.Note = "could not read issues: gh printed something unexpected"; Save(); return; }
+        // What the director sees of what waits on what. Only the owner's: anyone can open an issue on a public repository.
+        _openIssues[repo] = issues.Where(i => i.Author.Equals(me, StringComparison.OrdinalIgnoreCase) || i.Assignees.Contains(me, StringComparer.OrdinalIgnoreCase)).ToList();
         var open = issues.Select(i => i.Number).ToHashSet();
         // Issues an open pull request already resolves are someone's work in progress.
         var covered = new HashSet<int>();

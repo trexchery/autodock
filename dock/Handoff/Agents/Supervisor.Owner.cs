@@ -203,7 +203,8 @@ public sealed partial class Supervisor
     }
 
     /// What was planned on a skipped item leaves the goal: removed, it counts as landed and they would start on its absence;
-    /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them.
+    /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them,
+    /// and so does an issue the director ordered after it.
     internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip, string why = "which you skipped")
     {
         for (var q = new Queue<(RepoAgents, WorkItem)>([(repo, skip)]); q.TryDequeue(out var next);)
@@ -211,7 +212,7 @@ public sealed partial class Supervisor
             var (sr, s) = next;
             var sk = Key(sr, s);
             foreach (var r in repos)
-                foreach (var d in r.Items.Where(d => d.Goal != null && d.After.Contains(sk)).ToList())
+                foreach (var d in r.Items.Where(d => d.After.Contains(sk) && (d.Goal != null || d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })).ToList())
                 {
                     var dg = repos.SelectMany(x => x.Goals.Where(g => Key(x, g) == d.Goal)).FirstOrDefault(); // before Unplan clears d.Goal
                     if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
@@ -314,7 +315,10 @@ public sealed partial class Supervisor
     string Machinery(RepoAgents repo, WorkItem i)
     {
         var parts = new List<string>();
-        if (i.Run is { } r) parts.Add($"{r.Kind} run {r.Attempt} on {r.Email}, session {r.SessionId}");
+        if (i.Run is { } r) parts.Add($"{r.Kind} run {r.Attempt} on {r.Email}, session {r.SessionId}"
+            + (r.Settings is { } s ? $", {s.Model} · {s.Effort}{(s.Ultracode ? " · ultracode" : "")}" : "")
+            + (r is { Ended: { } end, Outcome: { } how } ? $", {how} after {Format.Age(Math.Max(60, (end - r.Started).TotalSeconds))}" : ""));
+        if (i.Route is { } route) parts.Add("route " + route.Line + (route.Why is { } why ? $": {why}" : ""));
         if (i.Failures > 0) parts.Add($"{i.Failures} failed attempt(s)");
         if (i.Reviews > 0) parts.Add($"{i.Reviews} review round(s)");
         if (i.Branch != null) parts.Add($"branch {i.Branch}");
@@ -351,12 +355,21 @@ public sealed partial class Supervisor
                 : $"You are an handoff agent. The repository owner asked for: {item.Title}");
         if (item.Body.Trim().Length > 0) sb.AppendLine().AppendLine(Clip(item.Body, 8000));
         if (discussion != null) sb.AppendLine().AppendLine("Discussion on the issue, oldest first (decisions the owner documented here stand):").AppendLine(discussion);
+        if (Prerequisites(item) is { } landed) sb.AppendLine().AppendLine("This builds on work that already landed:").AppendLine(landed);
         if (item.Guidance != null) sb.AppendLine().AppendLine("The owner's answer to your earlier question:").AppendLine(item.Guidance);
         if (item.Followup != null) sb.AppendLine().AppendLine("This pass must address:").AppendLine(item.Followup);
         if (notes != null) sb.AppendLine().AppendLine($"An earlier session worked on this and stopped. Read its hand-off notes in {notes} first, check the current state of this worktree, and continue from there; do not redo finished work.");
         if (Memory.Prompt(_state.Memory, repo.Memory) is { } memory) sb.AppendLine().AppendLine(memory);
         sb.AppendLine().AppendLine(Rules(repo, item));
         return sb.ToString();
+    }
+
+    /// What the item's prerequisites did, as their runs summed it up, so the next agent starts from it. Gone ones landed and were pruned.
+    string? Prerequisites(WorkItem item)
+    {
+        var lines = item.After.Select(k => ItemByKey(_state.Repos, k)).OfType<WorkItem>()
+            .Select(p => $"- {p.Label}{(p.Merged && p.Pr is { } n ? $" (merged as #{n})" : "")}: {Brief(p.Summary ?? p.Note ?? "", 300)}").ToList();
+        return lines.Count == 0 ? null : Clip(string.Join('\n', lines), 2000);
     }
 
     string ResumePrompt(RepoAgents repo, WorkItem item)

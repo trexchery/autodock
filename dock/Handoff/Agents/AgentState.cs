@@ -63,6 +63,8 @@ public sealed class WorkItem
     public Session? Session { get; set; }
     /// The latest process (work or review).
     public Run? Run { get; set; }
+    /// How its runs go: the director's validated routing, escalated by genuine failures. Null until routed (or started).
+    public Route? Route { get; set; }
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Label => Issue is { } n ? $"#{n} {Title}" : $"{Id} {Title}";
@@ -99,6 +101,15 @@ public sealed class Run
     public DateTimeOffset Started { get; set; }
     /// The process may still be running (cleared once its outcome is handled).
     public bool Live { get; set; }
+    /// What it was started with (null: before routing existed).
+    public RunSettings? Settings { get; set; }
+    /// Its account's usage at the start, to compare with the end's.
+    public QuotaSnap? QuotaStart { get; set; }
+    /// It continued an earlier conversation (its token counts include that history).
+    public bool Resumed { get; set; }
+    /// Measured once it ended: how it went, and how long it took.
+    public string? Outcome { get; set; }
+    public DateTimeOffset? Ended { get; set; }
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
@@ -163,6 +174,9 @@ public sealed class RepoAgents
     public int NextLocal { get; set; } = 1;
     public List<Goal> Goals { get; set; } = [];
     public int NextGoal { get; set; } = 1;
+    /// The director's pass over queued work that serves no goal: ordering and routing only, never new work. A goal's
+    /// planner runs it (its run, failures, back-off), but it is no goal the owner sees.
+    public Goal? Triage { get; set; }
     /// What the owner and runs noted about this repository.
     public List<Note> Memory { get; set; } = [];
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
@@ -173,6 +187,9 @@ public sealed class RepoAgents
     [JsonIgnore] public string Key => AgentStore.KeyFor(Path);
 
     [JsonIgnore] public bool Running => Authorized && !Paused;
+
+    /// Every director run holder: the goals, and the triage.
+    [JsonIgnore] public IEnumerable<Goal> Directors => Triage is { } t ? Goals.Append(t) : Goals;
 }
 
 public sealed class AgentsState
@@ -225,11 +242,11 @@ public sealed class AgentStore(string root)
     /// A repository was left running, or a worker may still be: the tray starts agents, so open terminals link up
     /// and runs without one stop.
     public static bool HasWork(string root) =>
-        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }) || r.Goals.Any(g => g.Run is { Live: true }));
+        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }) || r.Directors.Any(g => g.Run is { Live: true }));
 
     /// A worker of `root`'s state still runs: workers outlive the tray that started them.
     public static bool Running(string root) =>
-        new AgentStore(root).Load().Repos.SelectMany(r => r.Items.Select(i => i.Run).Concat(r.Goals.Select(g => g.Run)))
+        new AgentStore(root).Load().Repos.SelectMany(r => r.Items.Select(i => i.Run).Concat(r.Directors.Select(g => g.Run)))
             .Any(r => r is { Live: true, Pid: > 0 } && AgentProcess.Attach(r.Job, r.Pid, r.Created) is { } p && Close(p));
 
     static bool Close(AgentProcess p) { p.Dispose(); return true; }

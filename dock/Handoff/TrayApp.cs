@@ -1010,6 +1010,7 @@ public sealed partial class TrayApp : ApplicationContext
         f.AgentIssues.Value = Math.Clamp(_settings.AgentIssues, (int)f.AgentIssues.Minimum, (int)f.AgentIssues.Maximum);
         f.AgentOpenPrs.Value = Math.Clamp(_settings.AgentOpenPrs, (int)f.AgentOpenPrs.Minimum, (int)f.AgentOpenPrs.Maximum);
         f.DraftPrs.Checked = _settings.AgentDraftPrs;
+        f.Ultracode.Checked = _settings.AgentUltracode;
         if (f.ShowDialog() != DialogResult.OK) return;
         try
         {
@@ -1031,6 +1032,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AgentIssues = (int)f.AgentIssues.Value;
             _settings.AgentOpenPrs = (int)f.AgentOpenPrs.Value;
             _settings.AgentDraftPrs = f.DraftPrs.Checked;
+            _settings.AgentUltracode = f.Ultracode.Checked;
             ApplyAgentSettings();
             _settings.Save();
             _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold

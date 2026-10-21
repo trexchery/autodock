@@ -9,7 +9,7 @@ public sealed class SettingsForm : Form
     public readonly TextBox TerminalFolder = new() { PlaceholderText = "your user folder" };
     public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     public readonly Toggle Startup = new("");
-    public readonly Toggle PreserveRc = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new("");
+    public readonly Toggle PreserveRc = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new(""), Ultracode = new("");
     public readonly NumericUpDown AgentIssues = new() { Minimum = 0, Maximum = 10, Value = 1 }, AgentOpenPrs = new() { Minimum = 1, Maximum = 50, Value = 10 };
 
     readonly Palette _pal = Palette.Current;
@@ -49,6 +49,7 @@ public sealed class SettingsForm : Form
         Row("Issues at once", "0 = automatic: one per account with quota to spare, started a few minutes apart", AgentIssues, Ui.S(72));
         Row("Open pull requests", "New work holds while this many wait for review", AgentOpenPrs, Ui.S(72));
         Row("Draft pull requests", "Agents open pull requests as drafts", DraftPrs, Ui.S(34));
+        Row("Ultracode", "Agents may fan a task out to parallel subagents when it benefits and an account has ample room; uses quota faster", Ultracode, Ui.S(34));
 
         _y += Ui.S(8);
         var about = new Label

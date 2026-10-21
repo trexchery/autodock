@@ -9,7 +9,10 @@ public sealed record InitEvent(string? SessionId, string? Model) : StreamEvent;
 public sealed record TextEvent(string Text) : StreamEvent;
 public sealed record ToolEvent(string Name, string? Target) : StreamEvent;
 public sealed record TurnEvent(string MessageId, long OutputTokens) : StreamEvent;
-public sealed record ResultEvent(bool IsError, string? Subtype, string Text, double? CostUsd, int? Turns, long? OutputTokens) : StreamEvent;
+public sealed record ResultEvent(bool IsError, string? Subtype, string Text, double? CostUsd, int? Turns, long? OutputTokens, Tokens? Tokens = null, long? DurationMs = null) : StreamEvent;
+/// A run's tokens: every model's, subagents and workflow agents included when Claude reports `modelUsage`. A resumed
+/// session reports the whole conversation's. Quota is measured from the account's usage, never from these or from cost.
+public sealed record Tokens(long Input, long Output, long CacheRead, long CacheWrite);
 
 /// Follows a growing stream-json file. Reads only what was appended since the last call, keeps a
 /// partial last line for the next one, and skips anything that is not a JSON object (the `cswap run`
@@ -106,11 +109,27 @@ public sealed class StreamTail(string path)
                         Str(root, "result") ?? "",
                         root.TryGetProperty("total_cost_usd", out var cost) && cost.ValueKind == JsonValueKind.Number ? cost.GetDouble() : null,
                         (int?)Long(root, "num_turns"),
-                        root.TryGetProperty("usage", out var ru) ? Long(ru, "output_tokens") : null));
+                        root.TryGetProperty("usage", out var ru) ? Long(ru, "output_tokens") : null,
+                        Usage(root),
+                        Long(root, "duration_ms")));
                     break;
             }
         }
         catch (JsonException) { }
+    }
+
+    /// `modelUsage` summed over models, else the main loop's `usage`.
+    static Tokens? Usage(JsonElement root)
+    {
+        if (root.TryGetProperty("modelUsage", out var mu) && mu.ValueKind == JsonValueKind.Object && mu.EnumerateObject().Any())
+        {
+            var ms = mu.EnumerateObject().Select(p => p.Value).ToList();
+            long Sum(string k) => ms.Sum(m => Long(m, k) ?? 0);
+            return new(Sum("inputTokens"), Sum("outputTokens"), Sum("cacheReadInputTokens"), Sum("cacheCreationInputTokens"));
+        }
+        return root.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object
+            ? new(Long(u, "input_tokens") ?? 0, Long(u, "output_tokens") ?? 0, Long(u, "cache_read_input_tokens") ?? 0, Long(u, "cache_creation_input_tokens") ?? 0)
+            : null;
     }
 
     /// The most telling argument of a tool call: a path, a command or a pattern.

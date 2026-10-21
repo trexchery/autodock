@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace Handoff;
@@ -29,6 +30,11 @@ public sealed class AgentsConfig
     public TimeSpan ReplanEvery { get; set; } = TimeSpan.FromMinutes(10);
     /// A goal whose work has all landed looks again after this long.
     public TimeSpan IdleReplan { get; set; } = TimeSpan.FromHours(1);
+    /// The owner lets runs turn on ultracode by themselves, where the director recommends it or an escalation calls for it,
+    /// whenever their account has room (Routing.UltracodeOn). Off by default.
+    public bool Ultracode { get; set; }
+    /// The director orders and routes queued work no goal planned (Supervisor.WantsTriage). Off: it runs on default routes.
+    public bool Triage { get; set; } = true;
 }
 
 /// `Transient`: nothing is wrong with the work itself (a fetch that failed, as when offline), so it is no failure to count.
@@ -122,6 +128,8 @@ public sealed partial class Supervisor : IDisposable
         public long LastLen, LastProgress = AgentProcess.UnbiasedMilliseconds;
         public TimeSpan LastCpu;
         public string? StopReason;
+        /// Ultracode: its workflow agents can wait on the network for long, quiet stretches.
+        public bool Fanned;
         public Task? Finished;
     }
 
@@ -160,7 +168,7 @@ public sealed partial class Supervisor : IDisposable
                 }
                 else if (item.State == ItemState.Working) item.State = ItemState.Queued;
             }
-            foreach (var goal in repo.Goals.Where(g => g.Run is { Live: true }))
+            foreach (var goal in repo.Directors.Where(g => g.Run is { Live: true }))
             {
                 var run = goal.Run!;
                 var proc = run.Pid == 0 ? null : AgentProcess.Attach(run.Job, run.Pid, run.Created);
@@ -273,6 +281,8 @@ public sealed partial class Supervisor : IDisposable
                     : TimeSpan.Zero;
                 if (wait > TimeSpan.Zero) Min(wait);
             }
+            // Only ahead, as for goals: a triage due but unable to start is woken by what unblocks it.
+            if (repo.Triage is { LastPlan: { } routed } && WantsTriage(repo, throttled: false) && Until(routed, Config.ReplanEvery) is var due && due > TimeSpan.Zero) Min(due);
         }
         foreach (var t in _notBefore.Values) Min(t - DateTimeOffset.Now);
         if (_resumeAt is { } resume) Min(resume - DateTimeOffset.Now);
@@ -300,7 +310,7 @@ public sealed partial class Supervisor : IDisposable
                 (w.LastLen, w.LastCpu, w.LastProgress) = (len, cpu, now);
                 continue;
             }
-            if (now - w.LastProgress > Config.Stall.TotalMilliseconds) Fire(() => StopWorkerAsync(item, "stalled"));
+            if (now - w.LastProgress > Config.Stall.TotalMilliseconds * (w.Fanned ? 3 : 1)) Fire(() => StopWorkerAsync(item, "stalled"));
         }
     }
 
@@ -313,15 +323,19 @@ public sealed partial class Supervisor : IDisposable
         {
             if (_disposed || _launching) break;
             // A goal's planner first, outside the item cap: what it plans decides the items. One per repository at a time.
-            if (!_goalBusy.Any(b => b.Value == PlanningNow && repo.Goals.Contains(b.Key))
-                && repo.Goals.Where(g => WantsPlan(repo, g)).MinBy(g => g.LastPlan ?? DateTimeOffset.MinValue) is { } goal)
+            // With no goal to plan, the triage orders and routes the queued work; it is optional, so it never holds anything up.
+            if (!_goalBusy.Any(b => b.Value == PlanningNow && Owns(repo, b.Key))
+                && (repo.Goals.Where(g => WantsPlan(repo, g)).MinBy(g => g.LastPlan ?? DateTimeOffset.MinValue) ?? (WantsTriage(repo) ? repo.Triage : null)) is { } goal)
             {
-                var (planner, why) = PickAccount(repo, null, PlannerModel);
-                if (planner == null) waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why;
+                var triage = goal == repo.Triage;
+                var settings = triage ? Routing.Triage : Routing.Plan;
+                var (planner, why) = PickAccount(repo, null, settings.Model);
+                if (planner == null && triage) (planner, settings) = (PickAccount(repo, null, Routing.TriageFallback.Model).Item1, Routing.TriageFallback);
+                if (planner == null) { if (!triage) waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why; }
                 else if (_workers.Count == 0 || DateTimeOffset.Now - _lastLaunch >= Config.Ramp)
                 {
                     var last = goal.Run;
-                    await LaunchPlannerAsync(repo, goal, planner);
+                    await LaunchPlannerAsync(repo, goal, planner, settings);
                     if (goal.Run != last) // one that never got to start (GitHub unreadable, paused meanwhile) takes no turn from the items
                     {
                         (_lastLaunch, _turn) = (DateTimeOffset.Now, _state.Repos.IndexOf(repo) + 1);
@@ -338,12 +352,14 @@ public sealed partial class Supervisor : IDisposable
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
-                var (account, why) = PickAccount(repo, item);
+                // The triage under way is routing it: it waits for that run (the stall check bounds it), never for one that cannot start.
+                if (item.Route == null && repo.Triage is { } routing && _goalBusy.ContainsKey(routing)) break;
+                var (account, settings, why) = PickRun(repo, item);
                 // A reason only the owner can fix wins over one that passes by itself, whichever folder came first.
                 if (account == null) { waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why; break; }
                 // Spaced out after the last start; judged after the pick, so every folder's reason stays current.
                 if (_workers.Count > 0 && DateTimeOffset.Now - _lastLaunch < Config.Ramp) break;
-                await LaunchAsync(repo, item, account);
+                await LaunchAsync(repo, item, account, settings);
                 (_lastLaunch, _turn) = (DateTimeOffset.Now, _state.Repos.IndexOf(repo) + 1);
                 if (item.State == ItemState.Queued) break; // paused or backed off while preparing
                 started = true;
@@ -384,6 +400,23 @@ public sealed partial class Supervisor : IDisposable
         return underway != null || prs + repo.Items.Count(i => i.InFlight && i.Pr == null) >= maxPrs ? null : ordered.FirstOrDefault();
     }
 
+    /// The account and settings for an item's next run. Its route (the director's, else the default) decides the model,
+    /// effort and ultracode; the account needs room in that model's own weekly window. Opus out of room everywhere: a
+    /// route the director chose runs on Sonnet at no less than high effort rather than idle; one that failures escalated
+    /// to Opus waits for it. Ultracode only where Routing.UltracodeOn allows it.
+    (Account?, RunSettings, string?) PickRun(RepoAgents repo, WorkItem item)
+    {
+        var route = item.Route ?? Routing.Default;
+        var s = item.ReviewNext ? Routing.Review(route) : new RunSettings(route.Model, route.Effort, false);
+        var (account, why) = PickAccount(repo, item, s.Model);
+        if (account == null && s.Model == "opus" && !(route.ModelRaised && !item.ReviewNext)
+            && PickAccount(repo, item, "sonnet") is ({ } fallback, _))
+            (account, s) = (fallback, s with { Model = "sonnet", Effort = Array.IndexOf(Routing.Efforts, s.Effort) < 2 ? "high" : s.Effort });
+        if (account != null && !item.ReviewNext)
+            s = s with { Ultracode = Routing.UltracodeOn(route, Config.Ultracode, account, RunsOn(account), Config.Threshold) };
+        return (account, s, why);
+    }
+
     /// The folder's assigned account if it has one (work code stays on its account), otherwise the best
     /// of the rest, leaving other open folders' assigned accounts to them while another fits. Never the
     /// login in use at the keyboard: runs only happen in isolated profiles.
@@ -405,7 +438,7 @@ public sealed partial class Supervisor : IDisposable
 
     // -- runs ---------------------------------------------------------------
 
-    async Task LaunchAsync(RepoAgents repo, WorkItem item, Account account)
+    async Task LaunchAsync(RepoAgents repo, WorkItem item, Account account, RunSettings settings)
     {
         _launching = true;
         var review = item.ReviewNext;
@@ -453,12 +486,16 @@ public sealed partial class Supervisor : IDisposable
                 Head = head,
                 Started = DateTimeOffset.Now,
                 Live = true,
+                Settings = settings,
+                QuotaStart = Routing.Snap(account, settings.Model),
+                Resumed = resume,
             };
             if (!review) item.Session = new Session(session, account.Email, org);
+            item.Route ??= Routing.Default; // started unrouted: escalation needs a base
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review), wt, item.Run.Job,
-                promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh")));
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings), wt, item.Run.Job,
+                promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings.Ultracode));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
             Watch(repo, item, proc);
@@ -488,11 +525,8 @@ public sealed partial class Supervisor : IDisposable
     }
 
     /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login.
-    /// Runs cannot push or call gh; reviewers cannot edit files either.
-    /// The director reads the whole project to plan, where the strongest model pays; work and review runs keep the owner's default model.
-    internal const string PlannerModel = "opus";
-
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, string? model = null) =>
+    /// Runs cannot push or call gh; reviewers cannot edit files either. Every run states its model, effort and ultracode.
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null) =>
     [
         "run", account.ToString(), "--require-session", "--",
         "-p", "--output-format", "stream-json", "--verbose",
@@ -500,7 +534,7 @@ public sealed partial class Supervisor : IDisposable
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
         "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [],
-        .. model != null ? (string[])["--model", model] : [],
+        .. settings != null ? Routing.Args(settings) : [],
     ];
 
     /// The tray's environment, minus anything that would point Claude elsewhere, plus a guard between
@@ -508,7 +542,8 @@ public sealed partial class Supervisor : IDisposable
     /// pull requests itself, after verifying and review. Runs act as the owner's Windows user, so this
     /// stops mistakes and casual attempts, not a determined program; Claude's own auto-mode classifier,
     /// the owner-only issue and comment rules, and holding workflow changes for the owner do the rest.
-    internal static Dictionary<string, string?> WorkerEnvironment(string noGh)
+    /// Nothing that remaps a model alias or sets thinking comes along; without `ultracode`, workflows are off outright.
+    internal static Dictionary<string, string?> WorkerEnvironment(string noGh, bool ultracode = false)
     {
         Directory.CreateDirectory(noGh);
         var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -530,9 +565,13 @@ public sealed partial class Supervisor : IDisposable
             ["GIT_CONFIG_VALUE_0"] = "",
             ["CLAUDE_CONFIG_DIR"] = null,
             ["CLAUDECODE"] = null,
+            ["ANTHROPIC_MODEL"] = null,
+            ["ANTHROPIC_SMALL_FAST_MODEL"] = null,
+            ["MAX_THINKING_TOKENS"] = null,
         };
         foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
-            if (e.Key is string k && k.StartsWith("CLAUDE_CODE_", StringComparison.OrdinalIgnoreCase)) env[k] = null;
+            if (e.Key is string k && (k.StartsWith("CLAUDE_CODE_", StringComparison.OrdinalIgnoreCase) || k.StartsWith("ANTHROPIC_DEFAULT_", StringComparison.OrdinalIgnoreCase))) env[k] = null;
+        if (!ultracode) env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1";
         return env;
     }
 
@@ -553,7 +592,7 @@ public sealed partial class Supervisor : IDisposable
     /// Tracks a run (an item's, or a goal's planner) until its process exits, then hands it to `finish`.
     void Watch(RepoAgents repo, object key, Run run, string outPath, AgentProcess proc, Func<Worker, Task> finish)
     {
-        var w = new Worker(repo, proc, outPath, run.Email + "|" + run.Org) { LastCpu = proc.CpuTime };
+        var w = new Worker(repo, proc, outPath, run.Email + "|" + run.Org) { LastCpu = proc.CpuTime, Fanned = run.Settings?.Ultracode == true };
         w.LastLen = FileLength(outPath);
         _workers[key] = w;
         w.Finished = Fire(async () =>
@@ -612,16 +651,19 @@ public sealed partial class Supervisor : IDisposable
                 Memory.Add(repo.Memory, l.Groups[1].Value, item.Label, false, DateTimeOffset.Now);
         text = StripLearned(text); // what a note mentions is not the run's verdict or summary
 
-        if (reason == "stalled") Charge(repo, item, "it stopped making progress");
-        else if (reason == "limit") item.Note = "its account became unavailable; continuing on another";
-        else if (reason != null) item.Note = null; // paused, stopped, skipped or rebooted: nothing failed
+        string outcome;
+        if (reason == "stalled") { outcome = "stalled"; Charge(repo, item, "it stopped making progress"); } // a hung call or prompt, not the work: no escalation
+        else if (reason == "limit") { outcome = "limit"; item.Note = "its account became unavailable; continuing on another"; }
+        else if (reason != null) { outcome = reason; item.Note = null; } // paused, stopped, skipped or rebooted: nothing failed
         else if (review && Marker(text, "APPROVED") != null)
         {
+            outcome = "approved";
             (item.ReviewNext, item.ReviewedHead, item.ReviewNotes) = (false, run.Head, null);
             item.State = ItemState.Checking;
         }
         else if (review && Marker(text, "CHANGES") is { } findings)
         {
+            outcome = "changes";
             item.ReviewNext = false;
             item.Reviews++;
             if (item.Reviews >= MaxReviews)
@@ -630,24 +672,69 @@ public sealed partial class Supervisor : IDisposable
                 (item.ReviewedHead, item.ReviewNotes) = (run.Head, findings);
                 item.State = ItemState.Checking;
             }
-            else item.Followup = "A fresh review of your change found these problems. Fix them:\n" + findings;
+            else
+            {
+                item.Followup = "A fresh review of your change found these problems. Fix them:\n" + findings;
+                Escalate(repo, item, "review");
+            }
         }
-        else if (!review && Marker(text, "BLOCKED") is { } question) await AskOwnerAsync(repo, item, question);
-        else if (!review && Marker(text, "DONE") is { } summary) EnterChecking(item, summary);
+        else if (!review && Marker(text, "BLOCKED") is { } question) { outcome = "blocked"; await AskOwnerAsync(repo, item, question); }
+        else if (!review && Marker(text, "DONE") is { } summary) { outcome = "done"; EnterChecking(item, summary); }
         else if (LimitHit(text) || LimitHit(err))
         {
             // Not the work's fault: rest the account until it resets; the item moves on with a hand-off.
+            outcome = "limit";
             CoolAccount(run.Email + "|" + run.Org);
         }
-        else if (NoConversation(text) || NoConversation(err)) item.Session = null; // the transcript is elsewhere: hand off
+        else if (NoConversation(text) || NoConversation(err)) { outcome = "no conversation"; item.Session = null; } // the transcript is elsewhere: hand off
         else if (!started && err.Contains("active default login", StringComparison.OrdinalIgnoreCase))
+        {
+            outcome = "account in use";
             _cooled[run.Email + "|" + run.Org] = DateTimeOffset.Now.AddMinutes(5); // the owner switched to it: another account, free
-        else if (!started) { _notBefore[item] = DateTimeOffset.Now + Config.LaunchBackoff; Charge(repo, item, "Claude did not start: " + OneLine(err)); }
-        else if (!review && result is { IsError: false }) EnterChecking(item, LastLine(text));
-        else Charge(repo, item, result == null ? "the run ended without a result" : OneLine(text));
+        }
+        else if (!started) { outcome = "did not start"; _notBefore[item] = DateTimeOffset.Now + Config.LaunchBackoff; Charge(repo, item, "Claude did not start: " + OneLine(err)); }
+        else if (!review && result is { IsError: false }) { outcome = "done"; EnterChecking(item, LastLine(text)); }
+        else { outcome = "error"; Charge(repo, item, result == null ? "the run ended without a result" : OneLine(text)); } // an API or tool error: not the work's to escalate
+        Measure(repo, item.Label, run, outcome, events, run.Settings?.Model);
         Save();
         if (item.State == ItemState.Checking) await CheckAsync(repo, item);
         Pump();
+    }
+
+    /// A genuine failure of the work ("review": a review found problems; "verify": the verification command or the pull
+    /// request's checks failed). An item's first verify failure may be a flake: only later ones escalate. Infrastructure
+    /// (limits, stalls, starts, crashes) never comes here. The worktree, branch and conversation stay: the next run resumes.
+    void Escalate(RepoAgents repo, WorkItem item, string kind)
+    {
+        var route = item.Route ??= Routing.Default;
+        if (kind == "verify" && !route.VerifyFailed) { route.VerifyFailed = true; return; }
+        if (Routing.Escalate(route, kind, Config.Ultracode) is not { } up) return; // all at the top: the failure count decides
+        item.Route = up;
+        if (GoalOf(item.Goal) is { } g) AddLog(g, DateTimeOffset.Now, $"{item.Label}: {up.Why}, now {up.Line}");
+        else if (repo.Triage is { } t) AddLog(t, DateTimeOffset.Now, $"{item.Label}: {up.Why}, now {up.Line}");
+    }
+
+    /// One finished run's measurements, appended to metrics.jsonl (local, never sent anywhere): what it ran with, what
+    /// Claude says it ran on, how long, its tokens, and its account's usage at start and now. Quota is the usage
+    /// readings' difference, never the price-table cost Claude also reports.
+    void Measure(RepoAgents repo, string what, Run run, string outcome, List<StreamEvent> events, string? model)
+    {
+        (run.Outcome, run.Ended) = (outcome, DateTimeOffset.Now);
+        var result = events.OfType<ResultEvent>().LastOrDefault();
+        var line = new Dictionary<string, object?>
+        {
+            ["at"] = run.Ended, ["repo"] = repo.Leaf, ["item"] = what, ["kind"] = run.Kind, ["attempt"] = run.Attempt,
+            ["model"] = run.Settings?.Model, ["effort"] = run.Settings?.Effort, ["ultracode"] = run.Settings?.Ultracode,
+            ["ran_on"] = events.OfType<InitEvent>().LastOrDefault()?.Model,
+            ["seconds"] = (int)(run.Ended.Value - run.Started).TotalSeconds,
+            ["claude_ms"] = result?.DurationMs, ["turns"] = result?.Turns, ["tokens"] = result?.Tokens,
+            ["resumed"] = run.Resumed, // a resumed conversation's tokens are its whole history's
+            ["quota_start"] = run.QuotaStart,
+            ["quota_end"] = Routing.Snap(_accounts?.FirstOrDefault(a => AccountPicker.Key(a) == run.Email + "|" + run.Org), model),
+            ["outcome"] = outcome,
+        };
+        try { File.AppendAllText(Path.Combine(_store.Root, "metrics.jsonl"), JsonSerializer.Serialize(line, Json.Options) + "\n"); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Program.Log(e); }
     }
 
     /// Not the run's fault: rest its account until it resets (an hour when unknown).

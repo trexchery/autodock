@@ -21,6 +21,7 @@ public sealed class DockSettings
     public int AgentIssues { get; set; } = 1;
     public int AgentOpenPrs { get; set; } = 10;
     public bool AgentDraftPrs { get; set; }
+    public bool AgentUltracode { get; set; }
     public DateTimeOffset? AgentSummaryAt { get; set; }
     public string? TerminalFolder { get; set; } // where "Open terminal" starts browsing; null: the user folder
 
