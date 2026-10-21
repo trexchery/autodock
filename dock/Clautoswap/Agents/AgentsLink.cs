@@ -134,7 +134,8 @@ public static class AgentsLink
         - Use agents_control only when the owner asks to start, pause, resume or stop. Starting shows the owner a native clautoswap confirmation dialog the first time; tell them to look for it. When starting, pass the command that must pass before a pull request opens as `verify` if the repository has a clear one (from its CI config, README or CLAUDE.md); ask the owner if unsure.
         - Use agents_queue when the owner reorders, skips or restores issues, adds a request ("add": title and text), or answers a question an item is waiting on ("answer": item and text). An item held before its push (review concerns, or a change to .github/) is pushed as is by "answer" with no text, only when the owner says so; with text it goes back for that change.
         - Use agents_memory to list, add or forget shared notes when the owner asks you to remember or forget something: their notes bind every agent, here or (with global) in every repository.
-        - Items are named #<issue> for issues and w<n> for the owner's own requests.
+        - Use agents_goal when the owner states an objective bigger than one change (set), and to list goals, answer a goal's question, ask for a new plan, drop one, or confirm one done. Goals come first when you report progress. Checks the owner gives (`checks`) are confirmed in a native clautoswap dialog; tell them to look for it. The director may plan steps in the owner's other repositories that agents work on; those run there while that repository's agents terminal is open.
+        - Items are named #<issue> for issues and w<n> for the owner's own requests; goals g<n>.
         You can still do ordinary work in this repository yourself when the owner asks for it directly.
         """;
 

@@ -150,8 +150,9 @@ public sealed partial class TrayApp
         if (repo.Paused) return "paused";
         if (!open) return "waits for its terminal";
         var parts = new List<string>();
-        if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking)) parts.Add("working");
-        if (repo.Items.Count(i => i.State == ItemState.NeedsOwner) is > 0 and var needs) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
+        if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking) || repo.Goals.Any(g => g.Run is { Live: true })) parts.Add("working");
+        if (repo.Goals.Count(g => g.State == GoalState.Active) is > 0 and var goals) parts.Add($"{goals} goal{(goals == 1 ? "" : "s")}");
+        if (repo.Items.Count(i => i.State == ItemState.NeedsOwner) + repo.Goals.Count(g => g.State == GoalState.NeedsOwner) is > 0 and var needs) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
         if (repo.Items.Count(i => i.Pr != null && i.State != ItemState.Done) is > 0 and var prs) parts.Add($"{prs} PR{(prs == 1 ? "" : "s")} open");
         return parts.Count > 0 ? string.Join(", ", parts) : "idle";
     }

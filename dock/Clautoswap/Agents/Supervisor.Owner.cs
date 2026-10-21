@@ -144,9 +144,11 @@ public sealed partial class Supervisor
                 if (skip.Pr == null) repo.Items.Remove(skip);
                 // What was planned on it leaves the goal: removed, it counts as landed and they would start on its absence;
                 // kept with its pull request unmerged, they would wait for it forever.
-                for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
-                    foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
-                        if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
+                // In any repository: a goal's steps can build on each other across them.
+                for (var q = new Queue<(RepoAgents, WorkItem)>([(repo, skip)]); q.TryDequeue(out var s);)
+                    foreach (var r in _state.Repos)
+                        foreach (var d in r.Items.Where(d => d.Goal != null && d.After.Contains(Key(s.Item1, s.Item2))).ToList())
+                            if (Unplan(r, d.Goal!, [d]) > 0) q.Enqueue((r, d));
                 Save();
                 Pump();
                 return $"{skip.Label} is skipped" + (skip.Pr is { } p ? $"; pull request #{p} is left as it is." : ".");
@@ -239,11 +241,11 @@ public sealed partial class Supervisor
         if (repo.Note != null) sb.AppendLine(repo.Note);
         foreach (var g in repo.Goals.Where(g => detail || g.State != GoalState.Dropped))
             sb.AppendLine(GoalLine(repo, g) + (detail && g.Log.Count > 0 ? "\n  " + string.Join("\n  ", g.Log.TakeLast(5)) : ""));
-        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
-        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
-        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(repo, active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
+        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(repo, i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(repo, i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
         if (queued.Count > 0)
-            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
+            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(repo, i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
         if (repo.Running && actives.Count == 0 && queued.Count > 0)
             sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs, i => !Ready(i)) == null
                 ? $"Holding new work: {prs.Count} pull requests are waiting for review."

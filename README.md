@@ -18,7 +18,7 @@ multi-account switcher for Claude Code, Codex, and Grok Build. live usage, reset
 - **preserve remote control** (on by default): a new terminal turns Claude remote control back on only if its last session used it
 - optional quota notifications when a limit gets near, runs out, or resets
 - **auto-prime** (off by default): tracks each Claude account's 5-hour window and, with one click in the tray menu, starts every fresh one early with a single silent Haiku "hi" (no window, nothing saved), so it also resets early. success is only claimed once a new usage reading shows the window started
-- **agents** (off until you start them): work through a repository's open GitHub issues on your other Claude accounts, one reviewed pull request at a time, steered from a normal Claude Code terminal. never merges. [how it works](docs/agents.md)
+- **agents** (off until you start them): work through a repository's open GitHub issues on your other Claude accounts, one reviewed pull request at a time, steered from a normal Claude Code terminal. give them a goal and a read-only director plans the steps, across your repositories, and calls it done only on evidence. never merges. [how it works](docs/agents.md)
 
 ## install
 
