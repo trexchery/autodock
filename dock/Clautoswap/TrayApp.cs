@@ -28,6 +28,7 @@ public sealed partial class TrayApp : ApplicationContext
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
     readonly Dictionary<int, DateTime> _freed = []; // account → when its `cswap run` windows were last moved to the default login
+    readonly HashSet<int> _heldNotice = []; // pinned accounts the user was told a working window holds, while a free is due
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
@@ -456,22 +457,34 @@ public sealed partial class TrayApp : ApplicationContext
     async Task<bool> FreePinnedAsync(Snapshot snap)
     {
         var (threshold, hysteresis) = (_engineThreshold ?? 97, _engineHysteresis ?? 10);
-        if (ResumeStopped.FreeTarget(snap.Accounts, LiveOrLaunching(), _limits.RefusedUntil, DateTimeOffset.UtcNow, threshold, hysteresis) is not { } n
-            || _freed.TryGetValue(n, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(30) // once per half hour per account: never a loop
-            || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60) || ResumeStopped.ProfileDir(n) is not { } dir)
+        if (ResumeStopped.FreeTarget(snap.Accounts, LiveOrLaunching(), _limits.RefusedUntil, DateTimeOffset.UtcNow, threshold, hysteresis) is not { } n)
+        {
+            _heldNotice.Clear(); // nothing due: a later stall is news again
+            return false;
+        }
+        if (_freed.TryGetValue(n, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(30) // once per half hour per account: never a loop
+            || ResumeStopped.ProfileDir(n) is not { } dir)
             return false;
         List<StoppedSession> windows;
         try
         {
             windows = await Task.Run(() => ResumeStopped.Scan([(dir, n)], DateTime.UtcNow, includeBusy: true, agentLimits: _agentLimits));
             var (records, runs) = await Task.Run(() => ResumeStopped.LiveCounts(dir));
-            if (!ResumeStopped.Releasable(windows, records, runs)
+            if (!ResumeStopped.Releasable(windows, records, runs))
+            {
+                // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
+                if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && _heldNotice.Add(n))
+                    Notify($"#{n} is held by a pinned terminal",
+                        $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner.",
+                        ToolTipIcon.Warning);
+                return false;
+            }
+            if (ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
                 || windows.Any(w => ResumeStopped.MovesInLastHour(_resumed, w.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour))
                 return false;
             foreach (var w in windows) ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); // a failed copy closes nothing
         }
         catch (Exception e) { Program.Log(e); return false; }
-        _freed[n] = DateTime.UtcNow;
         Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)");
         var closed = new List<StoppedSession>();
         foreach (var w in windows)
@@ -482,7 +495,8 @@ public sealed partial class TrayApp : ApplicationContext
             try { await ResumeStopped.CloseAsync(w.Pid); closed.Add(w); }
             catch (Exception e) { Program.Log(e); break; }
         }
-        if (closed.Count == 0) return false;
+        if (closed.Count == 0) return false; // nothing closed: no lockout, the next idle poll tries again
+        _freed[n] = DateTime.UtcNow;
         var free = false;
         for (var i = 0; i < 60 && !(free = await Task.Run(() => ResumeStopped.LiveProfiles([(dir, n)]).Count == 0)); i++) await Task.Delay(500);
         SwitchResult? sw = null;
@@ -502,7 +516,9 @@ public sealed partial class TrayApp : ApplicationContext
         if (sw is { Switched: true })
         {
             _lastBlockedNotice = null;
-            Notify("", Format.SwitchNotice(sw.From, sw.To), ToolTipIcon.None);
+            // One balloon (a second replaces the first): the switch, and that these windows are no longer pinned.
+            Notify(closed.Count == 1 ? "Moved a pinned window to the default login" : $"Moved {closed.Count} pinned windows to the default login",
+                $"{Format.SwitchNotice(sw.From, sw.To)}. {string.Join(", ", closed.Select(w => Path.GetFileName(w.Cwd.TrimEnd('\\'))))} now follow the default login, no longer pinned to #{n}.");
             if (_snap is { } s) _snap = s with { ActiveAccountNumber = n, Accounts = [.. s.Accounts.Select(a => a with { Active = a.Number == n })] };
         }
         return true;

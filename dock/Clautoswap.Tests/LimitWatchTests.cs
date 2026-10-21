@@ -408,6 +408,25 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public void WhatHoldsAProfileIsNamedForTheUser()
+    {
+        Assert.Empty(ResumeStopped.Holders([Window("idle")], records: 1, runs: 1));
+        Assert.Equal(["w (busy)", "w (shell)"], ResumeStopped.Holders([Window("idle"), Window("busy", "t"), Window("shell", "u")], records: 3, runs: 3));
+        Assert.Equal(["a window still working"], ResumeStopped.Holders([Window("idle")], records: 2, runs: 2));
+        Assert.Equal(["2 runs without a window"], ResumeStopped.Holders([Window("idle")], records: 1, runs: 3));
+    }
+
+    [Fact]
+    public void AClosedShellExitsCleanlySoTheTerminalTabCloses()
+    {
+        using var shell = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Engine.Cmd, "/k")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true })!;
+        ResumeStopped.EndShell(shell);
+        Assert.True(shell.WaitForExit(10_000));
+        Assert.Equal(0, shell.ExitCode); // not -1: Windows Terminal keeps a dead tab for that
+    }
+
+    [Fact]
     public void LiveCountsSeeRecordsAndWrappers()
     {
         var root = TempRoot();

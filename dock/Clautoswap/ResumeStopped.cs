@@ -302,6 +302,16 @@ public static class ResumeStopped
     public static bool Releasable(IReadOnlyCollection<StoppedSession> windows, int records, int runs) =>
         records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle);
 
+    /// What keeps a profile that is not `Releasable`, for the user: each window not idle by folder and status, a window the
+    /// scan did not see as done, a run without a window.
+    public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
+    {
+        var held = windows.Where(w => !w.Idle).Select(w => $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
+        if (records > windows.Count) held.Add(records - windows.Count == 1 ? "a window still working" : $"{records - windows.Count} windows still working");
+        if (runs > records) held.Add(runs - records == 1 ? "a run without a window" : $"{runs - records} runs without a window");
+        return held;
+    }
+
     /// Live claude records and live `cswap run` wrapper markers in a profile dir. Throws when it cannot be listed.
     public static (int Records, int Runs) LiveCounts(string dir)
     {
@@ -518,7 +528,7 @@ public static class ResumeStopped
                 using var proc = Process.GetProcessById(p);
                 if (proc.StartTime != start) continue; // the pid went to another process meanwhile: never kill that
                 if (name == "cswap") { try { await proc.WaitForExitAsync(new CancellationTokenSource(30_000).Token); } catch (OperationCanceledException) { } }
-                else proc.Kill();
+                else EndShell(proc);
             }
             catch (ArgumentException) { } // already gone
             catch (InvalidOperationException) { }
@@ -607,6 +617,13 @@ public static class ResumeStopped
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool Process32First(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Process32Next(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(Microsoft.Win32.SafeHandles.SafeProcessHandle h, uint exitCode);
+
+    /// Ends a shell with exit code 0: `Process.Kill` leaves -1, and Windows Terminal keeps a dead tab for any failure exit.
+    internal static void EndShell(Process shell)
+    {
+        if (!TerminateProcess(shell.SafeHandle, 0) && !shell.HasExited) throw new System.ComponentModel.Win32Exception();
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     struct LASTINPUTINFO { public uint cbSize, dwTime; }
