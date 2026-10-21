@@ -40,6 +40,8 @@ public sealed class WorkItem
     public string? Goal { get; set; }
     /// Items ("{repo.Key}/{item.Id}") that must land first: merged, finished without a pull request, or gone.
     public List<string> After { get; set; } = [];
+    /// The rank it had before a plan raised it; null when the plan did not (or the owner ranked it since).
+    public int? OwnRank { get; set; }
     /// PR feedback after this moment is new.
     public DateTimeOffset? PrSeen { get; set; }
     public int Failures { get; set; }

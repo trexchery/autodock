@@ -275,6 +275,10 @@ public sealed partial class Supervisor
         {
             dropped = Unplan(repo, key, (plan.Drop ?? []).Select(Ref).OfType<string>().Select(r => Find(repo, r)).OfType<WorkItem>().Distinct());
             var keys = new Dictionary<string, WorkItem>(StringComparer.OrdinalIgnoreCase); // earlier steps only, so `after` cannot loop
+            var declared = (plan.Items ?? []).Take(MaxSteps).Select(x => Ref(x.Key)).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // A step's key never means an existing item: a skipped or later step's key is unknown, not whatever item is named alike.
+            WorkItem? Resolve(string r) => keys.GetValueOrDefault(r) ?? (declared.Contains(r) ? null : Find(repo, r));
+            var planned = new Dictionary<int, WorkItem>();
             foreach (var (step, index) in (plan.Items ?? []).Take(MaxSteps).Select((x, at) => (x, at)))
             {
                 var title = Brief(step.Title, 120);
@@ -285,12 +289,12 @@ public sealed partial class Supervisor
                 }
                 var rank = OwnerRank + 100 - index;
                 var refs = (step.After ?? []).Select(Ref).OfType<string>().ToList();
-                if (refs.FirstOrDefault(r => (keys.GetValueOrDefault(r) ?? Find(repo, r)) == null) is { } unknown)
+                if (refs.FirstOrDefault(r => Resolve(r) == null) is { } unknown)
                 {
                     AddLog(goal, now, $"skipped \"{title}\": it builds on {unknown}, which is not a step or item that exists"); // never start it without its prerequisite
                     continue;
                 }
-                var after = refs.Select(r => Key(repo, (keys.GetValueOrDefault(r) ?? Find(repo, r))!)).Distinct().ToList();
+                var after = refs.Select(r => Key(repo, Resolve(r)!)).Distinct().ToList();
                 WorkItem? item;
                 if (int.TryParse(Ref(step.Issue)?.TrimStart('#'), out var n))
                 {
@@ -308,7 +312,7 @@ public sealed partial class Supervisor
                             AddLog(goal, now, $"skipped #{n}: not an open issue of the owner's that agents may take");
                             continue;
                         }
-                        repo.Items.Add(item = new WorkItem { Id = n.ToString(), Issue = n, Title = info.Title, Body = info.Body, Rank = rank, Goal = key, After = after });
+                        repo.Items.Add(item = new WorkItem { Id = n.ToString(), Issue = n, Title = info.Title, Body = info.Body, Rank = rank, OwnRank = OwnerRank - 1, Goal = key, After = after }); // dropped, the scan may prune it again
                         added++;
                     }
                     else if (item.Goal == null && item.State != ItemState.Done) { item.Goal = key; added++; } // adopted
@@ -333,9 +337,15 @@ public sealed partial class Supervisor
                         added++;
                     }
                 }
-                if (item.Goal == key && item is { State: ItemState.Queued, Worktree: null }) item.Rank = Math.Max(item.Rank, rank);
+                if (item.Goal == key && item is { State: ItemState.Queued, Worktree: null } && item.Rank < rank) (item.OwnRank, item.Rank) = (item.OwnRank ?? item.Rank, rank);
                 if (Ref(step.Key) is { Length: > 0 } k) keys.TryAdd(k, item);
+                if (item.Issue is { } num && item.Goal == key) planned[num] = item;
             }
+            // GitHub's "Blocked by" between issues the plan names was left to `after` (OwnIssuesAsync): make it one.
+            foreach (var (num, item) in planned.Where(p => p.Value is { State: ItemState.Queued, Worktree: null }))
+                if (issues.TryGetValue(num, out var info))
+                    foreach (var blocker in info.BlockedBy(planned.Keys.ToHashSet()).Select(b => planned[b]))
+                        if (!item.After.Contains(Key(repo, blocker)) && !blocker.After.Contains(Key(repo, item))) item.After.Add(Key(repo, blocker));
         }
         var settled = repos.SelectMany(r => r.Items).Where(i => i.Goal == key).All(i => i.State == ItemState.Done);
         var quiet = added + dropped == 0 && settled; // waiting on its own work is not idle
@@ -363,7 +373,7 @@ public sealed partial class Supervisor
         foreach (var i in which.Where(i => i.Goal == goalKey && i is { State: ItemState.Queued, Worktree: null, Pr: null }).ToList())
         {
             if (i.Issue == null) repo.Items.Remove(i);
-            else { i.Goal = null; i.After = []; if (i.Rank >= OwnerRank + 101 - MaxSteps) i.Rank = OwnerRank - 1; } // planner rank off: the scan may prune it again
+            else { i.Goal = null; i.After = []; if (i.OwnRank is { } own) i.Rank = own; i.OwnRank = null; } // planner rank off, an owner's pick keeps its own
             n++;
         }
         return n;
@@ -460,7 +470,12 @@ public sealed partial class Supervisor
         catch (Exception e) // whatever it was: back off and count, a check that throws must not loop through Pump
         {
             if (e is not AgentsException) Program.Log(e);
-            if (Still()) GoalFailed(repo, goal, "checking", Engine.Redact(e.Message));
+            if (Still() && e is AgentsException { Transient: true }) // offline is no failure: back off and try again, the dot stays dark
+            {
+                _notBefore[goal] = DateTimeOffset.Now + Config.LaunchBackoff;
+                AddLog(goal, DateTimeOffset.Now, "check postponed: " + Engine.Redact(e.Message));
+            }
+            else if (Still()) GoalFailed(repo, goal, "checking", Engine.Redact(e.Message));
         }
         finally
         {

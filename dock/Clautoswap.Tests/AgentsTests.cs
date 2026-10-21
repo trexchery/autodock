@@ -1133,7 +1133,59 @@ public class AgentGoalTests
         Ingest(repo, goal, """{"status":"working","items":[{"key":"a","issue":12}]}""");
         Assert.Equal((Supervisor.Key(repo, goal), 10100), (i12.Goal, i12.Rank));
         Ingest(repo, goal, """{"status":"working","drop":["12"]}""");
-        Assert.Equal((null, 9999), (i12.Goal, i12.Rank)); // below the owner's rank, so the scan may prune it again
+        Assert.Equal((null, 0), (i12.Goal, i12.Rank)); // below the owner's rank, so the scan may prune it again
+    }
+
+    [Fact]
+    public void DroppingAdoptedWorkKeepsTheOwnersPick()
+    {
+        var picked = I("12");
+        picked.Rank = 10_150; // the owner prioritized it above any plan rank
+        var repo = Repo(picked);
+        var goal = G();
+        Ingest(repo, goal, """{"status":"working","items":[{"key":"a","issue":12}]}""");
+        Ingest(repo, goal, """{"status":"working","drop":["12"]}""");
+        Assert.Equal((null, 10_150), (picked.Goal, picked.Rank));
+    }
+
+    [Fact]
+    public void AGitHubBlockerBetweenPlannedIssuesBecomesAfter()
+    {
+        var (i5, i6) = (I("5"), I("6"));
+        var repo = Repo(i5, i6);
+        Ingest(repo, G(), """{"status":"working","items":[{"key":"b","issue":6},{"key":"a","issue":5}]}""",
+            new() { [5] = new IssueInfo(5, "Five", "", [], [], [], "owner"), [6] = new IssueInfo(6, "Six", "Blocked by #5.", [], [], [], "owner") });
+        Assert.Equal([Supervisor.Key(repo, i5)], i6.After); // even though the blocker comes later in the plan
+        Assert.Empty(i5.After);
+    }
+
+    [Fact]
+    public void AnAfterNamingASkippedStepsKeyBindsToNothingElse()
+    {
+        var repo = Repo(I("w1"));
+        var goal = G();
+        Ingest(repo, goal, """
+            {"status":"working","items":[{"key":"w1","title":"Other repo","repo":"elsewhere"},{"key":"b","title":"Builds on it","after":["w1"]}]}
+            """);
+        Assert.DoesNotContain(repo.Items, i => i.Title == "Builds on it"); // not started on the unrelated w1
+        Assert.Contains(goal.Log, l => l.Contains("builds on w1"));
+    }
+
+    [Fact]
+    public void SkippingAStepHoldsAdoptedDependentsAndUnplansTheRest()
+    {
+        var (step, adopted, request) = (I("w1"), I("7"), I("w2"));
+        var repo = Repo(adopted, request);
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (adopted.Goal, request.Goal) = (key, key);
+        adopted.After = request.After = [Supervisor.Key(repo, step)]; // the skipped step is already gone
+        Supervisor.HoldDependents([repo], repo, step);
+        Assert.Equal(ItemState.NeedsOwner, adopted.State);
+        Assert.Null(Supervisor.Next(repo)); // it does not start
+        Assert.True(goal.Replan);
+        Assert.DoesNotContain(request, repo.Items);
     }
 
     [Fact]

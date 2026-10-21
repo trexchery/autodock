@@ -685,6 +685,25 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task BeingOfflineDuringTheCheckIsNoFailure()
+    {
+        Plan("""{"status":"achieved","summary":"ready","evidence":"it is ready"}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        Git(_repo, "remote", "set-url", "origin", P("gone.git")); // fetching fails, as when offline
+        await Goal(new { action = "set", title = "Be ready", checks = new[] { "exit 0" } });
+        var fetched = typeof(Supervisor).GetField("_fetched", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        // The check fetches the base afresh (strict); forget earlier fetches until it tries.
+        await Until(r =>
+        {
+            ((System.Collections.IDictionary)fetched.GetValue(_sup)!).Clear();
+            return G(r).Log.Any(l => l.Contains("check postponed"));
+        }, "the check waits for the network");
+        Assert.Equal((GoalState.Active, 0), await On(r => (G(r).State, G(r).Failures)));
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task AClaimWithNothingToProveItAsksAndAnAnswerWithACheckSettlesIt()
     {
         await StartAsync(GoalConfig());
