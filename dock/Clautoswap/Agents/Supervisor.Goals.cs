@@ -65,6 +65,12 @@ public sealed partial class Supervisor
             GoalNeedsOwner(repo, goal, $"{stuck.Label} builds on a pull request that was closed without merging, so it cannot start; skip it, or answer how to proceed");
             return;
         }
+        // A step in a repository whose agents the owner stopped never moves, and no plan can reach it there.
+        if (!_goalBusy.ContainsKey(goal) && _state.Repos.Where(r => !r.Authorized).SelectMany(r => r.Items.Where(i => i.Goal == key && i.State is not (ItemState.Done or ItemState.NeedsOwner)).Select(i => (r, i))).FirstOrDefault() is ({ } there, { } halted))
+        {
+            GoalNeedsOwner(repo, goal, $"{halted.Label} is in {there.Leaf}, where agents are stopped; start them there, skip it, or answer how to proceed");
+            return;
+        }
         if (_goalBusy.ContainsKey(goal) || !GoalItems(key).All(i => i.State == ItemState.Done)) return;
         if (goal.Claim == null) { if (!goal.Replan && Due(goal.LastPlan, Config.IdleReplan)) goal.Replan = true; }
         else if (!_stopping && !_baseline.Contains(repo) && _notBefore.GetValueOrDefault(goal) <= DateTimeOffset.Now)
@@ -377,10 +383,11 @@ public sealed partial class Supervisor
         return n;
     }
 
-    /// The repository a step goes to: this one, or another the owner authorized, by its folder name (null when none, or two, match).
+    /// The repository a step goes to: this one, or another the owner authorized, by its folder name (null when none, or two, match:
+    /// this one's own name too, when another authorized repository shares it).
     static RepoAgents? Target(IReadOnlyList<RepoAgents> repos, RepoAgents repo, string? folder) =>
-        folder?.Trim() is not { Length: > 0 } f || f.Equals(repo.Leaf, StringComparison.OrdinalIgnoreCase) ? repo
-        : repos.Where(r => r.Authorized && r.Leaf.Equals(f, StringComparison.OrdinalIgnoreCase)).ToList() is [var only] ? only : null;
+        folder?.Trim() is not { Length: > 0 } f ? repo
+        : repos.Where(r => (r == repo || r.Authorized) && r.Leaf.Equals(f, StringComparison.OrdinalIgnoreCase)).ToList() is [var only] ? only : null;
 
     /// A plan's item reference: w3 or #12 here, or folder:w3 in another authorized repository.
     static (RepoAgents Repo, WorkItem Item)? Resolve(IReadOnlyList<RepoAgents> repos, RepoAgents repo, string r)
@@ -449,7 +456,9 @@ public sealed partial class Supervisor
         if (_disposed || !Active(repo) || goal is not { State: GoalState.Active, Claim: { } claim } || !_goalBusy.TryAdd(goal, CheckingNow)) return;
         var probe = new WorkItem { Id = "goal-" + goal.Id, Title = goal.Title };
         bool Still() => !_disposed && repo.Goals.Contains(goal) && goal.State == GoalState.Active && goal.Claim == claim;
-        var merged = GoalItems(Key(repo, goal)).Where(i => i is { Merged: true, Pr: not null }).Select(i => "#" + i.Pr).ToList();
+        // Another repository's pull requests carry its folder (web#5), as the planner names its items.
+        var merged = _state.Repos.SelectMany(r => r.Items.Where(i => i.Goal == Key(repo, goal) && i is { Merged: true, Pr: not null })
+            .Select(i => (r == repo ? "" : r.Leaf) + "#" + i.Pr)).ToList();
         var landed = merged.Count > 0 ? " · merged " + string.Join(", ", merged) : "";
         var probed = false;
         try

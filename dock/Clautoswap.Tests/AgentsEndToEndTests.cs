@@ -669,6 +669,25 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task AGoalWhoseStepIsInAStoppedRepositoryAsksTheOwner()
+    {
+        var other = NewRepo("other");
+        Plan("""
+            {"status":"working","summary":"server first","items":[{"key":"a","title":"Serve greetings","repo":"other"},{"key":"b","title":"Use the server","after":["a"]}]}
+            """);
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Greetings everywhere" });
+        await Until(r => G(r).Plans == 1, "the first plan is in");
+
+        await Tool("agents_control", """{"action":"stop"}""", other);
+        await Until(r => G(r).State == GoalState.NeedsOwner, "a step agents will never take up asks the owner");
+        Assert.Equal("w1 Serve greetings is in other, where agents are stopped; start them there, skip it, or answer how to proceed", await On(r => G(r).Note));
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task AClaimIsRefutedByAFailingCheckThenAchievedOnceItPasses()
     {
         var ready = P("ready");

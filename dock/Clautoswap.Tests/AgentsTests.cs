@@ -1189,6 +1189,22 @@ public class AgentGoalTests
     }
 
     [Fact]
+    public void AFolderNameTwoRepositoriesShareNamesNeitherEvenTheGoalsOwn()
+    {
+        var goal = G();
+        var repo = new RepoAgents { Path = @"C:\work\app", Authorized = true, NextLocal = 2 };
+        var fork = new RepoAgents { Path = @"C:\fork\app", Authorized = true, Items = [I("w1")], NextLocal = 2 };
+        repo.Items.Add(new WorkItem { Id = "w1", Title = "Mine", Goal = Supervisor.Key(repo, goal) });
+        Supervisor.Ingest([repo, fork], repo, goal, Plan("""
+            {"status":"working","drop":["app:w1"],"items":[{"key":"a","title":"There","repo":"app"},{"key":"b","title":"Here","after":["app:w1"]},{"key":"c","title":"Plain"}]}
+            """), new Dictionary<int, IssueInfo>(), [], Now);
+        Assert.Equal(["w1", "w2"], repo.Items.Select(i => i.Id)); // nothing dropped; only the step that names no folder lands
+        Assert.Equal("Plain", repo.Items[1].Title);
+        Assert.Equal(["w1"], fork.Items.Select(i => i.Id));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"There\": app is not a repository agents are authorized for"));
+    }
+
+    [Fact]
     public void IngestAdoptsOnlyIssuesAgentsMayTake()
     {
         var i7 = I("7");
