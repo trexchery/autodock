@@ -134,11 +134,9 @@ public static class ResumeStopped
                     }
                     var seen = File.GetLastWriteTimeUtc(t);
                     var tail = Tail(t).ToList();
-                    // A limit hit only in a subagent or workflow file stops the process just the same.
-                    // A prompt typed after the error does not clear it: the process refuses every request until the reset, so while the reset is ahead and no reply followed, it is still stopped.
-                    // A subagent's stop holds the same way: only until its reset, and not once the window replied after it.
-                    var limit = LimitOf(tail) ?? (LimitOf(tail, sticky: true) is { ResetsAt: { } until } held && until.UtcDateTime > nowUtc ? held : null)
-                        ?? (agentLimits?.GetValueOrDefault(id) is { } sub && !(sub.ResetsAt?.UtcDateTime <= nowUtc) && !RepliedAfter(tail, sub.At) ? sub : null);
+                    // A limit hit only in a subagent or workflow file stops the process too, but only while the main loop has written nothing since:
+                    // once it has, its own transcript says whether it stopped (a refused follow-up is an error there), else it carried on after the switch.
+                    var limit = LimitOf(tail) ?? (agentLimits?.GetValueOrDefault(id) is { } agent && seen <= agent.At.UtcDateTime && (agent.ResetsAt is not { } until || until.UtcDateTime > nowUtc) ? agent : null);
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
@@ -152,29 +150,11 @@ public static class ResumeStopped
         return found;
     }
 
-    /// Whether Claude replied (not with an error) after `at`: the window worked again since a stop recorded elsewhere.
-    static bool RepliedAfter(IEnumerable<string> lines, DateTimeOffset at)
-    {
-        foreach (var line in lines.Reverse())
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(line);
-                var r = doc.RootElement;
-                if (Str(r, "type") != "assistant" || r.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True) continue;
-                return at != default && r.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String && ts.TryGetDateTimeOffset(out var t) && t > at;
-            }
-            catch (JsonException) { } // a line cut by the tail window, or one being written
-        }
-        return false;
-    }
-
     /// Whether the conversation's last message is Claude Code's own usage-limit error.
     public static bool EndsAtLimit(IEnumerable<string> lines) => LimitOf(lines) != null;
 
     /// The usage-limit error the conversation ends with, or null. A look at the limit (/usage, /status) typed after it doesn't hide it; any other command does.
-    /// `sticky`: a typed prompt after it doesn't hide it either (the stopped process refuses it locally), only a reply does.
-    public static Limit? LimitOf(IEnumerable<string> lines, bool sticky = false)
+    public static Limit? LimitOf(IEnumerable<string> lines)
     {
         foreach (var line in lines.Reverse())
         {
@@ -183,7 +163,7 @@ public static class ResumeStopped
                 using var doc = JsonDocument.Parse(line);
                 var r = doc.RootElement;
                 var type = Str(r, "type");
-                if (type is not ("assistant" or "user") || type == "user" && (IsLook(r) || IsNotice(r) || sticky && !IsCommand(r))) continue;
+                if (type is not ("assistant" or "user") || type == "user" && (IsLook(r) || IsNotice(r))) continue;
                 if (type == "user" || !r.TryGetProperty("isApiErrorMessage", out var err) || err.ValueKind != JsonValueKind.True) return null;
                 JsonElement info = default;
                 var refused = r.TryGetProperty("apiErrorParams", out var p) && p.ValueKind == JsonValueKind.Object
@@ -232,13 +212,9 @@ public static class ResumeStopped
         || r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text
            && (text.StartsWith("<command-name>") || text.StartsWith("<local-command-"));
 
-    /// A user line nobody typed: a background task's notification and the like carry an origin other than "human".
+    /// A user line nobody typed: a background task's notification. Other origins (auto-continue, a suggestion, a peer) answer the user's own input, so they count as it.
     static bool IsNotice(JsonElement r) =>
-        r.TryGetProperty("origin", out var o) && o.ValueKind == JsonValueKind.Object && Str(o, "kind") is { } kind && kind != "human";
-
-    /// A slash command the user ran (/model, /login): unlike a typed prompt, it changes the window, so even a sticky limit gives way to it.
-    static bool IsCommand(JsonElement r) =>
-        r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text && text.StartsWith("<command-name>/");
+        r.TryGetProperty("origin", out var o) && o.ValueKind == JsonValueKind.Object && Str(o, "kind") == "task-notification";
 
     /// A user line that only looks at the limit: a /usage or /status command, or local command output. Nothing else (/model, /compact) is.
     static bool IsLook(JsonElement r) =>
@@ -290,16 +266,13 @@ public static class ResumeStopped
     /// The account a usage-limit error is charged to: a profile's own; in `~/.claude`, the one whose window resets when the
     /// error says (a refusal just after an in-place switch is the previous login's), else the default login when the
     /// stop landed well after its last switch (`OwnStop`). Null: unknown, so nothing is imported or switched on it.
-    /// `refusedUntil`: a refusal replayed by a stuck window (new timestamp, old reset) matches the account already recorded for that reset, not the login.
-    public static int? Refuser(Limit l, int? profile, IReadOnlyList<Account> accounts, (int? Account, DateTime ChangedAt) login,
-        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null)
+    /// Resets that fall together (Auto-Prime) leave the match ambiguous: then it is the login's, once `OwnStop` trusts it; sooner, nobody's.
+    public static int? Refuser(Limit l, int? profile, IReadOnlyList<Account> accounts, (int? Account, DateTime ChangedAt) login)
     {
         if (profile != null) return profile;
         var match = accounts.Where(a => a.ShownUsage is { } u && l.ResetsAt is { } t
             && Windows(u).Any(w => w.ResetsAt is { } r && Math.Abs((r - t).TotalSeconds) <= 120)).Select(a => a.Number).ToList();
         if (match.Count == 1) return match[0];
-        var known = refusedUntil?.Where(k => l.ResetsAt is { } t && Math.Abs((k.Value - t).TotalSeconds) <= 120).Select(k => k.Key).ToList();
-        if (known is { Count: 1 }) return known[0];
         return login.Account is { } n && OwnStop(true, l.At, login.ChangedAt) ? n : null;
     }
 
@@ -463,6 +436,25 @@ public static class ResumeStopped
             }
         }
         return found;
+    }
+
+    /// What one scanned window gets in a pass. `Ignore`: nothing due. `Left`: busy or in a shell at its limit, never closed (its
+    /// background work would die): told about once, moved when idle. `Wait`: look again on the next poll (waiting on a dialog, someone typing,
+    /// or it changed since the scan). `NoRoom`, `Recent` (reopened there under ten minutes ago), `Capped` (`MovesPerHour`): left as it is.
+    /// `Move`: close and reopen it on `target`.
+    public enum Step { Ignore, Left, Wait, NoRoom, Recent, Capped, Move }
+
+    /// The per-window decision, in the order that keeps a window safe. `unchanged` is the last look before a close, so it runs only then.
+    /// A finished turn moves only off the default login, and only after a minute without input anywhere.
+    public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged)
+    {
+        if (!s.Idle) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
+        if (!s.AtLimit && (s.ConfigDir == DefaultDir || userIdle < TimeSpan.FromSeconds(60))) return Step.Ignore;
+        if (s.AtLimit && userIdle < typingPause) return Step.Wait;
+        if (target == null) return Step.NoRoom;
+        if (recent) return Step.Recent;
+        if (moves >= MovesPerHour) return Step.Capped;
+        return unchanged() ? Step.Move : Step.Wait;
     }
 
     /// The move guard's record key for one move of a session (`session#@ticks`): unlike `session#account` it is never overwritten.
@@ -651,6 +643,35 @@ public static class ResumeStopped
             catch (ArgumentException) { } // already gone
             catch (InvalidOperationException) { }
         }
+    }
+
+    /// Whether a planned move may still close its window: the target not refused since the plan, no switch running, and the
+    /// default login where the plan saw it (a launch on a login that moved would leave two live copies of it).
+    internal static bool SafeToClose(int target, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, bool switching, int? loginAtPlan, int? loginNow, DateTimeOffset now) =>
+        !(refusedUntil.GetValueOrDefault(target) > now) && !switching && loginAtPlan == loginNow;
+
+    /// Accounts a window was just reopened on (a `session#account` stamp under 30 s old; its run marker appears a few seconds later): a switch must not pick them.
+    internal static IEnumerable<int> Launching(IReadOnlyDictionary<string, DateTime> resumed, DateTime nowUtc) =>
+        resumed.Where(m => nowUtc - m.Value < TimeSpan.FromSeconds(30) && int.TryParse(m.Key[(m.Key.LastIndexOf('#') + 1)..], out _))
+            .Select(m => int.Parse(m.Key[(m.Key.LastIndexOf('#') + 1)..]));
+
+    /// Whether the transcript has a reply of Claude's own (not an error) written after `since`: the session carried on after that error.
+    internal static bool RanSince(string file, DateTimeOffset since)
+    {
+        try
+        {
+            foreach (var line in Tail(file))
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var r = doc.RootElement;
+                    if (Str(r, "type") == "assistant" && !(r.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True)
+                        && r.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String && ts.TryGetDateTimeOffset(out var t) && t > since) return true;
+                }
+                catch (JsonException) { } // a line cut by the tail window, or one being written
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return false;
     }
 
     /// Whether `key` has been seen for at least `grace`: stamps it on first sight only.

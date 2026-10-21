@@ -7,7 +7,7 @@ namespace Clautoswap.Tests;
 /// Synthetic accounts, files and engine calls only: nothing here touches a real login or process.
 public class LimitWatchTests
 {
-    static readonly DateTimeOffset Now = DateTimeOffset.UtcNow;
+    readonly DateTimeOffset Now = DateTimeOffset.UtcNow; // per test (xunit builds one instance each), so a slow run never ages a hit past the watcher's freshness window
 
     static string LimitLine(DateTimeOffset at, DateTimeOffset resets, string window = "five_hour", string error = "usage_limit_reached") =>
         $$$"""{"type":"assistant","timestamp":"{{{at:O}}}","apiError":"{{{error}}}","isApiErrorMessage":true,"apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":{{{resets.ToUnixTimeSeconds()}}},"rateLimitType":"{{{window}}}"}},"message":{"role":"assistant","content":[{"type":"text","text":"You've hit your limit"}]}}""";
@@ -131,18 +131,21 @@ public class LimitWatchTests
         public HashSet<int> Failing = [];
         public LimitSwitch Switch;
         public double Line = ResumeStopped.Full, Hysteresis;
+        public Func<string, Task> Report = _ => Task.CompletedTask;
+        public Task SwitchGate = Task.CompletedTask;
 
         public Rig(params Account[] accounts)
         {
             Snap = new Snapshot(1, 1, [.. accounts]);
-            Switch = new LimitSwitch(() => Snap, () => (Default, Changed), () => Live, d => { Reports.Add(d); return Task.CompletedTask; },
-                m =>
+            Switch = new LimitSwitch(() => Snap, () => (Default, Changed), () => Live, d => { Reports.Add(d); return Report(d); },
+                async m =>
                 {
+                    await SwitchGate;
                     if (Failing.Contains(m)) throw new EngineException("lock timeout");
                     Switched.Add(m);
                     var from = Default;
                     (Default, Changed) = (m, DateTime.UtcNow);
-                    return Task.FromResult(new SwitchResult(true, new AccountRef(from, $"{from}@example.com"), new AccountRef(m, $"{m}@example.com"), null));
+                    return new SwitchResult(true, new AccountRef(from, $"{from}@example.com"), new AccountRef(m, $"{m}@example.com"), null);
                 }, new HashSet<string>(), Log.Add, threshold: () => Line, hysteresis: () => Hysteresis);
         }
 
@@ -591,46 +594,115 @@ public class LimitWatchTests
             Assert.Equal("sid", ResumeStopped.AgentSession(root, agent));
             Assert.Null(ResumeStopped.AgentSession(root, Path.Combine(root, "projects", "C--w", "sid.jsonl")));
             Stage(root, "idle", """{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"waiting on the workflow"}],"stop_reason":"tool_use"}}""");
+            var main = Path.Combine(root, "projects", "C--w", "sid.jsonl");
+            File.SetLastWriteTimeUtc(main, Now.UtcDateTime.AddSeconds(-5)); // the main loop wrote nothing since the agent's error
             var later = DateTime.UtcNow.AddSeconds(10);
             Assert.Empty(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue));
-            var s = Assert.Single(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, agentLimits: new Dictionary<string, Limit> { ["sid"] = new Limit("five_hour", Now.AddHours(1), Now) }));
+            var agentLimit = new Limit("five_hour", Now.AddHours(1), Now);
+            var s = Assert.Single(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, agentLimits: new Dictionary<string, Limit> { ["sid"] = agentLimit }));
             Assert.True(s.AtLimit);
             Assert.True(ResumeStopped.Unchanged(s)); // the main transcript is as quiet as at the scan
-            var sub = new Dictionary<string, Limit> { ["sid"] = new Limit("five_hour", Now.AddHours(1), Now) };
-            Assert.Empty(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddHours(2), DateTime.MinValue, agentLimits: sub)); // its reset has passed
-            Stage(root, "idle", $$$"""{"type":"assistant","timestamp":"{{{Now.AddMinutes(1):O}}}","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}""");
-            Assert.False(Assert.Single(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(30), DateTime.MinValue, agentLimits: sub)).AtLimit); // it replied since
+            // The main loop carried on after the in-place switch (it wrote since): it is not stopped, so never closed and relaunched.
+            File.SetLastWriteTimeUtc(main, Now.UtcDateTime.AddSeconds(5));
+            Assert.Empty(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, agentLimits: new Dictionary<string, Limit> { ["sid"] = agentLimit }));
+            // And an agent limit whose reset has passed stops nothing.
+            File.SetLastWriteTimeUtc(main, Now.UtcDateTime.AddSeconds(-5));
+            Assert.Empty(ResumeStopped.Scan([(root, 3)], Now.UtcDateTime.AddHours(2), DateTime.MinValue, agentLimits: new Dictionary<string, Limit> { ["sid"] = agentLimit }));
         }
         finally { Directory.Delete(root, true); }
     }
 
     [Fact]
-    public void AReplayedRefusalIsChargedToTheAccountAlreadyRefusedForThatReset()
+    public void ResetsThatFallTogetherAreTheLoginsOnceItIsTrustedElseNobodys()
     {
         var resets = Now.AddHours(2);
-        Account[] both = [A(1, 100, active: true, resets: resets), A(2, 100, resets: resets.AddSeconds(30))]; // two accounts reset together
-        var l = new Limit("five_hour", resets, Now.AddMinutes(5)); // a stuck window's new line, the old reset
-        var after = (2, DateTime.UtcNow.AddMinutes(-5)); // the login is on 2 now, long enough ago to be trusted
-        Assert.Equal(2, ResumeStopped.Refuser(l, null, both, after)); // without a record: the login
-        Assert.Equal(1, ResumeStopped.Refuser(l, null, both, after, new Dictionary<int, DateTimeOffset> { [1] = resets }));
+        Account[] both = [A(1, 100, active: true, resets: resets), A(2, 100, resets: resets.AddSeconds(30))]; // Auto-Prime: two accounts reset together
+        var l = new Limit("five_hour", resets, Now);
+        Assert.Equal(2, ResumeStopped.Refuser(l, null, both, (2, DateTime.UtcNow.AddMinutes(-5)))); // the login, long enough after its last switch
+        Assert.Null(ResumeStopped.Refuser(l, null, both, (2, DateTime.UtcNow))); // too soon after one: no import, no switch
     }
 
     [Fact]
-    public void ATypedPromptAfterTheErrorKeepsTheWindowAtTheLimitUntilAReplyOrTheReset()
+    public async Task ALaterRefusalWithAnAlignedResetStillMovesTheLogin()
+    {
+        var resets = Now.AddHours(2);
+        var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets.AddSeconds(20)), A(3, 60)); // 1 and 2 reset within seconds
+        Assert.Equal(2, (await rig.Hit(Now, resets.AddSeconds(10)))!.Switched!.To!.Number);
+        rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+        rig.Changed = DateTime.UtcNow.AddMinutes(-90); // 2 ran for a while, then ran out too
+        var o = await rig.Hit(Now.AddMinutes(90), resets.AddSeconds(10), file: @"C:\x\other.jsonl"); // another window, which ran on 2
+        Assert.Equal(3, o!.Switched!.To!.Number); // not charged to 1 again, which would have switched nothing
+        Assert.Equal([2, 3], rig.Switched);
+        Assert.Contains(2, rig.Switch.RefusedUntil.Keys);
+    }
+
+    [Fact]
+    public async Task AReplayedRefusalStaysWithItsFirstRefuser()
+    {
+        var resets = Now.AddHours(2);
+        var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets.AddSeconds(20)), A(3, 60));
+        Assert.Equal(2, (await rig.Hit(Now, resets.AddSeconds(10)))!.Switched!.To!.Number);
+        rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+        rig.Changed = DateTime.UtcNow.AddMinutes(-5); // the stuck window refuses again, well after the switch
+        Assert.Null(await rig.Hit(Now.AddMinutes(5), resets.AddSeconds(10))); // the same window and reset: still 1's, so 2 is not charged
+        Assert.Equal([2], rig.Switched);
+        Assert.DoesNotContain(2, rig.Switch.RefusedUntil.Keys);
+    }
+
+    [Fact]
+    public async Task ASessionThatCarriedOnAfterTheSwitchIsRefusedByTheNewLogin()
     {
         var root = TempRoot();
         try
         {
-            var typed = """{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"continue"}}""";
-            var reply = """{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}""";
-            var at = DateTimeOffset.UtcNow;
-            Stage(root, "idle", LimitLine(at, at.AddHours(1)), typed);
-            Assert.Single(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(10), DateTime.MinValue));
-            Assert.Empty(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddHours(2), DateTime.MinValue)); // the reset has passed
-            Stage(root, "idle", LimitLine(at, at.AddHours(1)), typed, reply);
-            Assert.Empty(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(10), DateTime.MinValue)); // it answered: running again
+            var resets = Now.AddHours(2);
+            var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets), A(3, 60)); // Auto-Prime: 1 and 2 reset together
+            var f = Write(root, "sid.jsonl", LimitLine(Now, resets));
+            Assert.Equal(2, (await rig.Hit(Now, resets, file: f))!.Switched!.To!.Number);
+            rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+            rig.Changed = DateTime.UtcNow.AddMinutes(-90);
+            File.AppendAllLines(f, [$$$"""{"type":"assistant","timestamp":"{{{Now.AddMinutes(1):O}}}","message":{"role":"assistant","content":[{"type":"text","text":"carried on"}],"stop_reason":"end_turn"}}""",
+                LimitLine(Now.AddMinutes(90), resets)]);
+            Assert.Equal(3, (await rig.Hit(Now.AddMinutes(90), resets, file: f))!.Switched!.To!.Number); // ran on 2 since: 2's refusal, not 1's replayed
+            Assert.Contains(2, rig.Switch.RefusedUntil.Keys);
         }
         finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task AMovedSessionsEarlierRefusalsAreForgotten()
+    {
+        var resets = Now.AddHours(2);
+        var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets), A(3, 60));
+        await rig.Hit(Now, resets); // sid is charged to 1
+        rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+        rig.Changed = DateTime.UtcNow.AddMinutes(-90);
+        rig.Switch.Forget("sid"); // the tray reopened it
+        Assert.Equal(3, (await rig.Hit(Now.AddMinutes(90), resets))!.Switched!.To!.Number);
+    }
+
+    [Fact]
+    public void AWindowReopenedOnAnAccountIsNeverPickedBySwitchTargetsMeanwhile()
+    {
+        var resets = Now.AddHours(2);
+        var accounts = new[] { A(1, 10, active: true, resets: resets), A(2, 20), A(3, 60) };
+        var stamps = new Dictionary<string, DateTime> { ["sid#2"] = DateTime.UtcNow, ["old#3"] = DateTime.UtcNow.AddMinutes(-5), ["sid#@123"] = DateTime.UtcNow };
+        var live = ResumeStopped.Launching(stamps, DateTime.UtcNow).ToHashSet();
+        Assert.Equal([2], live); // the plan-time stamp counts; an old one and a move stamp do not
+        Assert.Equal([3], ResumeStopped.SwitchTargets(accounts, 1, live, new Dictionary<int, DateTimeOffset>(), Now));
+    }
+
+    [Fact]
+    public void AnythingTheOwnerDidAfterTheErrorMeansTheWindowIsNotStopped()
+    {
+        var limit = LimitLine(Now, Now.AddHours(1));
+        var typed = """{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"do Y instead"}}""";
+        var interrupted = """{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}""";
+        var bash = """{"type":"user","message":{"role":"user","content":"<bash-input>git status</bash-input>"}}""";
+        var auto = """{"type":"user","origin":{"kind":"auto-continue"},"message":{"role":"user","content":"continue"}}""";
+        Assert.Null(ResumeStopped.LimitOf([limit, typed, interrupted])); // the owner went on, then interrupted: nothing to relaunch
+        Assert.Null(ResumeStopped.LimitOf([limit, bash]));
+        Assert.Null(ResumeStopped.LimitOf([limit, auto])); // only a background task's notice is not the owner's
     }
 
     [Fact]
@@ -645,5 +717,114 @@ public class LimitWatchTests
             Assert.False(s.AtLimit); // a finished turn: the threshold move still sees it
         }
         finally { Directory.Delete(root, true); }
+    }
+
+    // ---- the per-window decision ---------------------------------------------------------------------------------
+
+    static StoppedSession Stopped(string status = "idle", bool atLimit = true, string dir = @"C:\cfg") =>
+        new(1, "sid", @"C:\w", dir, 3, dir + @"\projects\w\sid.jsonl", atLimit, Status: status);
+
+    static ResumeStopped.Step Decide(StoppedSession s, int? target = 2, double idleSeconds = 60, bool recent = false, int moves = 0, bool unchanged = true) =>
+        ResumeStopped.Decide(s, TimeSpan.FromSeconds(idleSeconds), TimeSpan.FromSeconds(5), target, recent, moves, () => unchanged);
+
+    [Fact]
+    public void ABusyShellOrWaitingWindowIsNeverMovedWhateverElseHolds()
+    {
+        foreach (var status in new[] { "busy", "shell", "waiting" })
+        {
+            var step = Decide(Stopped(status), unchanged: true);
+            Assert.Equal(status == "waiting" ? ResumeStopped.Step.Wait : ResumeStopped.Step.Left, step); // one balloon names the left ones
+        }
+        Assert.Equal(ResumeStopped.Step.Move, Decide(Stopped())); // idle at the limit, with room: moved
+    }
+
+    [Fact]
+    public void AWindowWaitsForTypingAndForItsOwnStateToHold()
+    {
+        Assert.Equal(ResumeStopped.Step.Wait, Decide(Stopped(), idleSeconds: 2)); // mid-keystroke: the next poll
+        Assert.Equal(ResumeStopped.Step.Wait, Decide(Stopped(), unchanged: false)); // something happened since the scan
+        var ran = false;
+        Assert.Equal(ResumeStopped.Step.NoRoom, ResumeStopped.Decide(Stopped(), TimeSpan.FromMinutes(1), TimeSpan.FromSeconds(5), null, false, 0, () => ran = true));
+        Assert.False(ran); // the last look runs only when a close is about to follow
+    }
+
+    [Fact]
+    public void ARecentOrOftenMovedWindowStaysPut()
+    {
+        Assert.Equal(ResumeStopped.Step.Recent, Decide(Stopped(), recent: true));
+        Assert.Equal(ResumeStopped.Step.Capped, Decide(Stopped(), moves: ResumeStopped.MovesPerHour));
+        Assert.Equal(ResumeStopped.Step.Move, Decide(Stopped(), moves: ResumeStopped.MovesPerHour - 1));
+    }
+
+    [Fact]
+    public void AFinishedTurnMovesOnlyOffAProfileAfterAMinuteOfQuiet()
+    {
+        Assert.Equal(ResumeStopped.Step.Ignore, Decide(Stopped(atLimit: false, dir: ResumeStopped.DefaultDir)));
+        Assert.Equal(ResumeStopped.Step.Ignore, Decide(Stopped(atLimit: false), idleSeconds: 30));
+        Assert.Equal(ResumeStopped.Step.Move, Decide(Stopped(atLimit: false)));
+        Assert.Equal(ResumeStopped.Step.Ignore, Decide(Stopped("busy", atLimit: false)));
+    }
+
+    // ---- shutdown and the engine gate ------------------------------------------------------------------------------
+
+    [Fact]
+    public void ADisposedWatchStartsNoWatcherAndPostsNoHit()
+    {
+        var root = TempRoot();
+        try
+        {
+            var hits = new List<LimitHit>();
+            var w = new LimitWatch(hits.Add, _ => { });
+            var f = Write(root, "sid.jsonl", LimitLine(Now, Now.AddHours(1)));
+            w.Dispose();
+            w.Sync([root]);
+            Assert.False(w.Watching(root)); // a Sync still running at exit leaks no watcher
+            w.Poll([(f, root)]);
+            Assert.Empty(hits); // and a Read still running at exit posts into a gone UI
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task ASlowImportNeverDelaysTheSwitch()
+    {
+        var never = new TaskCompletionSource();
+        var rig = new Rig(A(1, 50, active: true), A(2, 20)) { Report = _ => never.Task };
+        var o = await rig.Hit(Now, Now.AddHours(1)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, o!.Switched!.To!.Number); // the import is still pending
+    }
+
+    [Fact]
+    public async Task SwitchingIsSetWhileTheEngineSwitchRuns()
+    {
+        var gate = new TaskCompletionSource();
+        var rig = new Rig(A(1, 50, active: true), A(2, 20)) { SwitchGate = gate.Task };
+        var hit = rig.Hit(Now, Now.AddHours(1));
+        Assert.True(rig.Switch.Switching);
+        gate.SetResult();
+        await hit;
+        Assert.False(rig.Switch.Switching);
+    }
+
+    [Fact]
+    public async Task RepeatedRefusalsDoNotRespawnFailingSwitchesEachTime()
+    {
+        var rig = new Rig(A(1, 50, active: true), A(2, 20)) { Failing = [2] };
+        var resets = Now.AddHours(1);
+        Assert.NotNull((await rig.Hit(Now, resets))!.Error);
+        for (var i = 1; i <= 5; i++) Assert.Null(await rig.Hit(Now.AddSeconds(i), resets, file: $@"C:\x\sid\subagents\a{i}.jsonl")); // the burst: the login is still on the refuser
+        Assert.Single(rig.Log, l => l.StartsWith("switch 1->2 failed"));
+    }
+
+    [Fact]
+    public void RememberForgetsOnlyErrorsOlderThanTheFreshnessWindow()
+    {
+        var clock = Now;
+        using var w = new LimitWatch(_ => { }, _ => { }, () => clock);
+        var recent = Now.AddSeconds(-10);
+        w.Remember(recent);
+        for (var i = 0; i < 1100; i++) w.Remember(Now.AddHours(-1).AddSeconds(i)); // history: older than the window
+        w.Remember(Now.AddSeconds(-5)); // over the count: old entries are pruned
+        Assert.False(w.Remember(recent)); // a recent one is still known
     }
 }
