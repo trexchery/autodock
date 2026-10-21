@@ -29,6 +29,8 @@ public sealed partial class TrayApp : ApplicationContext
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
     readonly Dictionary<int, DateTime> _freed = []; // account → when its `cswap run` windows were last moved to the default login
     readonly HashSet<int> _heldNotice = []; // pinned accounts the user was told a working window holds, while a free is due
+    (int N, string Text)? _held; // this pass's held warning, shown only if the pass shows no other balloon (a second replaces the first)
+    int _notices; // balloons shown so far
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
@@ -333,7 +335,14 @@ public sealed partial class TrayApp : ApplicationContext
     {
         await _movePass.WaitAsync();
         // The caller's snapshot may predate a switch made while this pass waited: a reopened window must see where the default login is now.
-        try { await MovePassAsync(_snap ?? snap); }
+        try
+        {
+            (_held, var shown) = (null, _notices);
+            await MovePassAsync(_snap ?? snap);
+            // Not yet told if anything else showed: the next quiet pass tells it, while a free of that account is still due.
+            if (_held is { } h && _notices == shown && _heldNotice.Add(h.N))
+                Notify($"#{h.N} is held by a pinned terminal", h.Text, ToolTipIcon.Warning);
+        }
         finally { _movePass.Release(); }
     }
 
@@ -473,10 +482,8 @@ public sealed partial class TrayApp : ApplicationContext
             if (!ResumeStopped.Releasable(windows, records, runs))
             {
                 // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
-                if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && _heldNotice.Add(n))
-                    Notify($"#{n} is held by a pinned terminal",
-                        $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner.",
-                        ToolTipIcon.Warning);
+                if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && !_heldNotice.Contains(n))
+                    _held = (n, $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner.");
                 return false;
             }
             if (ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
@@ -536,8 +543,11 @@ public sealed partial class TrayApp : ApplicationContext
 
     static string Name(AccountRef? r) => r == null ? "(none)" : $"#{r.Number} {r.Email}";
 
-    void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info) =>
+    void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
+    {
+        _notices++;
         _tray.ShowBalloonTip(5000, title, Engine.Redact(text), icon);
+    }
 
     void BuildMenu()
     {
