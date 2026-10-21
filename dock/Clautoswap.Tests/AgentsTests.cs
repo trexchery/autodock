@@ -232,6 +232,17 @@ public class AccountPickerTests
     }
 
     [Fact]
+    public void TheDefaultLoginNearItsLimitKeepsTheRoomiestFreeAccount()
+    {
+        Account[] accounts = [A(3, 85, active: true), A(1, 10), A(2, 30)];
+        Assert.Equal(2, AccountPicker.Pick(accounts, 90, None, NoneCooled, Now).Pick!.Number); // #1 waits for the default login
+        var (none, why) = AccountPicker.Pick(accounts, 90, new Dictionary<string, int> { [AccountPicker.Key(accounts[2])] = 1 }, NoneCooled, Now, perAccount: 1);
+        Assert.Null(none);
+        Assert.Contains("#1 is kept free", why);
+        Assert.Equal(1, AccountPicker.Pick([A(3, 50, active: true), A(1, 10), A(2, 30)], 90, None, NoneCooled, Now).Pick!.Number); // room left: no reserve
+    }
+
+    [Fact]
     public void BusyAndCooledAccountsWaitAndPreferenceKeepsASessionOnItsAccount()
     {
         var accounts = new[] { A(2, 10), A(3, 50) };
@@ -677,6 +688,20 @@ public class AgentStoreTests
         store.Save(store.Load());
         Assert.Contains("\"later\": 5", File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
         Assert.Empty(new AgentStore(Path.Combine(tmp.Path, "none")).Load().Memory);
+    }
+
+    [Fact]
+    public void RunningSeesOnlyAWorkerThatIsStillAlive()
+    {
+        using var tmp = new TempDir();
+        var self = System.Diagnostics.Process.GetCurrentProcess();
+        Run R(int pid, long created) => new() { Job = "clautoswap-test-" + Guid.NewGuid().ToString("N"), Pid = pid, Created = created, Live = true };
+        var dead = new WorkItem { Id = "1", Run = R(2147483000, 1) };
+        new AgentStore(tmp.Path).Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", Items = [dead] }] });
+        Assert.False(AgentStore.Running(tmp.Path));
+        Assert.False(AgentStore.Running(Path.Combine(tmp.Path, "none")));
+        new AgentStore(tmp.Path).Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", Items = [dead], Goals = [new Goal { Id = "g1", Run = R(self.Id, self.StartTime.ToFileTime()) }] }] });
+        Assert.True(AgentStore.Running(tmp.Path)); // a planner the old tray left running
     }
 
     [Fact]

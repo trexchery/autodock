@@ -175,6 +175,15 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public async Task RoomOnlyOnAHeldAccountIsHeldNotNoRoom()
+    {
+        var rig = new Rig(A(1, 50, active: true), A(2, 5)) { Live = [2] };
+        var o = await rig.Hit(Now, Now.AddHours(1));
+        Assert.True(o is { Held: true, NoRoom: false }); // the move pass frees #2 or says what holds it; not "all accounts near their limits"
+        Assert.Empty(rig.Switched);
+    }
+
+    [Fact]
     public async Task SecondRefusalHopsOnAndNeverGoesBackToTheFirstRefuser()
     {
         var rig = new Rig(A(1, 10, active: true), A(2, 20), A(3, 60)); // 1's reading is low and stale: it just said no
@@ -413,7 +422,7 @@ public class LimitWatchTests
         Assert.Empty(ResumeStopped.Holders([Window("idle")], records: 1, runs: 1));
         Assert.Equal(["w (busy)", "w (shell)"], ResumeStopped.Holders([Window("idle"), Window("busy", "t"), Window("shell", "u")], records: 3, runs: 3));
         Assert.Equal(["a window still working"], ResumeStopped.Holders([Window("idle")], records: 2, runs: 2));
-        Assert.Equal(["2 runs without a window"], ResumeStopped.Holders([Window("idle")], records: 1, runs: 3));
+        Assert.Equal(["2 agent or headless runs"], ResumeStopped.Holders([Window("idle")], records: 1, runs: 3));
     }
 
     [Fact]
@@ -438,10 +447,13 @@ public class LimitWatchTests
             File.WriteAllText(Path.Combine(root, ".cswap-runs", "2147483000"), ""); // no such process
             Assert.Equal((0, 1), ResumeStopped.LiveCounts(root));
             Directory.CreateDirectory(Path.Combine(root, "sessions"));
+            File.WriteAllText(Path.Combine(root, "sessions", $"{self.Id}.abc.key"), ""); // a live claude without its record
+            File.WriteAllText(Path.Combine(root, "sessions", "2147483000.abc.key"), "");
+            Assert.Equal((1, 1), ResumeStopped.LiveCounts(root));
             File.WriteAllText(Path.Combine(root, "sessions", "1.json"),
                 $$"""{"pid":{{self.Id}},"sessionId":"sid","procStart":"{{self.StartTime.ToUniversalTime().ToFileTimeUtc()}}"}""");
             File.WriteAllText(Path.Combine(root, "sessions", "2.json"), """{"pid":2147483000,"sessionId":"old","procStart":"1"}""");
-            Assert.Equal((1, 1), ResumeStopped.LiveCounts(root));
+            Assert.Equal((1, 1), ResumeStopped.LiveCounts(root)); // its key and its record are one claude
         }
         finally { Directory.Delete(root, true); }
     }

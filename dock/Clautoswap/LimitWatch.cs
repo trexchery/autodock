@@ -123,8 +123,9 @@ public sealed class LimitWatch(Action<LimitHit> onHit, Action<string> log, Func<
 }
 
 /// What one limit event came to: null from `OnLimitAsync` when it was already handled. `Switched`: the default login
-/// moved; `NoRoom`: no account to move it to (`Earliest`: when one frees up); `Error`: every try failed.
-public sealed record LimitOutcome(SwitchResult? Switched = null, bool NoRoom = false, DateTimeOffset? Earliest = null, string? Error = null);
+/// moved; `NoRoom`: no account to move it to (`Earliest`: when one frees up); `Held`: room only on accounts a `cswap run`
+/// profile holds (the move pass frees one, or says what holds it); `Error`: every try failed.
+public sealed record LimitOutcome(SwitchResult? Switched = null, bool NoRoom = false, DateTimeOffset? Earliest = null, string? Error = null, bool Held = false);
 
 /// What a usage-limit error does at once: dedupe it, tell the engine the account is full, and move the default login to
 /// the account with room from the latest reading. No refresh, no quiet wait; a stale reading corrects itself when the
@@ -163,7 +164,9 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
             catch (Exception e) { log($"import-usage failed: {e.Message}"); } // the switch does not need it
             // Only the default login moves here, and only while it is still the refuser: the engine's own check may have moved it already.
             if ((login().Account ?? snap.ActiveAccountNumber) != n) return new LimitOutcome();
-            var targets = ResumeStopped.SwitchTargets(snap.Accounts, n, liveProfiles(), RefusedUntil, now, threshold?.Invoke() ?? ResumeStopped.Full);
+            var line = threshold?.Invoke() ?? ResumeStopped.Full;
+            var targets = ResumeStopped.SwitchTargets(snap.Accounts, n, liveProfiles(), RefusedUntil, now, line);
+            if (targets.Count == 0 && ResumeStopped.SwitchTargets(snap.Accounts, n, new HashSet<int>(), RefusedUntil, now, line).Count > 0) return new LimitOutcome(Held: true);
             if (targets.Count == 0) return new LimitOutcome(NoRoom: true, Earliest: ResumeStopped.EarliestReset(snap.Accounts, RefusedUntil, now));
             var clockMs = Stopwatch.StartNew();
             foreach (var m in targets.Take(3)) // ponytail: three tries, then the engine's own check takes over

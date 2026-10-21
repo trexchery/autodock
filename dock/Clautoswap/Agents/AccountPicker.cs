@@ -40,6 +40,12 @@ public static class AccountPicker
         var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now)).ToList();
         var headroom = open.Where(a => Peak(a, now) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();
+        // The default login near its line can only switch to an account no `cswap run` holds: keep the roomiest one free of agents.
+        // shortcut: runs already holding every such account keep them until they end; stop one for the default login if that stalls it too long.
+        var kept = accounts.FirstOrDefault(a => a.Active) is { } own && Peak(own, now) is { } p0 && p0 >= threshold - MinRoom
+            ? headroom.Where(a => busy.GetValueOrDefault(Key(a)) == 0).OrderBy(a => Peak(a, now) ?? threshold).FirstOrDefault() : null;
+        if (kept != null) free.Remove(kept);
+        if (free.Count == 0 && kept != null) return (null, $"#{kept.Number} is kept free for your own login, which is near its limit");
         if (free.Count == 0)
         {
             if (headroom.Count > 0) return (null, "every account is already running its share of agents");

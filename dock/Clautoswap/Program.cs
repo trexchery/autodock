@@ -45,21 +45,34 @@ static class Program
                 "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
+        // Workers outlive the tray that started them, and work inside the old folder: it cannot move under them, and
+        // clautoswap must not start beside them without their state.
+        if (AgentStore.Running(Path.Combine(old, "agents")))
+        {
+            MessageBox.Show("Agents the old autodock tray started are still working. Start clautoswap again once they finish: it then carries over your settings and agents.",
+                "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
         try
         {
             if (Directory.Exists(old) && !Directory.Exists(DockSettings.Dir)) Directory.Move(old, DockSettings.Dir);
-            // A clautoswap folder that holds no settings yet (say, only a log from an earlier start) is not a
-            // reason to leave everything behind: move the old entries in beside what is there.
-            else if (Directory.Exists(old) && !File.Exists(Path.Combine(DockSettings.Dir, "settings.json")))
+            // A clautoswap folder that already exists (say, only a log from an earlier start, or what moved before an entry
+            // was locked) is not a reason to leave everything behind: move the old entries in beside what is there.
+            else if (Directory.Exists(old))
             {
                 foreach (var entry in Directory.EnumerateFileSystemEntries(old))
                 {
                     var dest = Path.Combine(DockSettings.Dir, Path.GetFileName(entry));
                     if (File.Exists(dest) || Directory.Exists(dest)) continue;
-                    if (Directory.Exists(entry)) Directory.Move(entry, dest); else File.Move(entry, dest);
+                    try { if (Directory.Exists(entry)) Directory.Move(entry, dest); else File.Move(entry, dest); }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log(e); } // one locked entry stays; the rest move
                 }
                 if (!Directory.EnumerateFileSystemEntries(old).Any()) Directory.Delete(old);
             }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log(e); }
+        try
+        {
             using var run = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", writable: true);
             if (run?.GetValue("autodock") is string) { run.DeleteValue("autodock"); if (!Startup.IsEnabled()) Startup.Set(true); }
         }

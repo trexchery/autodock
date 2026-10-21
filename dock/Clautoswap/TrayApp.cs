@@ -355,7 +355,7 @@ public sealed partial class TrayApp : ApplicationContext
         List<StoppedSession> stopped;
         try { stopped = await Task.Run(() => ScanStops(snap, includeBusy: true)); }
         catch (Exception e) { Program.Log(e); return; }
-        if (stopped.Count > 0 && _engineThreshold == null) await ReadEngineThresholdAsync();
+        if (_engineThreshold == null) await ReadEngineThresholdAsync(); // the free below judges the default login at the engine's line too
         // First, so the default login's stopped windows are reopened where it lands, not in the profile being freed.
         if (await FreePinnedAsync(snap)) { _retry = true; return; } // the next poll's pass sees where the default login is now
         var (threshold, hysteresis) = (Threshold, _engineHysteresis ?? 10);
@@ -490,7 +490,9 @@ public sealed partial class TrayApp : ApplicationContext
             {
                 // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
                 if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && !_heldNotice.Contains(n))
-                    _held = (n, $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner.");
+                    _held = (n, $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. " + (windows.Count == records && windows.All(w => w.Idle)
+                        ? $"It moves to #{n} once that run ends; pausing agents frees #{n} sooner." // no window to close: only runs hold it
+                        : $"It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner."));
                 return false;
             }
             if (ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
@@ -561,14 +563,15 @@ public sealed partial class TrayApp : ApplicationContext
         _menu.Items.Clear();
         _menu.Items.Add("Open dashboard", null, (_, _) => ShowDashboard());
         var sw = new ToolStripMenuItem("Switch to");
-        var term = new ToolStripMenuItem("Open terminal as");
         foreach (var a in _snap?.Accounts ?? [])
         {
             var label = $"#{a.Number} {(string.IsNullOrEmpty(a.Alias) ? a.Email : a.Alias)}";
             sw.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) => _ = SwitchAsync(a)) { Checked = a.Active, Enabled = !a.Active });
-            term.DropDownItems.Add(label, null, (_, _) => OpenTerminal(a, null));
         }
-        sw.Enabled = term.Enabled = sw.DropDownItems.Count > 0;
+        sw.Enabled = sw.DropDownItems.Count > 0;
+        // The folder's assigned account if it has one, else the default login: the dashboard's Terminal path.
+        var active = _snap?.Accounts.FirstOrDefault(a => a.Active);
+        var term = new ToolStripMenuItem("Open terminal", null, (_, _) => { if (active != null) _ = AccountActionAsync(active, "terminal-folder"); }) { Enabled = active != null };
         _menu.Items.Add(sw);
         _menu.Items.Add(term);
         var proj = new ToolStripMenuItem("Project terminals");

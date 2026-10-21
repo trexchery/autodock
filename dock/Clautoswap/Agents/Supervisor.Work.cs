@@ -267,7 +267,7 @@ public sealed partial class Supervisor
         Notify?.Invoke("Agents need you", $"{repo.Leaf} · {item.Label}: {item.Note}");
     }
 
-    const string QuestionMark = "<!-- clautoswap-agents -->";
+    const string QuestionMark = "<!-- clautoswap-agents -->", OldQuestionMark = "<!-- autodock-agents -->"; // asked before the rename
 
     /// A decision only the owner can make: park the item, ask where the owner already works (the issue),
     /// and move on. An answer there, or in the agents terminal, brings it back.
@@ -445,7 +445,7 @@ public sealed partial class Supervisor
             var v = await _cli.GhAsync(repo.Path, "issue", "view", item.Issue!.Value.ToString(), "--json", "comments");
             if (!v.Ok) continue;
             if (item.State != ItemState.NeedsOwner || item.AskedAt is not { } asked || Dropped(repo, item)) continue; // changed during the await
-            var answers = IssueInfo.Comments(v.Out, asked, _me).Where(c => !c.Contains(QuestionMark)).ToList();
+            var answers = IssueInfo.Comments(v.Out, asked, _me).Where(c => !c.Contains(QuestionMark) && !c.Contains(OldQuestionMark)).ToList();
             if (answers.Count == 0) continue;
             item.Guidance = Engine.Redact(string.Join("\n\n", answers));
             Memory.Add(repo.Memory, $"#{item.Issue}: {item.Guidance}", "issue", true, DateTimeOffset.Now);

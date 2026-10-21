@@ -17,7 +17,7 @@ public sealed class AgentsEndToEndTests : IDisposable
     readonly string _repo, _gh, _log;
     readonly Cli _cli;
     readonly Engine _engine;
-    readonly AgentStore _store;
+    AgentStore _store;
     readonly ConcurrentQueue<string> _notes = new();
     readonly string? _dataWas = Environment.GetEnvironmentVariable("CLAUTOSWAP_DATA");
     Supervisor? _sup;
@@ -288,13 +288,42 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         // The owner answers on GitHub. Two open pull requests leave capacity for more work.
         Issues("""[{"number":10,"title":"Greeting tone","body":"[fake:blocked] Pick a tone.","labels":[],"assignees":[],"author":{"login":"owner"}},{"number":13,"title":"New","body":"","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
-        File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
+        // A question clautoswap asked before the rename (old marker) is not the owner's answer.
+        File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Which tone?\n<!-- autodock-agents -->","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"},{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
         await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
         await Until(r => Item(r, 10).State == ItemState.Open, "the answered issue reaches a pull request without a merge");
         Assert.Contains("owner: Formal, please.", Read(_log + ".prompts"));
+        Assert.DoesNotContain("Which tone?", Read(_log + ".prompts"));
         Assert.Contains(Runs, r => r.Contains("--resume")); // in its own conversation
         await Until(r => Item(r, 13).State == ItemState.Open, "the next issue also reaches a pull request");
         Assert.DoesNotContain("Holding new work", await Tool("agents_status", "{}"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AWorktreeInTheMovedDataFolderCarriesOnThere()
+    {
+        Issues("""[{"number":10,"title":"Greeting tone","body":"[fake:blocked] Pick a tone.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var config = Fast();
+        await StartAsync(config);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 10).State == ItemState.NeedsOwner, "issue 10 asks the owner");
+        var was = await On(r => Item(r, 10).Worktree!);
+        await _loop.Run(() => { _sup!.Dispose(); return 0; });
+
+        Directory.Move(P("agents"), P("moved")); // autodock's data folder became clautoswap's
+        _store = new AgentStore(P("moved"));
+        await StartAsync(config);
+        var moved = await On(r => _store.Worktree(r, Item(r, 10)));
+        Assert.True(Directory.Exists(moved));
+        Assert.Equal(moved, await On(r => Item(r, 10).Worktree));
+        // git learns the worktree's new place, so no prune drops it with its work.
+        await AgentProcessTests.WaitUntil(() => Git(_repo, "worktree", "list", "--porcelain").Replace('/', '\\').Contains(moved, StringComparison.OrdinalIgnoreCase));
+
+        File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
+        await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
+        await Until(r => Item(r, 10).State == ItemState.Open, "the answered issue carries on in its moved worktree");
+        Assert.False(Directory.Exists(was)); // no fresh worktree at the old place
         _sup!.Dispose();
     }
 
@@ -698,6 +727,27 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Tool("agents_control", """{"action":"start"}""", other);
         Assert.StartsWith("Goal g1: the director plans again", await Goal(new { action = "replan", goal = "g1" }));
         await Until(_ => DirectorPrompts().Length == 2, "the owner's replan plans now");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task SkippingTheStepAGoalAskedAboutPutsTheGoalBackToWork()
+    {
+        var other = NewRepo("other");
+        Plan("""
+            {"status":"working","summary":"server first","items":[{"key":"a","title":"Serve greetings","repo":"other"},{"key":"b","title":"Use the server","after":["a"]}]}
+            """);
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Greetings everywhere" });
+        await Until(r => G(r).Plans == 1, "the first plan is in");
+        await Tool("agents_control", """{"action":"stop"}""", other);
+        await Until(r => G(r).State == GoalState.NeedsOwner, "a step agents will never take up asks the owner");
+
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w1"}""", other)); // what the note offers
+        Assert.Equal((GoalState.Active, (string?)null), await On(r => (G(r).State, G(r).Note)));
+        await Until(_ => DirectorPrompts().Length == 2, "the goal plans again without the skipped step");
         _sup!.Dispose();
     }
 

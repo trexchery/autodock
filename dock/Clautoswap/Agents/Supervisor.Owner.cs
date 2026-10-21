@@ -140,7 +140,12 @@ public sealed partial class Supervisor
                 if (skip.Issue is { } si && !repo.Skipped.Contains(si)) repo.Skipped.Add(si);
                 await StopWorkerAsync(skip, "skipped");
                 await FinishAsync(repo, skip, "skipped by the owner");
-                if (GoalOf(skip.Goal) is { } sg) AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
+                if (GoalOf(skip.Goal) is { } sg)
+                {
+                    AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
+                    // A goal waiting on this step got its answer: plan again without it, now (the owner acted).
+                    if (sg.State == GoalState.NeedsOwner) (sg.State, sg.Note, sg.Claim, sg.Replan, sg.LastPlan) = (GoalState.Active, null, null, true, null);
+                }
                 if (skip.Pr == null) repo.Items.Remove(skip);
                 HoldDependents(_state.Repos, repo, skip);
                 Save();

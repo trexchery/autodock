@@ -218,6 +218,13 @@ public sealed class AgentStore(string root)
     public static bool HasWork(string root) =>
         new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }) || r.Goals.Any(g => g.Run is { Live: true }));
 
+    /// A worker of `root`'s state still runs: workers outlive the tray that started them.
+    public static bool Running(string root) =>
+        new AgentStore(root).Load().Repos.SelectMany(r => r.Items.Select(i => i.Run).Concat(r.Goals.Select(g => g.Run)))
+            .Any(r => r is { Live: true, Pid: > 0 } && AgentProcess.Attach(r.Job, r.Pid, r.Created) is { } p && Close(p));
+
+    static bool Close(AgentProcess p) { p.Dispose(); return true; }
+
     public string RunDir(RepoAgents repo, WorkItem item) => System.IO.Path.Combine(Root, "runs", $"{repo.Key}-{item.Id}");
 
     public string Worktree(RepoAgents repo, WorkItem item) => System.IO.Path.Combine(Root, "wt", $"{repo.Key}-{item.Id}");

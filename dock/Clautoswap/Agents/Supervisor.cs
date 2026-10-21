@@ -142,6 +142,13 @@ public sealed partial class Supervisor : IDisposable
         {
             foreach (var item in repo.Items)
             {
+                // The data folder moved (autodock became clautoswap): the worktree is there now, and git learns its new place
+                // before any prune would drop it (git runs one command at a time, in order).
+                if (item.Worktree is { } was && !Directory.Exists(was) && _store.Worktree(repo, item) is var moved && Directory.Exists(moved))
+                {
+                    item.Worktree = moved;
+                    Fire(() => GitAsync(repo.Path, "worktree", "repair", moved));
+                }
                 if (item.Run is { Live: true } run)
                 {
                     var proc = run.Pid == 0 ? null : AgentProcess.Attach(run.Job, run.Pid, run.Created);

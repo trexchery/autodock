@@ -303,22 +303,30 @@ public static class ResumeStopped
         records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle);
 
     /// What keeps a profile that is not `Releasable`, for the user: each window not idle by folder and status, a window the
-    /// scan did not see as done, a run without a window.
+    /// scan did not see as done, a run without a window (an agent's, or a headless `cswap run`).
     public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
     {
         var held = windows.Where(w => !w.Idle).Select(w => $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
         if (records > windows.Count) held.Add(records - windows.Count == 1 ? "a window still working" : $"{records - windows.Count} windows still working");
-        if (runs > records) held.Add(runs - records == 1 ? "a run without a window" : $"{runs - records} runs without a window");
+        if (runs > records) held.Add(runs - records == 1 ? "an agent or headless run" : $"{runs - records} agent or headless runs");
         return held;
     }
 
     /// Live claude records and live `cswap run` wrapper markers in a profile dir. Throws when it cannot be listed.
+    /// A live claude with only a `{pid}.<hash>.key` (a Windows `--resume` may write no record) counts as a record, as in
+    /// the engine: one started after the key was written holds a recycled pid. shortcut: `Scan` and `LiveTranscripts`
+    /// still miss such a window (no record names its transcript), so it is only ever held, never moved; find its
+    /// transcript by the pid's newest projects file if those windows turn out common.
     public static (int Records, int Runs) LiveCounts(string dir)
     {
         var runs = Path.Combine(dir, ".cswap-runs");
         var records = Path.Combine(dir, "sessions");
-        return (Directory.Exists(records) ? Directory.EnumerateFiles(records, "*.json").Count(IsLiveRecord) : 0,
-            Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid)) : 0);
+        var live = Directory.Exists(records) ? Directory.EnumerateFiles(records, "*.json").Select(LivePid).OfType<int>().ToHashSet() : [];
+        var count = live.Count;
+        if (Directory.Exists(records))
+            count += Directory.EnumerateFiles(records, "*.key").Count(f => int.TryParse(Path.GetFileName(f).Split('.')[0], out var pid) && live.Add(pid)
+                && IsRunning(pid) && !(StartOf(pid)?.ToUniversalTime() > File.GetLastWriteTimeUtc(f).AddSeconds(2)));
+        return (count, Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid)) : 0);
     }
 
     /// Accounts with a `cswap run` window right now: a live claude in the profile, or its wrapper's run marker (a headless
@@ -344,14 +352,14 @@ public static class ResumeStopped
         catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
     }
 
-    static bool IsLiveRecord(string rec)
+    static int? LivePid(string rec)
     {
         try
         {
             using var doc = JsonDocument.Parse(File.ReadAllText(rec));
-            return doc.RootElement.TryGetProperty("pid", out var pid) && pid.TryGetInt32(out var id) && IsLiveClaude(id, Str(doc.RootElement, "procStart"));
+            return doc.RootElement.TryGetProperty("pid", out var pid) && pid.TryGetInt32(out var id) && IsLiveClaude(id, Str(doc.RootElement, "procStart")) ? id : null;
         }
-        catch (JsonException) { return false; } // half-written: the next look sees it
+        catch (JsonException) { return null; } // half-written: the next look sees it
     }
 
     /// The transcripts of live windows, for the poll: each main transcript, and the subagent and workflow-agent files of its
