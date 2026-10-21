@@ -1205,8 +1205,24 @@ public class AgentGoalTests
     }
 
     [Fact]
+    public void SkippingASecondStepDoesNotAnswerAHeldIssue()
+    {
+        var (w1, w2, adopted) = (I("w1"), I("w2"), I("7"));
+        var repo = Repo(adopted);
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (adopted.Goal, adopted.After) = (key, [Supervisor.Key(repo, w1), Supervisor.Key(repo, w2)]);
+        Supervisor.HoldDependents([repo], repo, w1);
+        Supervisor.HoldDependents([repo], repo, w2);
+        Assert.Equal((ItemState.NeedsOwner, key), (adopted.State, adopted.Goal));
+        Assert.Empty(adopted.After);
+    }
+
+    [Fact]
     public void OnlyANetworkFailureOfAFetchIsOffline()
     {
+        Assert.Matches(Supervisor.Offline, "ssh: Could not resolve hostname github.com\nfatal: Could not read from remote repository.\nand the repository exists."); // the last line alone says nothing
         Assert.Matches(Supervisor.Offline, "fatal: unable to access 'x': Could not resolve host: github.com");
         Assert.DoesNotMatch(Supervisor.Offline, "fatal: couldn't find remote ref main");
     }

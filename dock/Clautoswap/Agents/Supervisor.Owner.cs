@@ -205,6 +205,7 @@ public sealed partial class Supervisor
                     d.After.Remove(Key(repo, s)); // answered, it must not wait for what the owner skipped
                     if (repos.SelectMany(r => r.Goals.Where(g => Key(r, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
                 }
+                else if (Held(d)) d.After.Remove(Key(repo, s)); // already the owner's question: skipping another step does not answer it
                 else if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
     }
 

@@ -37,7 +37,7 @@ public sealed partial class Supervisor
         if (Due(_fetched.GetValueOrDefault(repo), TimeSpan.FromMinutes(2)))
         {
             var fetch = await GitAsync(repo.Path, "fetch", "--quiet", "origin", repo.Base);
-            if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: Offline.IsMatch(fetch.Why)); // a stale base proves nothing
+            if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: Offline.IsMatch(fetch.Err + fetch.Out)); // a stale base proves nothing
             _fetched[repo] = DateTimeOffset.Now;
         }
         return "origin/" + repo.Base;

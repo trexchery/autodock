@@ -213,7 +213,7 @@ public sealed partial class Supervisor
         var covered = await _cli.GhAsync(repo.Path, "pr", "list", "--state", "open", "--limit", "100", "--json", "number,closingIssuesReferences") is { Ok: true } prs
             ? IssueInfo.ClosedByOpenPullRequests(prs.Out) : [];
         var (skip, only) = IssueInfo.Routing(issues, me);
-        var items = repo.Items.Select(i => i.Issue).OfType<int>().ToHashSet();
+        var items = repo.Items.Where(i => i.State != ItemState.Done).Select(i => i.Issue).OfType<int>().ToHashSet();
         var left = (sequenced ?? new HashSet<int>()).ToHashSet(); // a blocker the plan itself sequences is left to `after`: only while it is taken
         while (true)
         {
