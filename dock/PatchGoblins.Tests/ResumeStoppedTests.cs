@@ -471,6 +471,7 @@ public class ResumeStoppedTests
             File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(1));
             Assert.True(ResumeStopped.Unchanged(s)); // Remote Control dropping on a switch is not someone typing
             File.AppendAllText(t, Typed + "\n");
+            File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(2)); // a coarse file clock must not make "someone typed" look like no change
             Assert.False(ResumeStopped.Unchanged(s));
             File.WriteAllLines(t, [Typed, LimitV2]);
             foreach (var status in new[] { "busy", "shell" })
