@@ -1623,7 +1623,7 @@ class SessionManager:
         """Carry the default profile's folder trust into a session profile.
 
         A folder you already trusted in your normal claude (or under another
-        of your accounts) must not stop a `cswap run` launch, or a clautoswap
+        of your accounts) must not stop a `cswap run` launch, or a handoff
         resume nobody is watching, at the trust dialog just because this
         account's profile has never opened it. Only trust you granted flows
         across, and only for the launch folder. Fail-open like the MCP
