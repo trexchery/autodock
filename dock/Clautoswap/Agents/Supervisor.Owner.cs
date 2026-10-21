@@ -197,16 +197,18 @@ public sealed partial class Supervisor
     /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them.
     internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip)
     {
-        for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
-            foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
-                if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
-                {
-                    (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
-                    d.After.Remove(Key(repo, s)); // answered, it must not wait for what the owner skipped
-                    if (repos.SelectMany(r => r.Goals.Where(g => Key(r, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
-                }
-                else if (Held(d)) d.After.Remove(Key(repo, s)); // already the owner's question: skipping another step does not answer it
-                else if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
+        // In any repository: a goal's steps can build on each other across them.
+        for (var q = new Queue<(RepoAgents R, WorkItem I)>([(repo, skip)]); q.TryDequeue(out var s);)
+            foreach (var r in repos)
+                foreach (var d in r.Items.Where(d => d.Goal != null && d.After.Contains(Key(s.R, s.I))).ToList())
+                    if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
+                    {
+                        (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
+                        d.After.Remove(Key(s.R, s.I)); // answered, it must not wait for what the owner skipped
+                        if (repos.SelectMany(x => x.Goals.Where(g => Key(x, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
+                    }
+                    else if (Held(d)) d.After.Remove(Key(s.R, s.I)); // already the owner's question: skipping another step does not answer it
+                    else if (Unplan(r, d.Goal!, [d]) > 0) q.Enqueue((r, d));
     }
 
     /// An adopted issue held because a step it was planned after was skipped: a question for the owner, no problem.
@@ -256,11 +258,11 @@ public sealed partial class Supervisor
         if (repo.Note != null) sb.AppendLine(repo.Note);
         foreach (var g in repo.Goals.Where(g => detail || g.State != GoalState.Dropped))
             sb.AppendLine(GoalLine(repo, g) + (detail && g.Log.Count > 0 ? "\n  " + string.Join("\n  ", g.Log.TakeLast(5)) : ""));
-        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
-        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
-        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(repo, active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
+        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(repo, i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(repo, i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
         if (queued.Count > 0)
-            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
+            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(repo, i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
         if (repo.Running && actives.Count == 0 && queued.Count > 0)
             sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs, i => !Ready(i)) == null
                 ? $"Holding new work: {prs.Count} pull requests are waiting for review."

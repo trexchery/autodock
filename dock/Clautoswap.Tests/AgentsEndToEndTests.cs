@@ -116,10 +116,10 @@ public sealed class AgentsEndToEndTests : IDisposable
 
     WorkItem Item(RepoAgents r, int issue) => r.Items.Single(i => i.Issue == issue);
 
-    async Task Until(Func<RepoAgents, bool> condition, string what, int seconds = 90)
+    async Task Until(Func<RepoAgents, bool> condition, string what, int seconds = 90, string? repo = null)
     {
         var until = DateTime.UtcNow.AddSeconds(seconds);
-        while (!await On(r => { try { return condition(r); } catch (InvalidOperationException) { return false; } }))
+        while (!await On(r => { try { return condition(r); } catch (InvalidOperationException) { return false; } }, repo))
         {
             if (DateTime.UtcNow > until)
                 throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))))}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\nclautoswap.log:\n{Read(Path.Combine(P("data"), "clautoswap.log"))}");
@@ -640,6 +640,62 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Equal(ItemState.Queued, await On(r => Item(r, 6).State));
         Assert.Single(DirectorPrompts()); // the goal's work moved, but the last plan is recent
 
+        Assert.StartsWith("Goal g1: the director plans again", await Goal(new { action = "replan", goal = "g1" }));
+        await Until(_ => DirectorPrompts().Length == 2, "the owner's replan plans now");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AGoalPlansStepsInAnotherRepositoryThatWaitAcrossThem()
+    {
+        var other = NewRepo("other");
+        Plan("""
+            {"status":"working","summary":"server first","items":[{"key":"a","title":"Serve greetings","body":"Add serve.txt.","repo":"other"},{"key":"b","title":"Use the server","after":["a"]}]}
+            """);
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Tool("agents_queue", """{"action":"add","title":"Tidy the readme","text":"x"}""", other);
+        await Goal(new { action = "set", title = "Greetings everywhere" });
+
+        // The step in the other repository waits for its terminal: agents never work there in the background.
+        await Until(r => G(r).Plans == 1, "the first plan is in");
+        var (key, otherKey) = (await On(r => r.Key), await On(r => r.Key, other));
+        Assert.Equal((key + "/g1", ItemState.Queued), await On(r => (W(r, "w2").Goal, W(r, "w2").State), other));
+        Assert.Contains("Part of goal g1 of repo: Greetings everywhere", await On(r => W(r, "w2").Body, other));
+        Assert.Equal([otherKey + "/w2"], await On(r => W(r, "w1").After.ToList()));
+        var director = Assert.Single(DirectorPrompts());
+        Assert.Contains("- other (pull requests target main)", director);
+        Assert.Contains("- other:w1 Tidy the readme: queued", director); // the other repository's work, so it is not duplicated
+        Assert.Contains("Up next: w2 Serve greetings (goal g1 of repo)", await Tool("agents_status", "{}", other));
+
+        await Terminal(true, other);
+        await Until(r => W(r, "w2").State == ItemState.Open, "the other repository's step reaches a pull request", repo: other);
+        Assert.Equal(ItemState.Queued, await On(r => W(r, "w1").State)); // this repository's step waits for it
+        var pr = await On(r => W(r, "w2").Pr!.Value, other);
+        File.WriteAllText(Path.Combine(_gh, $"pr-{pr}.json"), """{"state":"MERGED"}""");
+        await Until(r => W(r, "w1").State == ItemState.Open, "this repository's step starts once the other one is merged");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AGoalWhoseStepIsInAStoppedRepositoryAsksTheOwner()
+    {
+        var other = NewRepo("other");
+        Plan("""
+            {"status":"working","summary":"server first","items":[{"key":"a","title":"Serve greetings","repo":"other"},{"key":"b","title":"Use the server","after":["a"]}]}
+            """);
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Greetings everywhere" });
+        await Until(r => G(r).Plans == 1, "the first plan is in");
+
+        await Tool("agents_control", """{"action":"stop"}""", other);
+        await Until(r => G(r).State == GoalState.NeedsOwner, "a step agents will never take up asks the owner");
+        Assert.Equal("w1 Serve greetings is in other, where agents are stopped; skip it there, or start them there and ask for a new plan", await On(r => G(r).Note));
+        // The path the note names works: once agents run there again, a new plan is not sent straight back to the owner.
+        await Tool("agents_control", """{"action":"start"}""", other);
         Assert.StartsWith("Goal g1: the director plans again", await Goal(new { action = "replan", goal = "g1" }));
         await Until(_ => DirectorPrompts().Length == 2, "the owner's replan plans now");
         _sup!.Dispose();

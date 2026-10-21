@@ -1251,6 +1251,56 @@ public class AgentGoalTests
     }
 
     [Fact]
+    public void StepsGoToOtherAuthorizedRepositoriesAndWaitAcrossThem()
+    {
+        var repo = Repo();
+        var web = new RepoAgents { Path = @"C:\web", Authorized = true, Items = [I("w1", ItemState.Open, "Old API", 4)], NextLocal = 2 };
+        var off = new RepoAgents { Path = @"C:\off" }; // not authorized: never a target
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        Supervisor.Ingest([repo, web, off], repo, goal, Plan("""
+            {"status":"working","items":[
+              {"key":"a","title":"Serve the API","repo":"WEB","after":["web:w1"]},{"key":"b","title":"Call it","after":["a"]},
+              {"key":"c","title":"Off","repo":"off"},{"key":"d","issue":3,"repo":"web"},{"key":"e","title":"Old","after":["off:w1","nope:w1"]}]}
+            """), new Dictionary<int, IssueInfo>(), ["Serve the API"], Now); // another repository's step is not this one's pull request
+        var served = web.Items.Single(i => i.Id == "w2");
+        Assert.Equal((key, "Serve the API", 10100), (served.Goal, served.Title, served.Rank));
+        Assert.Equal([Supervisor.Key(web, web.Items[0])], served.After);
+        Assert.EndsWith("Part of goal g1 of r: Ship the API", served.Body);
+        var call = Assert.Single(repo.Items);
+        Assert.Equal([Supervisor.Key(web, served)], call.After);
+        Assert.Equal("Call it", call.Title);
+        Assert.Empty(off.Items);
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Off\": off is not a repository agents are authorized for"));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #3 in web: its agents take up that repository's issues themselves"));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Old\": it builds on off:w1, which is not a step or item that exists"));
+
+        // Its own steps elsewhere count toward it and wait for what they build on there; dropping one there works too.
+        Assert.False(Supervisor.Ready([repo, web], served));
+        web.Items[0].State = ItemState.Done;
+        web.Items[0].Merged = true;
+        Assert.True(Supervisor.Ready([repo, web], served));
+        Supervisor.Ingest([repo, web], repo, goal, Plan("""{"status":"working","drop":["web:w2"]}"""), new Dictionary<int, IssueInfo>(), [], Now);
+        Assert.DoesNotContain(web.Items, i => i.Id == "w2");
+    }
+
+    [Fact]
+    public void AFolderNameTwoRepositoriesShareNamesNeitherEvenTheGoalsOwn()
+    {
+        var goal = G();
+        var repo = new RepoAgents { Path = @"C:\work\app", Authorized = true, NextLocal = 2 };
+        var fork = new RepoAgents { Path = @"C:\fork\app", Authorized = true, Items = [I("w1")], NextLocal = 2 };
+        repo.Items.Add(new WorkItem { Id = "w1", Title = "Mine", Goal = Supervisor.Key(repo, goal) });
+        Supervisor.Ingest([repo, fork], repo, goal, Plan("""
+            {"status":"working","drop":["app:w1"],"items":[{"key":"a","title":"There","repo":"app"},{"key":"b","title":"Here","after":["app:w1"]},{"key":"c","title":"Plain"}]}
+            """), new Dictionary<int, IssueInfo>(), [], Now);
+        Assert.Equal(["w1", "w2"], repo.Items.Select(i => i.Id)); // nothing dropped; only the step that names no folder lands
+        Assert.Equal("Plain", repo.Items[1].Title);
+        Assert.Equal(["w1"], fork.Items.Select(i => i.Id));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"There\": app is not a repository agents are authorized for"));
+    }
+
+    [Fact]
     public void IngestAdoptsOnlyIssuesAgentsMayTake()
     {
         var i7 = I("7");

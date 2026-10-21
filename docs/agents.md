@@ -30,6 +30,18 @@ clautoswap holds a change for you instead of pushing it when two review passes s
 
 pausing or stopping also holds any push that was about to happen. closing an issue on GitHub ends its work unless a pull request is already open.
 
+## goals
+
+for an objective bigger than one change, set a goal in the terminal: *"goal: the app has a settings page; `npm test` must pass"*. a read-only director session reads the whole project (it changes nothing) and plans the next few steps, each one a pull request like any other; steps wait for the ones they build on to be merged. it plans again as steps land, and asks you when only you can decide. ask how goals stand, answer a goal's question, ask for a new plan, drop a goal, or say it's done, all in the terminal.
+
+a goal counts as achieved only on evidence: once its steps are done, clautoswap runs the checks you gave it (you confirm the exact commands in a clautoswap dialog) and the verification command in a fresh checkout of the base branch. a claim without a check or merged work is put to you instead. three plans in a row that change nothing, or three failed plans, park the goal for you.
+
+a goal can plan steps in your other repositories that agents work on (by folder name), and a step in one can wait for a step in another. those steps run under that repository's own rules: only while its agents terminal is open, with its verification command and its pull request limit. the director only plans new steps there; issues there are taken up by that repository's own agents.
+
+## memory
+
+agents share short notes: what you told them (answers, or *"remember: we never touch the v1 API"*), and what runs learned (merged and closed pull requests, facts a run or the director wrote down). your notes bind every agent; theirs are hints. notes are per repository, or for every repository when you say so. ask the terminal to list or forget them.
+
 ## what agents never do
 
 - merge, close issues, deploy, publish, spend money, change settings or secrets, or make product decisions for you.
