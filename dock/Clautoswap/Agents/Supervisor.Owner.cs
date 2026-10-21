@@ -140,7 +140,12 @@ public sealed partial class Supervisor
                 if (skip.Issue is { } si && !repo.Skipped.Contains(si)) repo.Skipped.Add(si);
                 await StopWorkerAsync(skip, "skipped");
                 await FinishAsync(repo, skip, "skipped by the owner");
-                if (GoalOf(skip.Goal) is { } sg) AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
+                if (GoalOf(skip.Goal) is { } sg)
+                {
+                    AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
+                    sg.Claim = null; // the claim may have counted on it
+                    if (_workers.ContainsKey(sg)) Fire(() => StopWorkerAsync(sg, "owner")); // its plan may recreate the step: discarded, and Replan stays set
+                }
                 if (skip.Pr == null) repo.Items.Remove(skip);
                 HoldDependents(_state.Repos, repo, skip);
                 Save();
@@ -195,18 +200,30 @@ public sealed partial class Supervisor
 
     /// What was planned on a skipped item leaves the goal: removed, it counts as landed and they would start on its absence;
     /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them.
-    internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip)
+    internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip, string why = "which you skipped")
     {
-        for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
-            foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
-                if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
+        for (var q = new Queue<(RepoAgents, WorkItem)>([(repo, skip)]); q.TryDequeue(out var next);)
+        {
+            var (sr, s) = next;
+            var sk = Key(sr, s);
+            foreach (var r in repos)
+                foreach (var d in r.Items.Where(d => d.Goal != null && d.After.Contains(sk)).ToList())
                 {
-                    (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
-                    d.After.Remove(Key(repo, s)); // answered, it must not wait for what the owner skipped
-                    if (repos.SelectMany(r => r.Goals.Where(g => Key(r, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
+                    var dg = repos.SelectMany(x => x.Goals.Where(g => Key(x, g) == d.Goal)).FirstOrDefault(); // before Unplan clears d.Goal
+                    if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
+                    {
+                        (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, {why}; answer to run it anyway");
+                        d.After.Remove(sk); // answered, it must not wait for what the owner skipped
+                        if (dg != null) dg.Replan = true;
+                    }
+                    else if (Held(d)) d.After.Remove(sk); // already the owner's question: skipping another step does not answer it
+                    else if (Unplan(r, d.Goal!, [d]) > 0)
+                    {
+                        if (dg != null) dg.Claim = null; // it left without landing: the claim may have counted on it
+                        q.Enqueue((r, d));
+                    }
                 }
-                else if (Held(d)) d.After.Remove(Key(repo, s)); // already the owner's question: skipping another step does not answer it
-                else if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
+        }
     }
 
     /// An adopted issue held because a step it was planned after was skipped: a question for the owner, no problem.

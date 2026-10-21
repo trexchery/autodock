@@ -1110,18 +1110,89 @@ public class AgentGoalTests
     }
 
     [Fact]
-    public void AfterNamesOnlyEarlierStepsAndListedItems()
+    public void AfterNamesStepsInAnyOrderAndListedItems()
     {
         var (i12, w1) = (I("12"), I("w1", ItemState.Open, pr: 9));
         var repo = Repo(i12, w1);
         repo.NextLocal = 2;
-        Ingest(repo, G(), """
-            {"status":"working","items":[{"key":"a","title":"One","after":["b"]},{"key":"b","title":"Two","after":["w1","#12","12"]},{"key":"c","title":"Three","after":["nope"]}]}
+        var goal = G();
+        Ingest(repo, goal, """
+            {"status":"working","items":[{"key":"a","title":"One","after":["b"]},{"key":"b","title":"Two","after":["w1","#12","12"]},
+              {"key":"c","title":"Three","after":["nope"]},{"key":"d","title":"Four","after":["e"]},{"key":"e","title":"Five","after":["d"]}]}
             """);
         string K(string id) => Supervisor.Key(repo, repo.Items.Single(i => i.Id == id));
-        Assert.Equal([K("w1"), K("12")], repo.Items.Single(i => i.Id == "w2").After);
-        Assert.Equal(new[] { "12", "w1", "w2" }, repo.Items.Select(i => i.Id).Order()); // a later step or an unknown item is no predecessor: its dependent is not started without it
+        var (two, one) = (repo.Items.Single(i => i.Title == "Two"), repo.Items.Single(i => i.Title == "One"));
+        Assert.Equal([K("w1"), K("12")], two.After);
+        Assert.Equal((Supervisor.Key(repo, two), 10100), (Assert.Single(one.After), one.Rank)); // listed first, it still waits for the later step it names
+        Assert.Equal(new[] { "12", "w1", "w2", "w3" }, repo.Items.Select(i => i.Id).Order()); // an unknown item or a cycle: never started without it
+        Assert.Contains(goal.Log, l => l.Contains("skipped \"Three\": it builds on nope"));
         Assert.Empty(i12.After); // only the plan's new steps wait
+    }
+
+    [Fact]
+    public void HoldingCascadesPastOneLevelAndAcrossRepositories()
+    {
+        var (w1, w2, w3, other) = (I("w1"), I("w2"), I("w3"), I("w4"));
+        var (repo, elsewhere) = (Repo(w2, w3), Repo(other));
+        elsewhere.Path = @"C:\s";
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (w2.Goal, w3.Goal, other.Goal) = (key, key, key);
+        (w2.After, w3.After, other.After) = ([Supervisor.Key(repo, w1)], [Supervisor.Key(repo, w2)], [Supervisor.Key(repo, w1)]);
+        goal.Claim = "done";
+        Supervisor.HoldDependents([repo, elsewhere], repo, w1);
+        Assert.Empty(repo.Items); // w3 builds on w2, which left
+        Assert.Empty(elsewhere.Items); // a step of another repository, planned on the skipped one
+        Assert.Null(goal.Claim);
+    }
+
+    [Fact]
+    public void AnIssueLeavingItsGoalIsScannedBeforeItStarts()
+    {
+        var adopted = I("7");
+        var repo = Repo(adopted);
+        var key = Supervisor.Key(repo, G());
+        (adopted.Goal, adopted.OwnRank, repo.LastScan) = (key, 9999, DateTimeOffset.Now);
+        var left = new List<WorkItem>();
+        Assert.Equal(1, Supervisor.Unplan(repo, key, [adopted], left));
+        Assert.Equal([adopted], left);
+        Assert.Null(repo.LastScan);
+    }
+
+    [Fact]
+    public void DroppingAStepHoldsWhatWasPlannedAfterIt()
+    {
+        var (w1, w2, adopted) = (I("w1"), I("w2"), I("7"));
+        var repo = Repo(w1, w2, adopted);
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (w1.Goal, w2.Goal, adopted.Goal) = (key, key, key);
+        (w2.After, adopted.After) = ([Supervisor.Key(repo, w1)], [Supervisor.Key(repo, w1)]);
+        Ingest(repo, goal, """{"status":"working","drop":["w1"]}""");
+        Assert.DoesNotContain(w2, repo.Items); // not started on a base without it
+        Assert.Equal(ItemState.NeedsOwner, adopted.State);
+    }
+
+    [Fact]
+    public void FinishedWorkWhoseIssueIsStillOpenKeepsBlocking()
+    {
+        var done = I("7", ItemState.Done, pr: 3);
+        var repo = Repo(done);
+        List<IssueInfo> issues = [new(7, "Seven", "", [], [], [], "owner"), new(8, "Eight", "Blocked by #7", [], [], [], "owner")];
+        var wanted = Supervisor.Takeable(repo, issues, "owner", [], [], null, new HashSet<int> { 7 });
+        Assert.DoesNotContain(wanted, i => i.Number == 8);
+    }
+
+    [Fact]
+    public void StateWrittenBeforeMergedExistedReadsTheNoteForIt()
+    {
+        var (merged, closed) = (I("w1", ItemState.Done, pr: 7), I("w2", ItemState.Done, pr: 8));
+        (merged.Note, closed.Note) = ("pull request #7 merged", "pull request #8 closed without merging");
+        AgentStore.Upgrade(new AgentsState { Repos = [Repo(merged, closed)] });
+        Assert.True(merged.Merged);
+        Assert.False(closed.Merged);
     }
 
     [Fact]

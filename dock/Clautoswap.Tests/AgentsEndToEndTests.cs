@@ -816,9 +816,69 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Contains("closed without merging", await On(r => G(r).Note));
         Assert.Equal(ItemState.Queued, await On(r => W(r, "w2").State)); // it never started
 
-        // Skipping a step takes what was planned on it out of the goal, so it cannot start without it.
+        // Skipping a step takes what was planned on it out of the goal, so it cannot start without it, and a claim
+        // that counted on it.
+        await _loop.Run(() => G(_sup!.RepoFor(_repo)!).Claim = "done once w2 lands");
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w2"}"""));
         Assert.False(await On(r => r.Items.Any(i => i.Id == "w3"))); // a request planned on it is no longer in the goal
+        Assert.Null(await On(r => G(r).Claim));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task SkippingAStepStopsTheGoalsRunningPlanner()
+    {
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Chain", text = "[fake:hold] Plan slowly." });
+        await Until(r => G(r).Run is { Live: true, Pid: > 0 }, "the planner runs");
+        await _loop.Run(() =>
+        {
+            var r = _sup!.RepoFor(_repo)!;
+            r.Items.Add(new WorkItem { Id = "w1", Title = "Step", Goal = r.Key + "/g1", Rank = 10100 });
+            return 0;
+        });
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w1"}"""));
+        await Until(r => G(r).Run is not { Live: true }, "its stale plan is not waited for");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AGoalStepWhoseIssueClosedClearsTheGoalsClaim()
+    {
+        const string docs = """{"number":5,"title":"Write the docs page","body":"Docs.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
+        Issues($"[{docs}]");
+        Plan("""{"status":"working","summary":"docs","items":[{"key":"b","issue":5}]}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Docs" });
+        await Until(r => r.Items.Any(i => i.Issue == 5 && i.Goal != null), "the planned issue is in the goal");
+        await _loop.Run(() => G(_sup!.RepoFor(_repo)!).Claim = "done once #5 lands");
+        Issues("[]");
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
+        await Until(r => !r.Items.Any(i => i.Issue == 5), "the closed issue's item goes");
+        Assert.Equal((null, GoalState.Active), await On(r => (G(r).Claim, G(r).State))); // not Achieved on work that ended unmerged
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task PlannedIssueWorkTheOwnerHoldsLeavesTheGoalAndTheQueue()
+    {
+        const string docs = """{"number":5,"title":"Write the docs page","body":"Docs.","assignees":[],"author":{"login":"owner"},"labels":""";
+        Issues($"[{docs}[]}}]");
+        Plan("""{"status":"working","summary":"docs","items":[{"key":"a","title":"Held one","body":"[fake:hold] one"},{"key":"b","issue":5},{"key":"c","title":"Link the docs","body":"Link them.","after":["b"]}]}""");
+        await StartAsync(GoalConfig());
+        await Tool("agents_control", """{"action":"start"}""");
+        await Goal(new { action = "set", title = "Docs" });
+        await Until(r => W(r, "w1").State == ItemState.Working && Item(r, 5).Goal != null && W(r, "w2").After.Count == 1, "the first step works while the planned issue waits");
+
+        // The owner puts #5 on hold before it starts: the next scan judges it as it judges any work it found.
+        Issues($$"""[{{docs}}[{"name":"on hold"}]}]""");
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
+        await Until(r => !r.Items.Any(i => i.Issue == 5), "the held issue leaves the queue");
+        Assert.False(await On(r => r.Items.Any(i => i.Id == "w2"))); // planned on it, so it goes too, not started without it
+        Assert.Equal(ItemState.Working, await On(r => W(r, "w1").State));
+        File.WriteAllText(_log + ".release", "");
         _sup!.Dispose();
     }
 
