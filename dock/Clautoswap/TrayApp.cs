@@ -359,7 +359,7 @@ public sealed partial class TrayApp : ApplicationContext
                 // A window still marked busy just after writing its error is about to go idle: told about only if it stays busy past the grace.
                 var told = $"{s.SessionId}@{s.Limit?.At.Ticks}";
                 if (s.AtLimit && s.Status != "waiting" && !_told.Contains(told)
-                    && DateTime.UtcNow - _busySince.GetValueOrDefault(told, _busySince[told] = DateTime.UtcNow) >= BusyGrace && _told.Add(told))
+                    && ResumeStopped.BusyPast(_busySince, told, DateTime.UtcNow, BusyGrace) && _told.Add(told))
                 {
                     left.Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} (#{s.Account})");
                     Program.Log($"nudge {s.SessionId} left {s.Status}");

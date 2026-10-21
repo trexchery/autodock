@@ -110,7 +110,7 @@ public static class ResumeStopped
                     var pid = pidEl.GetInt32();
                     var stamp = Str(r, "procStart");
                     if (!IsLiveClaude(pid, stamp)) continue;
-                    var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : DateTime.MinValue;
+                    var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue; // unstamped record: the process's own start
                     if (TranscriptOf(dir, id, cwd) is not { } t) continue;
                     var seen = File.GetLastWriteTimeUtc(t);
                     var tail = Tail(t).ToList();
@@ -482,7 +482,7 @@ public static class ResumeStopped
     }
 
     /// Exit code 0, unlike Process.Kill's: Windows Terminal closes a tab whose shell exits 0, and keeps one that died with -1 open as a dead tab.
-    /// The handle is the one whose start time was just checked, so a recycled pid is never hit.
+    /// The handle is opened right after the start-time check, so a recycled pid is all but impossible to hit.
     internal static void EndShell(Process proc)
     {
         if (!TerminateProcess(proc.SafeHandle.DangerousGetHandle(), 0)) throw new InvalidOperationException("TerminateProcess failed");
@@ -502,6 +502,13 @@ public static class ResumeStopped
             catch (ArgumentException) { } // already gone
             catch (InvalidOperationException) { }
         }
+    }
+
+    /// Whether `key` has been seen for at least `grace`: stamps it on first sight only.
+    internal static bool BusyPast(Dictionary<string, DateTime> since, string key, DateTime now, TimeSpan grace)
+    {
+        if (!since.TryGetValue(key, out var first)) since[key] = first = now;
+        return now - first >= grace;
     }
 
     internal static bool IsLiveClaude(int pid, string? procStart)

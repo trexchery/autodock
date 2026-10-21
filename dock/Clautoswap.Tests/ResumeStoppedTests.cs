@@ -288,6 +288,30 @@ public class ResumeStoppedTests
     }
 
     [Fact]
+    public void FreshlyReopenedClaudeWithoutAStampIsNotStopped()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "idle", [Typed, Limit], procStart: null);
+            File.SetLastWriteTimeUtc(Path.Combine(root, "projects", "C--w", "sid.jsonl"), DateTime.UtcNow.AddHours(-1));
+            Assert.Empty(ScanOf(root));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void BusyWindowIsToldAboutOnlyAfterTheGrace()
+    {
+        var since = new Dictionary<string, DateTime>();
+        var t0 = DateTime.UtcNow;
+        var grace = TimeSpan.FromSeconds(10);
+        Assert.False(ResumeStopped.BusyPast(since, "k", t0, grace));
+        Assert.False(ResumeStopped.BusyPast(since, "k", t0.AddSeconds(2), grace)); // later passes do not restart the clock
+        Assert.True(ResumeStopped.BusyPast(since, "k", t0.AddSeconds(12), grace));
+    }
+
+    [Fact]
     public async Task EndedShellExitsWithCodeZero()
     {
         using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c ping -n 30 127.0.0.1 >nul") { CreateNoWindow = true })!;
