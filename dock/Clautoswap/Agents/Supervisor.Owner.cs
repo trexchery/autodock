@@ -129,7 +129,7 @@ public sealed partial class Supervisor
                     repo.Skipped.Remove(numbers[k]);
                     var item = repo.Items.FirstOrDefault(i => i.Issue == numbers[k]) ?? await AddIssueAsync(repo, numbers[k]);
                     if (item == null) { missing.Add(numbers[k]); continue; }
-                    item.Rank = top + (numbers.Count - k) * 10;
+                    (item.Rank, item.OwnRank) = (top + (numbers.Count - k) * 10, null);
                 }
                 Save();
                 Pump();
@@ -142,11 +142,7 @@ public sealed partial class Supervisor
                 await FinishAsync(repo, skip, "skipped by the owner");
                 if (GoalOf(skip.Goal) is { } sg) AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
                 if (skip.Pr == null) repo.Items.Remove(skip);
-                // What was planned on it leaves the goal: removed, it counts as landed and they would start on its absence;
-                // kept with its pull request unmerged, they would wait for it forever.
-                for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
-                    foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
-                        if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
+                HoldDependents(_state.Repos, repo, skip);
                 Save();
                 Pump();
                 return $"{skip.Label} is skipped" + (skip.Pr is { } p ? $"; pull request #{p} is left as it is." : ".");
@@ -196,6 +192,27 @@ public sealed partial class Supervisor
         }
         return "Unknown action; use prioritize, skip, restore, add, answer or retry.";
     }
+
+    /// What was planned on a skipped item leaves the goal: removed, it counts as landed and they would start on its absence;
+    /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them.
+    internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip)
+    {
+        for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
+            foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
+                if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
+                {
+                    (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
+                    d.After.Remove(Key(repo, s)); // answered, it must not wait for what the owner skipped
+                    if (repos.SelectMany(r => r.Goals.Where(g => Key(r, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
+                }
+                else if (Held(d)) d.After.Remove(Key(repo, s)); // already the owner's question: skipping another step does not answer it
+                else if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
+    }
+
+    /// An adopted issue held because a step it was planned after was skipped: a question for the owner, no problem.
+    const string SkipHold = "it was planned after ";
+
+    static bool Held(WorkItem i) => i is { State: ItemState.NeedsOwner, Worktree: null, Pr: null } && i.Note?.StartsWith(SkipHold) == true;
 
     const string NoItem = "No such item; name it as #12 (issue) or w3 (request).";
 

@@ -30,7 +30,8 @@ public sealed class AgentsConfig
     public TimeSpan IdleReplan { get; set; } = TimeSpan.FromHours(1);
 }
 
-public sealed class AgentsException(string message) : Exception(message);
+/// `Transient`: nothing is wrong with the work itself (a fetch that failed, as when offline), so it is no failure to count.
+public sealed class AgentsException(string message, bool transient = false) : Exception(message) { public bool Transient => transient; }
 
 /// The deterministic part of clautoswap agents. Per authorized repository it works on one item at a
 /// time: a headless Claude Code run in the item's own git worktree and account profile, a fresh
@@ -94,7 +95,7 @@ public sealed partial class Supervisor : IDisposable
 
     /// Parked after retries ran out or a check, push or pull request failed; not a hold, a question or a no-op.
     internal static bool Problem(WorkItem i) =>
-        i is { State: ItemState.NeedsOwner, HoldFor: null, AskedAt: null } && i.Note?.StartsWith(NoChange) != true;
+        i is { State: ItemState.NeedsOwner, HoldFor: null, AskedAt: null } && i.Note?.StartsWith(NoChange) != true && !Held(i);
 
     /// Anything the tray shows may have changed.
     public event Action? Changed;
