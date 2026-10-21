@@ -63,6 +63,7 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.SetAuto(_settings.AutoSwitch);
         _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
         _dash.Moved += SavePinnedPosition;
+        _dash.GeneralRequested += OpenGeneral;
         _dash.AgentsRequested += (anchor, menu) => { if (menu) ShowAgentsMenu(anchor); else LaunchAgents(); };
 
         HardenStores();
@@ -608,6 +609,16 @@ public sealed partial class TrayApp : ApplicationContext
             // and auto-switch never touch it. When N is the active login, the engine runs plain `claude`
             // instead (no second copy of the refresh token), which follows later switches.
             _engine.LaunchConsole($"Claude · {a.ShortName}", folder, Launch.Run(a.Number, _settings.PreserveRemoteControl));
+        }
+        catch (Exception e) { Error("Could not open terminal", e); }
+    }
+
+    void OpenGeneral()
+    {
+        try
+        {
+            Directory.CreateDirectory(Launch.GeneralFolder);
+            _engine.LaunchConsole("Claude · general", Launch.GeneralFolder, Launch.Run(Launch.GeneralAccount(_snap?.Accounts ?? []), _settings.PreserveRemoteControl));
         }
         catch (Exception e) { Error("Could not open terminal", e); }
     }
