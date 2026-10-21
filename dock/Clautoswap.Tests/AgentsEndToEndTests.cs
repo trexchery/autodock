@@ -40,9 +40,11 @@ public sealed class AgentsEndToEndTests : IDisposable
         Environment.SetEnvironmentVariable("FAKE_LOG", _log);
         Environment.SetEnvironmentVariable("FAKE_GH", _gh);
         Environment.SetEnvironmentVariable("CLAUTOSWAP_DATA", P("data")); // logs stay out of the real profile
+        AgentProcess.BelowNormal = false;
         _repo = NewRepo("repo");
         var fakes = Path.Combine(AppContext.BaseDirectory, "fakes");
-        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd"));
+        // Well inside Until's 90 s: a hung fake gh is killed and logged, and Until's failure prints clautoswap.log.
+        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd")) { GhTimeout = TimeSpan.FromSeconds(30) };
         _engine = new Engine(Path.Combine(fakes, "cswap.cmd"));
         _store = new AgentStore(P("agents"));
     }
@@ -77,7 +79,7 @@ public sealed class AgentsEndToEndTests : IDisposable
 
     static AgentsConfig Fast() => new()
     {
-        Stall = TimeSpan.FromSeconds(4),
+        Stall = TimeSpan.FromHours(1), // a run slowed by a busy machine is not stalled; the stall test sets its own
         ScanEvery = TimeSpan.FromHours(1),
         PrEvery = TimeSpan.FromSeconds(1),
         StopGrace = TimeSpan.FromSeconds(5),
@@ -125,7 +127,13 @@ public sealed class AgentsEndToEndTests : IDisposable
         }
     }
 
-    static string Read(string path) => File.Exists(path) ? File.ReadAllText(path) : "";
+    /// Shared with the fakes, which may be appending to a log right now.
+    static string Read(string path)
+    {
+        if (!File.Exists(path)) return "";
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return new StreamReader(f).ReadToEnd();
+    }
 
     string[] Runs => Read(_log).Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Where(l => l.StartsWith("run ")).ToArray();
 
@@ -179,7 +187,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.Equal(7, item.Pr);
         Assert.Equal("clautoswap/1-add-greeting", item.Branch);
         Assert.Contains("clautoswap/1-add-greeting", Git(_repo, "ls-remote", "origin"));
-        var body = File.ReadAllText(Path.Combine(_gh, "pr-body-7.md"));
+        var body = Read(Path.Combine(_gh, "pr-body-7.md"));
         Assert.Contains("For #1.", body);
         Assert.DoesNotContain("Closes", body);
         // Without memory the review prompt is as it was: no blank line before the verdict instructions.
@@ -193,7 +201,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.All(Runs, r => Assert.StartsWith("run 2 --require-session -- -p", r));
         Assert.DoesNotContain("Edit", Runs[0]);
         Assert.Contains("Edit Write NotebookEdit", Runs[1]);
-        Assert.All(File.ReadAllLines(_log + ".env"), l => Assert.Equal("clautoswap-agent-has-no-github-access|file|", l));
+        Assert.All(Read(_log + ".env").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), l => Assert.Equal("clautoswap-agent-has-no-github-access|file|", l));
         Assert.Contains(_notes, n => n.StartsWith("Pull request ready"));
 
         var status = await Tool("agents_status", "{}");
@@ -227,15 +235,12 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Tool("agents_control", """{"action":"start"}""");
 
         var peak = 0;
-        var until = DateTime.UtcNow.AddSeconds(90);
-        while (!await On(r => r.Items.Count(i => i.State == ItemState.Open) == 3))
+        await Until(r =>
         {
-            peak = Math.Max(peak, await On(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)));
-            Assert.True(peak <= 2, "never more runs than usable accounts");
-            Assert.True(DateTime.UtcNow < until, "all three reach a pull request");
-            await Task.Delay(100);
-        }
-        Assert.Equal(2, peak);
+            peak = Math.Max(peak, r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking));
+            return r.Items.Count(i => i.State == ItemState.Open) == 3;
+        }, "all three reach a pull request", 180); // the longest pipeline here: two chains of runs, reviews and pull requests
+        Assert.Equal(2, peak); // never more runs than usable accounts, and both at once
         var work = Runs.Where(r => !r.Contains("Edit Write")).ToArray(); // work runs, not reviews
         Assert.Contains(work, r => r.StartsWith("run 2 "));
         Assert.Contains(work, r => r.StartsWith("run 3 "));
@@ -275,8 +280,8 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         await Until(r => Item(r, 10).State == ItemState.NeedsOwner, "issue 10 asks the owner");
         Assert.Equal("Should the greeting be formal?", await On(r => Item(r, 10).Note));
-        await AgentProcessTests.WaitUntil(() => File.Exists(Path.Combine(_gh, "question-10.md"))); // asked on the issue
-        Assert.Contains("Should the greeting be formal?", File.ReadAllText(Path.Combine(_gh, "question-10.md")));
+        // Asked on the issue; the fake may still be writing it.
+        await AgentProcessTests.WaitUntil(() => Read(Path.Combine(_gh, "question-10.md")).Contains("Should the greeting be formal?"));
         await Until(r => Item(r, 11).State == ItemState.Open, "work moves on to issue 11");
         await Until(r => Item(r, 12).State == ItemState.Open, "and to issue 12");
         Assert.Contains("Needs you: #10 Greeting tone: Should the greeting be formal?", await Tool("agents_status", "{}"));
@@ -286,7 +291,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         File.WriteAllText(Path.Combine(_gh, "comments-10.json"), $$"""{"comments":[{"author":{"login":"owner"},"body":"Formal, please.","createdAt":"{{DateTimeOffset.UtcNow.AddMinutes(1):O}}"}]}""");
         await _loop.Run(() => { config.ScanEvery = TimeSpan.FromSeconds(1); _sup!.UpdateAccounts(Accounts, []); return 0; });
         await Until(r => Item(r, 10).State == ItemState.Open, "the answered issue reaches a pull request without a merge");
-        Assert.Contains("owner: Formal, please.", File.ReadAllText(_log + ".prompts"));
+        Assert.Contains("owner: Formal, please.", Read(_log + ".prompts"));
         Assert.Contains(Runs, r => r.Contains("--resume")); // in its own conversation
         await Until(r => Item(r, 13).State == ItemState.Open, "the next issue also reaches a pull request");
         Assert.DoesNotContain("Holding new work", await Tool("agents_status", "{}"));
@@ -338,7 +343,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.StartsWith("run 3 ", Runs[1]);
         Assert.Contains("--session-id", Runs[1]); // a new conversation...
         Assert.Contains("handoff --from claude --dir", Read(_log)); // ...that starts from the engine's hand-off notes
-        Assert.Contains("hand-off notes", File.ReadAllText(_log + ".prompts"));
+        Assert.Contains("hand-off notes", Read(_log + ".prompts"));
         Assert.Equal(0, await On(r => Item(r, 20).Failures)); // a limit is not the work's fault
         _sup!.Dispose();
     }
@@ -350,7 +355,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await StartAsync();
         await Tool("agents_control", """{"action":"start","verify":"if exist broken.txt (exit 1) else (exit 0)"}""");
         await Until(r => Item(r, 30).State == ItemState.Open, "the item passes verification and review");
-        var prompts = File.ReadAllText(_log + ".prompts");
+        var prompts = Read(_log + ".prompts");
         Assert.Contains("and it failed", prompts);
         Assert.Contains("A fresh review of your change found these problems", prompts);
         Assert.Contains("the greeting has no test", prompts);
@@ -366,9 +371,14 @@ public sealed class AgentsEndToEndTests : IDisposable
     public async Task AStalledRunIsResumedAndARestartReattachesInsteadOfStartingAgain()
     {
         Issues("""[{"number":40,"title":"Stuck","body":"[fake:stall]","labels":[],"assignees":[],"author":{"login":"owner"}},{"number":41,"title":"Slow","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
-        await StartAsync();
+        var config = Fast();
+        config.Stall = TimeSpan.FromSeconds(10);
+        await StartAsync(config);
         await Tool("agents_control", """{"action":"start"}""");
-        await Until(r => Item(r, 40).State == ItemState.Open, "the stalled run is stopped and resumed", 120);
+        await Until(r => Item(r, 40).Failures == 1, "the stalled run is stopped");
+        // Only that run may stall: a busy machine must not make the resumption or the review look stalled too.
+        await _loop.Run(() => { config.Stall = TimeSpan.FromHours(1); return 0; });
+        await Until(r => Item(r, 40).State == ItemState.Open, "the stalled run is resumed");
         // The stalled work run, its resumption in the same conversation, then the review.
         Assert.Equal(3, Runs.Length);
         Assert.Contains("--resume", Runs[1]);
@@ -400,9 +410,9 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 50).Followups == 1, "the feedback is picked up");
         File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[],"comments":[],"reviews":[]}""");
         await Until(r => Item(r, 50).State == ItemState.Open && Item(r, 50).Followup == null, "the follow-up is pushed");
-        var prompts = File.ReadAllText(_log + ".prompts");
+        var prompts = Read(_log + ".prompts");
         Assert.Contains("These checks failed: test.", prompts);
-        Assert.Contains("FAIL greeting.test: expected hello", prompts);
+        Assert.True(prompts.Contains("FAIL greeting.test: expected hello"), $"no failed-check log in the follow-up; clautoswap.log:\n{Read(Path.Combine(P("data"), "clautoswap.log"))}");
         Assert.Contains("owner: Please also update the README.", prompts);
         var gh = Read(Path.Combine(_gh, "gh.log"));
         Assert.Contains("run view 123 --log-failed", gh);
@@ -498,10 +508,10 @@ public sealed class AgentsEndToEndTests : IDisposable
             """);
         await StartAsync();
         await Tool("agents_control", """{"action":"start"}""");
-        await Until(r => Item(r, 70).Run is { Pid: > 0 }, "the first run starts");
+        await Until(r => Item(r, 70).Run is { Pid: > 0 } && Runs.Length == 1, "the first run starts");
         var first = await On(r => Item(r, 70).Run!.Pid);
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#70"}"""));
-        await Until(r => r.Items.All(i => i.Issue != 70) && Item(r, 71).Run is { Pid: > 0 }, "work moves on to the next issue");
+        await Until(r => r.Items.All(i => i.Issue != 70) && Item(r, 71).Run is { Pid: > 0 } && Runs.Length == 2, "work moves on to the next issue");
         Assert.Throws<ArgumentException>(() => Process.GetProcessById(first));
 
         var second = await On(r => Item(r, 71).Run!.Pid);
@@ -510,7 +520,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => r.Items.Count == 0, "the closed issue's work ends");
         Assert.Throws<ArgumentException>(() => Process.GetProcessById(second));
         await Task.Delay(1500);
-        Assert.InRange(Runs.Length, 1, 2); // at most one each (a run killed early may not have logged), and neither came back
+        Assert.Equal(2, Runs.Length); // one each, and neither came back
         Assert.Empty(Git(_repo, "branch", "--list", "clautoswap/*"));
         Assert.DoesNotContain("pr create", Read(Path.Combine(_gh, "gh.log")));
         _sup!.Dispose();
@@ -886,6 +896,15 @@ public sealed class AgentsEndToEndTests : IDisposable
         _sup!.Dispose();
     }
 
+    [Fact]
+    public async Task AHungGhCallIsKilledAndLoggedAtItsTimeout()
+    {
+        var hung = new Cli(_cli.Git, Engine.FindOnPath("powershell.exe")!) { GhTimeout = TimeSpan.FromSeconds(1) };
+        var r = await hung.GhAsync(_repo, "-NoProfile", "-Command", "Start-Sleep 60");
+        Assert.Equal(124, r.Code);
+        Assert.Contains("timed out after 1 s", Read(Path.Combine(P("data"), "clautoswap.log")));
+    }
+
     public void Dispose()
     {
         if (_sup != null) _loop.Run(() => { _sup.Dispose(); return 0; }).Wait(TimeSpan.FromSeconds(5));
@@ -895,6 +914,7 @@ public sealed class AgentsEndToEndTests : IDisposable
             using (var p = AgentProcess.Attach(run.Job, run.Pid, run.Created))
                 p?.StopAsync(TimeSpan.Zero).Wait(TimeSpan.FromSeconds(10));
         Environment.SetEnvironmentVariable("CLAUTOSWAP_DATA", _dataWas);
+        AgentProcess.BelowNormal = true;
         for (var i = 0; i < 5; i++)
         {
             try { Directory.Delete(_tmp.Path, recursive: true); break; }

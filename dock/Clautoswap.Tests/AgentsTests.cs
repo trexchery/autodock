@@ -509,6 +509,11 @@ public class AgentProcessTests
         await p.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(20));
         Assert.Equal(7, p.ExitCode);
         Assert.True(p.CpuTime >= TimeSpan.Zero);
+        // Our handle on the exited root does not keep it listed: reaping an emptied job returns at once.
+        var reap = Stopwatch.StartNew();
+        await p.ReapAsync();
+        Assert.True(reap.Elapsed < TimeSpan.FromSeconds(2), $"reap took {reap.Elapsed}");
+        Assert.Empty(p.ProcessIds());
     }
 
     /// A file a live process is still writing (a plain File.ReadAllText would be refused).

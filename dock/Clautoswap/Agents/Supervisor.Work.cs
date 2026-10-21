@@ -212,7 +212,7 @@ public sealed partial class Supervisor
             await proc.StopAsync(TimeSpan.Zero);
             return $"(timed out after {Config.VerifyTimeout.TotalMinutes:0} minutes)\n" + TailOf(log, 3000);
         }
-        proc.Reap();
+        await proc.ReapAsync();
         return proc.ExitCode == 0 ? null : TailOf(log, 3000);
     }
 
@@ -325,8 +325,11 @@ public sealed partial class Supervisor
             if (pr.FailedChecks.Count > 0)
             {
                 var logs = "";
-                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is { Ok: true } l)
-                    logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is var l)
+                {
+                    if (l.Ok) logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                    else Program.Log($"gh run view {run} --log-failed: exit {l.Code}: {l.Why}"); // the follow-up goes without the log
+                }
                 asks.Add($"These checks failed: {string.Join(", ", pr.FailedChecks)}.{logs}");
             }
             if (pr.Conflicting) asks.Add($"The pull request conflicts with {repo.Base}. clautoswap fetched it: merge origin/{repo.Base} into this branch and resolve the conflicts.");
@@ -491,15 +494,16 @@ public sealed partial class Supervisor
         _baseline.Add(repo);
         var probe = new WorkItem { Id = "baseline", Title = "baseline" };
         var wt = _store.Worktree(repo, probe);
+        var again = false; // its terminal closed: on the next open, once this one has cleaned up after itself
         try
         {
             var start = await StartPointAsync(repo);
             await GitAsync(repo.Path, "worktree", "prune");
             var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
             if (!add.Ok) { repo.Note = "could not check the verification command: " + add.Why; return; }
-            if (!Active(repo)) { _rebaseline.Add(repo); return; } // closed meanwhile
+            if (!Active(repo)) { again = true; return; } // closed meanwhile
             var result = await VerifyAsync(repo, probe, wt, verify);
-            if (_interrupted.Remove(probe)) _rebaseline.Add(repo); // its terminal closed: on the next open
+            if (_interrupted.Remove(probe)) again = true;
             else if (result is { } failure)
             {
                 repo.Paused = true;
@@ -512,6 +516,7 @@ public sealed partial class Supervisor
             await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
             try { Directory.Delete(_store.RunDir(repo, probe), recursive: true); } catch (IOException) { }
             _baseline.Remove(repo);
+            if (again) _rebaseline.Add(repo);
             Save();
             Pump();
         }

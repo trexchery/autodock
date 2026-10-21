@@ -247,6 +247,7 @@ public sealed partial class Supervisor : IDisposable
         void Min(TimeSpan t) { if (next is not { } n || t < n) next = t < TimeSpan.Zero ? TimeSpan.Zero : t; }
         if (retry) Min(TimeSpan.FromSeconds(30));
         if (_workers.Count > 0) Min(TimeSpan.FromSeconds(Math.Clamp(Config.Stall.TotalSeconds / 4, 1, 60)));
+        if (_workers.Count > 0 && DateTimeOffset.Now - _lastLaunch < Config.Ramp) Min(_lastLaunch + Config.Ramp - DateTimeOffset.Now); // the gap between starts ends
         if ((_workers.Count > 0 || _verifying.Count > 0) && DateTimeOffset.Now - _started < Config.Relink) Min(_started + Config.Relink - DateTimeOffset.Now);
         foreach (var repo in _state.Repos.Where(Active))
         {
@@ -560,9 +561,10 @@ public sealed partial class Supervisor : IDisposable
         var reason = w?.StopReason;
         if (w != null)
         {
+            await w.Proc.ReapAsync(); // still listed meanwhile: its account stays busy until the run is judged
             _workers.Remove(item);
-            w.Proc.Reap();
             w.Proc.Dispose();
+            if (_disposed) return;
         }
         if (item.Run is not { } run) return;
         run.Live = false;
