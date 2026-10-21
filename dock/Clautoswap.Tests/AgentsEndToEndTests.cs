@@ -1113,11 +1113,9 @@ public sealed class AgentsEndToEndTests : IDisposable
 
     async Task RescanAsync()
     {
-        int Lists() => Read(Path.Combine(_gh, "gh.log")).Split('\n').Count(l => l.StartsWith("pr list --state open --limit 100 --json number,closing"));
-        var before = Lists();
         await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
-        await Until(_ => Lists() > before, "the scan ran");
-        await Until(_ => !_sup!.Pumping, "the scan judged the queue"); // the read starts inside the pass that then judges
+        // The scan stamps LastScan as it starts, inside the pass that then judges (a planner reads the same pull request list).
+        await Until(r => r.LastScan != null && !_sup!.Pumping, "the scan judged the queue");
     }
 
     [Fact]

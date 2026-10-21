@@ -1428,7 +1428,7 @@ public class AgentGoalTests
         Assert.Empty(off.Items);
         Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Off\": off is not a repository agents are authorized for"));
         Assert.Contains(goal.Log, l => l.EndsWith("skipped #3 in web: its agents take up that repository's issues themselves"));
-        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Old\": it builds on off:w1, which is not a step or item that exists"));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Old\": it builds on off:w1, which is neither an item nor a step that can go first"));
 
         // Its own steps elsewhere count toward it and wait for what they build on there; dropping one there works too.
         Assert.False(Supervisor.Ready([repo, web], served));

@@ -347,7 +347,7 @@ public sealed partial class Supervisor
             }
             if (pr.Conflicting) asks.Add($"The pull request conflicts with {repo.Base}. clautoswap fetched it: merge origin/{repo.Base} into this branch and resolve the conflicts.");
             // Newest first: GitHub lists the oldest page first. shortcut: the newest 100 per poll, paginate if a review ever leaves more between polls.
-            var inline = await _cli.GhAsync(repo.Path, "api", $"repos/{{owner}}/{{repo}}/pulls/{item.Pr}/comments?sort=created&direction=desc&per_page=100");
+            var inline = await _cli.GhAsync(repo.Path, "api", "-X", "GET", $"repos/{{owner}}/{{repo}}/pulls/{item.Pr}/comments", "-f", "sort=created", "-f", "direction=desc", "-f", "per_page=100");
             if (!inline.Ok) continue; // PrSeen must not pass comments nobody read: the next poll tries again
             var feedback = pr.Feedback.Concat(PullRequestState.InlineComments(inline.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me).Reverse()).ToList();
             if (feedback.Count > 0) asks.Add("Review feedback to address:\n" + Engine.Redact(string.Join("\n\n", feedback)));
