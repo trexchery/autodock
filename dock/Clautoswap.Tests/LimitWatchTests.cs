@@ -374,6 +374,60 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public void APinnedAccountIsFreedOnlyWhenTheDefaultLoginHasNowhereElse()
+    {
+        var none = new Dictionary<int, DateTimeOffset>();
+        var pinned1 = new HashSet<int> { 1 };
+        // Oct 20: the default login on #3 at 100%, #2 full, #1 with room but held by a `cswap run 1` window.
+        Assert.Equal(1, ResumeStopped.FreeTarget([A(1, 40), A(2, 100), A(3, 100, active: true)], pinned1, none, Now, 97, 10));
+        Assert.Equal(1, ResumeStopped.FreeTarget([A(1, 40), A(2, 100), A(3, 97, active: true)], pinned1, none, Now, 97, 10)); // at the line, before the limit
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 40), A(2, 100), A(3, 90, active: true)], pinned1, none, Now, 97, 10)); // below the line: nothing due
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 40), A(2, 50), A(3, 100, active: true)], pinned1, none, Now, 97, 10)); // #2 is free: the engine's own switch
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 90), A(2, 100), A(3, 100, active: true)], pinned1, none, Now, 97, 10)); // within the hysteresis: it would trade back
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 40), A(2, 100), A(3, 100, active: true)], new HashSet<int>(), none, Now, 97, 10)); // nothing pinned: the engine's
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 40, disabled: true), A(2, 100), A(3, 100, active: true)], pinned1, none, Now, 97, 10));
+        Assert.Null(ResumeStopped.FreeTarget([A(1, 40), A(3, 100, active: true)], pinned1, new Dictionary<int, DateTimeOffset> { [1] = Now.AddHours(1) }, Now, 97, 10)); // #1 refused
+        // A refusal of the default login counts, whatever a stale reading says; the most room wins among pinned ones.
+        Assert.Equal(4, ResumeStopped.FreeTarget([A(1, 40), A(3, 20, active: true), A(4, 5)], new HashSet<int> { 1, 4 },
+            new Dictionary<int, DateTimeOffset> { [3] = Now.AddHours(1) }, Now, 97, 10));
+    }
+
+    static StoppedSession Window(string status, string id = "s") => new(1, id, @"C:\w", @"C:\p", 1, @"C:\p\t.jsonl", AtLimit: false, Status: status);
+
+    [Fact]
+    public void AProfileIsReleasedOnlyWhenEveryWindowInItIsIdle()
+    {
+        Assert.True(ResumeStopped.Releasable([Window("idle"), Window("idle", "t")], records: 2, runs: 2));
+        Assert.True(ResumeStopped.Releasable([Window("idle")], records: 1, runs: 0)); // claude started without the wrapper
+        Assert.False(ResumeStopped.Releasable([Window("idle"), Window("busy", "t")], records: 2, runs: 2));
+        Assert.False(ResumeStopped.Releasable([Window("idle"), Window("shell", "t")], records: 2, runs: 2)); // background work would die
+        Assert.False(ResumeStopped.Releasable([Window("idle")], records: 2, runs: 2)); // one window the scan did not see as done: working, or mid-prompt
+        Assert.False(ResumeStopped.Releasable([Window("idle")], records: 1, runs: 2)); // a headless run (an agent) holds it too
+        Assert.False(ResumeStopped.Releasable([], records: 0, runs: 1));
+        Assert.False(ResumeStopped.Releasable([], records: 0, runs: 0)); // nothing to free
+    }
+
+    [Fact]
+    public void LiveCountsSeeRecordsAndWrappers()
+    {
+        var root = TempRoot();
+        try
+        {
+            var self = System.Diagnostics.Process.GetCurrentProcess();
+            Directory.CreateDirectory(Path.Combine(root, ".cswap-runs"));
+            File.WriteAllText(Path.Combine(root, ".cswap-runs", Environment.ProcessId.ToString()), "");
+            File.WriteAllText(Path.Combine(root, ".cswap-runs", "2147483000"), ""); // no such process
+            Assert.Equal((0, 1), ResumeStopped.LiveCounts(root));
+            Directory.CreateDirectory(Path.Combine(root, "sessions"));
+            File.WriteAllText(Path.Combine(root, "sessions", "1.json"),
+                $$"""{"pid":{{self.Id}},"sessionId":"sid","procStart":"{{self.StartTime.ToUniversalTime().ToFileTimeUtc()}}"}""");
+            File.WriteAllText(Path.Combine(root, "sessions", "2.json"), """{"pid":2147483000,"sessionId":"old","procStart":"1"}""");
+            Assert.Equal((1, 1), ResumeStopped.LiveCounts(root));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public void ACopyTheTrayMadeIsNotANewRefusalButTheNextErrorThereIs()
     {
         var root = TempRoot();
