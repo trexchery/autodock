@@ -322,8 +322,11 @@ public sealed partial class Supervisor
             if (pr.FailedChecks.Count > 0)
             {
                 var logs = "";
-                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is { Ok: true } l)
-                    logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is var l)
+                {
+                    if (l.Ok) logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                    else Program.Log($"gh run view {run} --log-failed: exit {l.Code}: {l.Why}"); // the follow-up goes without the log
+                }
                 asks.Add($"These checks failed: {string.Join(", ", pr.FailedChecks)}.{logs}");
             }
             if (pr.Conflicting) asks.Add($"The pull request conflicts with {repo.Base}. clautoswap fetched it: merge origin/{repo.Base} into this branch and resolve the conflicts.");

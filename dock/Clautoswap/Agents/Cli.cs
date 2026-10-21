@@ -55,6 +55,7 @@ public sealed class Cli(string git, string? gh)
         catch (OperationCanceledException)
         {
             try { p.Kill(entireProcessTree: true); } catch { }
+            Program.Log($"{Path.GetFileNameWithoutExtension(exe)} {string.Join(' ', args.Take(2))} timed out after {timeout.TotalSeconds:0} s");
             return new CliResult(124, "", $"{Path.GetFileNameWithoutExtension(exe)} timed out");
         }
         return new CliResult(p.ExitCode, await stdout, await stderr);

@@ -374,7 +374,10 @@ public sealed class AgentsEndToEndTests : IDisposable
         config.Stall = TimeSpan.FromSeconds(10);
         await StartAsync(config);
         await Tool("agents_control", """{"action":"start"}""");
-        await Until(r => Item(r, 40).State == ItemState.Open, "the stalled run is stopped and resumed", 120);
+        await Until(r => Item(r, 40).Failures == 1, "the stalled run is stopped");
+        // Only that run may stall: a busy machine must not make the resumption or the review look stalled too.
+        await _loop.Run(() => { config.Stall = TimeSpan.FromHours(1); return 0; });
+        await Until(r => Item(r, 40).State == ItemState.Open, "the stalled run is resumed");
         // The stalled work run, its resumption in the same conversation, then the review.
         Assert.Equal(3, Runs.Length);
         Assert.Contains("--resume", Runs[1]);
@@ -408,7 +411,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Until(r => Item(r, 50).State == ItemState.Open && Item(r, 50).Followup == null, "the follow-up is pushed");
         var prompts = Read(_log + ".prompts");
         Assert.Contains("These checks failed: test.", prompts);
-        Assert.Contains("FAIL greeting.test: expected hello", prompts);
+        Assert.True(prompts.Contains("FAIL greeting.test: expected hello"), $"no failed-check log in the follow-up; clautoswap.log:\n{Read(Path.Combine(P("data"), "clautoswap.log"))}");
         Assert.Contains("owner: Please also update the README.", prompts);
         var gh = Read(Path.Combine(_gh, "gh.log"));
         Assert.Contains("run view 123 --log-failed", gh);

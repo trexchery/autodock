@@ -560,9 +560,10 @@ public sealed partial class Supervisor : IDisposable
         var reason = w?.StopReason;
         if (w != null)
         {
+            await w.Proc.ReapAsync(); // still listed meanwhile: its account stays busy until the run is judged
             _workers.Remove(item);
-            await w.Proc.ReapAsync();
             w.Proc.Dispose();
+            if (_disposed) return;
         }
         if (item.Run is not { } run) return;
         run.Live = false;

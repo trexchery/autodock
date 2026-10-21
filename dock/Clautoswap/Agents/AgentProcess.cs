@@ -186,12 +186,17 @@ public sealed class AgentProcess : IDisposable
         if (JobOpen) TerminateJobObject(_job!, 1);
     }
 
-    /// Reap, then wait (up to five seconds) until nothing in the job runs: termination is asynchronous, and a
-    /// process still dying keeps its folder, its open files and git's index lock.
+    /// Reap, then wait until nothing in the job runs: termination is asynchronous, and a process still dying
+    /// keeps its folder, its open files and git's index lock. A busy machine can take seconds; a minute is a hang.
     public async Task ReapAsync()
     {
         Reap();
-        for (var i = 0; i < 50 && JobOpen && ProcessIds().Length > 0; i++) await Task.Delay(100);
+        var until = DateTime.UtcNow.AddMinutes(1);
+        while (JobOpen && ProcessIds().Length > 0)
+        {
+            if (DateTime.UtcNow >= until) { Program.Log($"job {Pid}: processes {string.Join(",", ProcessIds())} outlived termination"); return; }
+            await Task.Delay(100);
+        }
     }
 
     public void Dispose()
