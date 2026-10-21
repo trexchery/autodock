@@ -1,4 +1,4 @@
-"""Grok (xAI Grok Build CLI) provider for autodock: ``cswap grok <cmd> --json``.
+"""Grok (xAI Grok Build CLI) provider for handoff: ``cswap grok <cmd> --json``.
 
 Store (``<backup root>/providers/grok/``):
   accounts.json        roster, no secrets: number, email, userId, scope, alias
@@ -11,7 +11,7 @@ Store (``<backup root>/providers/grok/``):
 scope's record atomically while holding grok's own ``auth.json.lock``.
 Running grok sessions keep their in-memory token and adopt the file only on
 their next refresh or rejection (and may decline an older-minted token), so
-they keep their account until restarted. autodock never refreshes tokens:
+they keep their account until restarted. handoff never refreshes tokens:
 grok refresh tokens rotate and are single-use, so a refresh behind grok's
 back can revoke its live login. An expired dormant token is reported as
 ``token_expired``; grok renews it after a switch.

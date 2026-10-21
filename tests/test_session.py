@@ -2147,6 +2147,22 @@ class TestGuards:
         data = seeded_switcher._get_sequence_data()
         assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
 
+    def test_exclusive_switch_refuses_live_target(
+        self, seeded_switcher, monkeypatch
+    ):
+        """The tray's switch: nobody reads a warning, so a live profile of the
+        target refuses, and nothing moves."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="in use by a session profile"):
+            seeded_switcher.switch_to(ACCOUNT_NUM, json_output=True, exclusive=True)
+
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
     def test_switch_refuses_live_target_whose_profile_is_ahead(
         self, seeded_switcher, monkeypatch
     ):
@@ -3543,3 +3559,94 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+class TestFolderTrust:
+    def _trust_default(self, default_config: Path, folder: Path) -> None:
+        data = json.loads(default_config.read_text())
+        data.setdefault("projects", {})[folder.as_posix()] = {"hasTrustDialogAccepted": True}
+        default_config.write_text(json.dumps(data))
+
+    def test_trusted_folder_carries_into_profile(self, mcp_setup, tmp_path):
+        default_config, session_dir, mgr = mcp_setup
+        work = (tmp_path / "repo").resolve()
+        work.mkdir()
+        self._trust_default(default_config, work)
+        mgr._sync_folder_trust(session_dir, work)
+
+        config = _session_config(session_dir)
+        assert config["projects"][work.as_posix()] == {"hasTrustDialogAccepted": True}
+        assert config["projects"]["/w"] == {"allowedTools": []}
+        assert config["theme"] == "light"
+
+    def test_parent_trust_covers_subfolder(self, mcp_setup, tmp_path):
+        default_config, session_dir, mgr = mcp_setup
+        parent = tmp_path.resolve()
+        sub = parent / "a" / "b"
+        sub.mkdir(parents=True)
+        self._trust_default(default_config, parent)
+        mgr._sync_folder_trust(session_dir, sub)
+
+        assert _session_config(session_dir)["projects"][sub.as_posix()]["hasTrustDialogAccepted"] is True
+
+    def test_untrusted_folder_is_left_alone(self, mcp_setup, tmp_path):
+        _, session_dir, mgr = mcp_setup
+        before = (session_dir / ".claude.json").read_text()
+        mgr._sync_folder_trust(session_dir, tmp_path)
+
+        assert (session_dir / ".claude.json").read_text() == before
+
+    def test_already_trusted_profile_is_not_rewritten(self, mcp_setup, tmp_path):
+        default_config, session_dir, mgr = mcp_setup
+        work = tmp_path.resolve()
+        self._trust_default(default_config, work)
+        mgr._sync_folder_trust(session_dir, work)
+        stamp = (session_dir / ".claude.json").stat().st_mtime_ns
+        mgr._sync_folder_trust(session_dir, work)
+
+        assert (session_dir / ".claude.json").stat().st_mtime_ns == stamp
+
+    def test_run_launch_trusts_the_current_folder(self, mcp_setup, tmp_path, monkeypatch):
+        default_config, session_dir, mgr = mcp_setup
+        work = (tmp_path / "proj").resolve()
+        work.mkdir()
+        self._trust_default(default_config, work)
+        monkeypatch.chdir(work)
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_config(session_dir)["projects"][work.as_posix()]["hasTrustDialogAccepted"] is True
+
+    @pytest.mark.skipif(os.name != "nt", reason="junctions are Windows-only")
+    def test_junction_is_judged_by_the_path_claude_sees(self, mcp_setup, tmp_path):
+        """claude keys trust by its unresolved cwd: an untrusted junction into a
+        trusted tree gains nothing, and a trusted one is written under its own path."""
+        import _winapi
+
+        default_config, session_dir, mgr = mcp_setup
+        real = (tmp_path / "trusted" / "proj").resolve()
+        real.mkdir(parents=True)
+        (tmp_path / "untrusted").mkdir()
+        link = tmp_path.resolve() / "untrusted" / "link"
+        _winapi.CreateJunction(str(real), str(link))
+        self._trust_default(default_config, real.parent)
+        before = (session_dir / ".claude.json").read_text()
+        mgr._sync_folder_trust(session_dir, link)
+        assert (session_dir / ".claude.json").read_text() == before
+
+        self._trust_default(default_config, link)
+        mgr._sync_folder_trust(session_dir, link)
+        projects = _session_config(session_dir)["projects"]
+        assert projects[link.as_posix()] == {"hasTrustDialogAccepted": True}
+        assert real.as_posix() not in projects
+
+    def test_trust_from_another_account_profile(self, mcp_setup, tmp_path):
+        _, session_dir, mgr = mcp_setup
+        work = tmp_path.resolve()
+        sibling = session_dir.parent / "9-other_example.com"
+        sibling.mkdir()
+        (sibling / ".claude.json").write_text(
+            json.dumps({"projects": {work.as_posix(): {"hasTrustDialogAccepted": True}}})
+        )
+        mgr._sync_folder_trust(session_dir, work)
+
+        assert _session_config(session_dir)["projects"][work.as_posix()]["hasTrustDialogAccepted"] is True

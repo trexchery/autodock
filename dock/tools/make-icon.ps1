@@ -1,6 +1,6 @@
-# Regenerates dock/Autodock/dock.ico (multi-size, PNG-compressed entries).
+# Regenerates dock/Handoff/dock.ico (multi-size, PNG-compressed entries).
 Add-Type -AssemblyName System.Drawing
-$out = Join-Path $PSScriptRoot '..\Autodock\dock.ico'
+$out = Join-Path $PSScriptRoot '..\Handoff\dock.ico'
 $sizes = 16, 24, 32, 48, 64, 256
 $pngs = foreach ($s in $sizes) {
     $bmp = New-Object System.Drawing.Bitmap $s, $s

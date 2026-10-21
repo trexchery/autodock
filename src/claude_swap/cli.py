@@ -180,7 +180,7 @@ Examples:
         action="store_true",
         help=(
             "Add --remote-control when this profile's most recent session "
-            "used Remote Control; used by autodock"
+            "used Remote Control; used by handoff"
         ),
     )
     parser.add_argument(
@@ -1230,6 +1230,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--exclusive",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': refuse while a 'cswap run' session of "
+            "that account is live, instead of warning"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1519,7 +1527,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                exclusive=args.exclusive,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)
@@ -1580,7 +1591,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    # Never in the frozen autodock bundle: it only talks to Anthropic, and
+    # Never in the frozen handoff bundle: it only talks to Anthropic, and
     # an upstream PyPI release cannot upgrade a bundled engine anyway.
     if not args.purge and not args.upgrade and not args.json and not getattr(sys, "frozen", False):
         from claude_swap.update_check import check_for_update

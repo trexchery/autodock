@@ -2736,7 +2736,7 @@ class ClaudeAccountSwitcher:
         session_dir = self._session_dir(account_num, email)
         sessions, _ = scan_live_sessions(session_dir)
         pids = [s.pid for s in sessions]
-        # A headless claude (`cswap run N -- -p`, autodock agents) writes no
+        # A headless claude (`cswap run N -- -p`, handoff agents) writes no
         # session record; its live wrapper still owns the profile's tokens.
         try:
             wrappers = live_run_marker_pids(session_dir, ignore=os.getpid())
@@ -5683,7 +5683,7 @@ class ClaudeAccountSwitcher:
                 groups: dict[tuple[str, str], dict[str, int]] = {}
                 for session in sessions:
                     label = entrypoint_label(session.entrypoint)
-                    cwd = abbreviate_path(session.cwd)
+                    cwd = abbreviate_path(session.cwd) if session.cwd else "(folder unknown)"
                     key = (label, cwd)
                     counts = groups.setdefault(key, {"sessions": 0, "ide": 0})
                     counts["sessions"] += 1
@@ -6291,13 +6291,19 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        exclusive: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``exclusive`` refuses, instead of warning, while a session profile of
+        the target is live (see ``_perform_switch``).
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6396,6 +6402,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            exclusive=exclusive,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6782,6 +6789,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        exclusive: bool = False,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -6796,6 +6804,10 @@ class ClaudeAccountSwitcher:
         managed live login exists: the stored backup is written over the live
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
+
+        ``exclusive`` turns the live-session warning into a refusal: an
+        unattended caller (the tray) has nobody to read the warning, and two
+        live copies of one rotating refresh token strand one of them.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -6844,6 +6856,18 @@ class ClaudeAccountSwitcher:
                         "refresh. Exit the session (its credential is adopted into "
                         "the backup once nothing runs against it), or switch to "
                         "another account."
+                    )
+                if exclusive:
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) is in use by a "
+                        "session profile ("
+                        + (
+                            f"PID {', '.join(map(str, pids))}"
+                            if pids
+                            else f"{unreadable} unreadable session record(s)"
+                        )
+                        + "); not switching the default login onto a second "
+                        "copy of its credential."
                     )
                 if pids:
                     msg = (

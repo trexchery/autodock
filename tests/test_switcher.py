@@ -8790,6 +8790,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            exclusive=False,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(
@@ -9109,6 +9110,35 @@ class TestDisableEnableAccount:
         with patch.object(s, "list_accounts"):
             s.switch_to("2")
 
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_switch_waits_out_a_concurrent_store_lock_holder(self, temp_home):
+        """The tray runs `switch` beside a running `auto --once` (and other terminals):
+        the engine's own store lock, not the caller, serializes them. A switch must not
+        mutate while another process holds it, and must go through once it is released."""
+        from claude_swap.exceptions import LockError
+        from claude_swap.locking import FileLock
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        def short_lock(path, timeout=10.0):
+            return FileLock(path, timeout=0.3)
+
+        holder = FileLock(s.lock_file)
+        assert holder.acquire()
+        try:
+            with patch("claude_swap.switcher.FileLock", short_lock), patch.object(s, "list_accounts"):
+                with pytest.raises(LockError):
+                    s.switch_to("2", json_output=True)
+            assert s._get_sequence_data()["activeAccountNumber"] == 1
+        finally:
+            holder.release()
+        with patch.object(s, "list_accounts"):
+            result = s.switch_to("2", json_output=True)
+        assert result["switched"] is True
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_remove_then_readd_clears_disabled(self, temp_home):

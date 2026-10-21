@@ -1387,6 +1387,7 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
+        self._sync_folder_trust(session_dir)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
@@ -1597,6 +1598,87 @@ class SessionManager:
             self._logger.warning(
                 f"Could not sync MCP servers ({e}) — skipping this launch."
             )
+
+    @staticmethod
+    def _trusted_in(config: dict, folder: Path) -> bool:
+        """Whether ``config`` records the trust dialog accepted for ``folder``
+        or one of its ancestors (claude's own rule: trusting a parent covers
+        its children). Windows paths compare case-insensitively."""
+        projects = config.get("projects")
+        if not isinstance(projects, dict):
+            return False
+        nt = os.name == "nt"
+        fold = (lambda s: s.lower()) if nt else (lambda s: s)
+        trusted = {
+            fold((k.replace("\\", "/") if nt else k).rstrip("/"))
+            for k, v in projects.items()
+            if isinstance(k, str) and isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True
+        }
+        return any(
+            fold(p.as_posix().rstrip("/")) in trusted
+            for p in (folder, *folder.parents)
+        )
+
+    def _sync_folder_trust(self, session_dir: Path, folder: Path | None = None) -> None:
+        """Carry the default profile's folder trust into a session profile.
+
+        A folder you already trusted in your normal claude (or under another
+        of your accounts) must not stop a `cswap run` launch, or a handoff
+        resume nobody is watching, at the trust dialog just because this
+        account's profile has never opened it. Only trust you granted flows
+        across, and only for the launch folder. Fail-open like the MCP
+        mirror: any trouble leaves the profile as it was and claude asks.
+
+        ``folder`` (default: the working directory) is kept as claude sees it,
+        not resolved: claude keys trust by its own unresolved cwd, so a
+        junction or mapped drive must be judged, and written, by that path.
+        """
+        try:
+            folder = Path(os.path.abspath(folder if folder is not None else Path.cwd()))
+        except OSError:
+            return
+        sources = [get_default_global_config_path()]
+        try:
+            sources += [
+                d / ".claude.json"
+                for d in session_dir.parent.iterdir()
+                if d != session_dir and d.is_dir()
+            ]
+        except OSError:
+            pass
+        # Regular files only: a FIFO would block the launch on read.
+        sources = [p for p in sources if p.is_file() and (os.name == "nt" or not p.is_symlink())]
+        if not any(
+            (cfg := self._load_json_object(p)) is not None and self._trusted_in(cfg, folder)
+            for p in sources
+        ):
+            return
+        config_path = session_dir / ".claude.json"
+        if config_path.is_symlink() or not config_path.is_file():
+            return
+        existing = self._load_json_object(config_path)
+        if existing is None or self._trusted_in(existing, folder):
+            return
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                if config_path.is_symlink() or not config_path.is_file():
+                    return  # swapped since the check above: never write through a link
+                existing = self._load_json_object(config_path)
+                if existing is None or self._trusted_in(existing, folder):
+                    return
+                projects = existing.get("projects")
+                if projects is None:
+                    projects = existing["projects"] = {}
+                if not isinstance(projects, dict):
+                    return
+                entry = projects.setdefault(folder.as_posix(), {})
+                if not isinstance(entry, dict):
+                    return
+                entry["hasTrustDialogAccepted"] = True
+                atomic_write_json(config_path, existing)
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            self._logger.warning(f"Could not carry folder trust ({e}) — claude will ask.")
 
     @staticmethod
     def _read_mcp_source() -> dict | None:
