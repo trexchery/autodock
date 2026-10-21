@@ -33,7 +33,7 @@ details, limits, and costs: [docs/agents.md](docs/agents.md).
 
 ## quick start
 
-needs **Windows 11 (64-bit)**, [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with auto mode, [Git for Windows](https://git-scm.com/download/win), and the [GitHub CLI](https://cli.github.com/) signed in (`gh auth login`). agents run on Claude accounts other than the one you're signed in with, so add at least one more.
+needs **Windows 11 (64-bit)**, [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with auto mode, [Git for Windows](https://git-scm.com/download/win), and the [GitHub CLI](https://cli.github.com/) signed in (`gh auth login`). agents run on Claude accounts other than the one you're signed in with. with only one account they share it instead: they queue while your own terminals are working or the account is near its limit, and never close a session of yours.
 
 1. download `handoff-win-x64.zip` from the [latest release](https://github.com/trexchery/handoff/releases/latest), extract it, and run `handoff\handoff.exe`.
 2. open the tray icon, use **+** to add each Claude account through official CLI sign-in.

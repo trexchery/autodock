@@ -150,7 +150,7 @@ public sealed partial class Supervisor
             goal.Progress = Signature(_state.Repos, Key(repo, goal)); // what this plan sees
             Save(); // write-ahead
             var outPath = _store.RunFile(repo, probe, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume: false, review: true, settings), wt, goal.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume: false, review: true, settings, own: _solo && account.Active), wt, goal.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, probe, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (goal.Run.Pid, goal.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
@@ -815,7 +815,7 @@ public sealed partial class Supervisor
     /// What the director plans for: how many runs go at once, how many accounts have room, and whether ultracode may run.
     string Capacity()
     {
-        var usable = (_accounts ?? []).Where(AccountPicker.Usable).ToList();
+        var usable = (_accounts ?? []).Where(a => AccountPicker.Usable(a, _solo)).ToList();
         var room = usable.Count(a => AccountPicker.Peak(a) is { } p && p < Config.Threshold);
         var opus = usable.Count(a => Routing.Peak(Routing.Snap(a, "opus")) < Config.Threshold);
         var cap = Config.MaxConcurrent > 0 ? $"{Config.MaxConcurrent}" : "one per account with room";

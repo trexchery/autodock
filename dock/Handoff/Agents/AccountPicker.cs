@@ -8,9 +8,16 @@ public static class AccountPicker
     /// Same exclusions as the engine's auto-switch (excluded accounts, dead or missing logins, API keys),
     /// plus the login in use at the keyboard: a worker on it could have its account switched mid-run.
     /// An account with extra usage turned on qualifies only with a live reading: a guess could cost money.
-    public static bool Usable(Account a) =>
-        a.Provider == "claude" && !a.Disabled && !a.Active && a.UsageStatus is "ok" or "token_expired" or "unavailable"
+    /// `solo`: the login in use is the only Claude account there is (see Solo), so it is no exception.
+    public static bool Usable(Account a, bool solo = false) =>
+        a.Provider == "claude" && !a.Disabled && (solo || !a.Active) && a.UsageStatus is "ok" or "token_expired" or "unavailable"
         && !(SpendsMoney(a) && a.Usage == null);
+
+    /// The only Claude account, and the login in use at the keyboard: with nothing to switch to, no switch can pull it from
+    /// under a run, so agents may share it, as `claude` itself runs in many terminals at once. A second account, excluded or
+    /// not, ends this: the owner could switch to it.
+    public static bool Solo(IReadOnlyList<Account> accounts) =>
+        accounts.Count(a => a.Provider == "claude") == 1 && accounts.First(c => c.Provider == "claude") is { Active: true } only && Usable(only, solo: true);
 
     /// Extra usage (paid overage) is set up on the account.
     public static bool SpendsMoney(Account a) => (a.Usage ?? a.LastGoodUsage)?.Spend != null;
@@ -33,14 +40,17 @@ public static class AccountPicker
     /// `busy`: workers running per email+org. `prefer`: the account a resumable session lives on.
     /// Why nothing can ever start until the owner acts (not a limit or busy accounts, which pass).
     internal const string OnlyYours = "agents need a Claude account besides the one you are signed in with (they never run on, or switch, your own login)",
-        NoneUsable = "no usable Claude account", AllNearLimits = "all accounts are near their limits";
+        NoneUsable = "no usable Claude account", AllNearLimits = "all accounts are near their limits",
+        OwnBusy = "your Claude terminals are in use, so agents wait: they share your only account and never close a session of yours";
 
     public static (Account? Pick, string? Why) Pick(IReadOnlyList<Account> accounts, double threshold,
         IReadOnlyDictionary<string, int> busy, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now,
-        int perAccount = 2, string? prefer = null, bool consumeFirst = false, IReadOnlySet<int>? live = null, string? model = null)
+        int perAccount = 2, string? prefer = null, bool consumeFirst = false, IReadOnlySet<int>? live = null, string? model = null,
+        bool solo = false, bool ownBusy = false)
     {
-        var usable = accounts.Where(Usable).ToList();
+        var usable = accounts.Where(a => Usable(a, solo)).ToList();
         if (usable.Count == 0) return (null, accounts.Any(a => a.Active) ? OnlyYours : NoneUsable);
+        if (solo && ownBusy) return (null, OwnBusy); // a window of yours is working: queued, never closed
         var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now) && ModelRoom(a, model, threshold, now)).ToList();
         var headroom = open.Where(a => Peak(a, now) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();
@@ -81,8 +91,8 @@ public static class AccountPicker
     }
 
     /// When the first account that is out of usage comes back, if any reading says.
-    public static DateTimeOffset? EarliestReturn(IEnumerable<Account> accounts, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now, double threshold = ResumeStopped.Full) =>
-        accounts.Where(Usable).Select(a => NextReset(a, cooled, now, threshold)).Where(t => t != null).Min();
+    public static DateTimeOffset? EarliestReturn(IEnumerable<Account> accounts, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now, double threshold = ResumeStopped.Full, bool solo = false) =>
+        accounts.Where(a => Usable(a, solo)).Select(a => NextReset(a, cooled, now, threshold)).Where(t => t != null).Min();
 
     public static string Key(Account a) => a.Email + "|" + (a.OrganizationUuid ?? "");
 

@@ -92,6 +92,8 @@ public sealed partial class Supervisor : IDisposable
     IReadOnlyList<Account>? _accounts;
     IReadOnlyList<ProjectMapping> _maps = [];
     IReadOnlySet<int> _live = new HashSet<int>();
+    /// The only Claude account is the login in use (AccountPicker.Solo): runs share it, and wait while a terminal of yours works on it.
+    bool _solo, _ownBusy;
     bool _allOut;
     DateTimeOffset? _resumeAt;
     bool _pumping, _pumpAgain, _launching, _disposed, _stopping;
@@ -198,18 +200,19 @@ public sealed partial class Supervisor : IDisposable
 
     /// The tray's latest Claude accounts (each refresh) and folder assignments.
     /// `live`: accounts a `cswap run` window holds (the tray's view), which the default login can never switch to.
-    public void UpdateAccounts(IReadOnlyList<Account> claude, IReadOnlyList<ProjectMapping> maps, IReadOnlySet<int>? live = null)
+    public void UpdateAccounts(IReadOnlyList<Account> claude, IReadOnlyList<ProjectMapping> maps, IReadOnlySet<int>? live = null, bool ownBusy = false)
     {
         _accounts = claude;
+        (_solo, _ownBusy) = (AccountPicker.Solo(claude), ownBusy);
         FlushMeasures(force: false); // a reading taken after a run ended completes its line
         _maps = maps;
         _live = live ?? new HashSet<int>();
         foreach (var (item, w) in _workers)
         {
             if (w.StopReason != null || claude.FirstOrDefault(a => AccountPicker.Key(a) == w.Account) is not { } a) continue;
-            if (a.Active)
+            if (a.Active && !_solo)
             {
-                // The owner switched to this account meanwhile: two copies of one login must not run.
+                // The owner switched to this account meanwhile (or added a second one): two copies of one login must not run.
                 Fire(() => StopWorkerAsync(item, "limit"));
             }
             else if (AccountPicker.SpendsMoney(a) && (a.Usage == null || AccountPicker.Peak(a) >= Config.Threshold))
@@ -366,7 +369,7 @@ public sealed partial class Supervisor : IDisposable
                     }
                 }
             }
-            var cap = Config.MaxConcurrent > 0 ? Config.MaxConcurrent : Math.Max(1, _accounts.Count(AccountPicker.Usable)); // automatic: one per account, verifying included
+            var cap = Config.MaxConcurrent > 0 ? Config.MaxConcurrent : Math.Max(1, _accounts.Count(a => AccountPicker.Usable(a, _solo))); // automatic: one per account, verifying included
             // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest;
             // planned work waits for what it builds on.
             Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
@@ -394,16 +397,16 @@ public sealed partial class Supervisor : IDisposable
         // Every account out of usage: hold (nothing starts, running work ends at its own limit and moves on),
         // say so once, and come back at the earliest reset with a fresh reading. Resumes by itself. Judged on
         // every account, not on the one a waiting folder is assigned to.
-        var allOut = waiting != null && AccountPicker.Pick(_accounts, Config.Threshold, new Dictionary<string, int>(), _cooled, DateTimeOffset.Now)
+        var allOut = waiting != null && AccountPicker.Pick(_accounts, Config.Threshold, new Dictionary<string, int>(), _cooled, DateTimeOffset.Now, solo: _solo)
             .Why?.StartsWith(AccountPicker.AllNearLimits) == true;
         if (allOut && !_allOut)
         {
-            var back = AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold);
+            var back = AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold, _solo);
             Notify?.Invoke("Agents waiting for usage", "Every Claude account is near its limit" + (back is { } t ? $"; they continue by themselves {Format.When(t, DateTimeOffset.Now)}." : "."));
         }
         else if (!allOut && _allOut && (started || _workers.Count > 0)) Notify?.Invoke("Agents resumed", "A Claude account has usage again.");
         _allOut = allOut;
-        _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
+        _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold, _solo) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
     }
 
     /// The repository's next item: the one already under way, then pull request follow-ups, then new
@@ -436,7 +439,7 @@ public sealed partial class Supervisor : IDisposable
             && PickAccount(repo, item, "sonnet") is ({ } fallback, _))
             (account, s) = (fallback, s with { Model = "sonnet", Effort = Array.IndexOf(Routing.Efforts, s.Effort) < 2 ? "high" : s.Effort });
         if (account != null && !item.ReviewNext)
-            s = s with { Ultracode = Routing.UltracodeOn(route, Config.Ultracode, account, RunsOn(account), Config.Threshold) };
+            s = s with { Ultracode = Routing.UltracodeOn(route, Config.Ultracode, account, RunsOn(account) + (_solo ? 1 : 0), Config.Threshold) };
         return (account, s, why);
     }
 
@@ -449,10 +452,10 @@ public sealed partial class Supervisor : IDisposable
         var busy = _workers.Values.GroupBy(w => w.Account).ToDictionary(g => g.Key, g => g.Count());
         var prefer = item is { ReviewNext: false, Session: { } s } ? s.Email + "|" + s.Org : null;
         (Account?, string?) From(IReadOnlyList<Account> pool) =>
-            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst, _live, model);
+            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst, _live, model, _solo, _ownBusy);
         // The folder's account as the default login: work code stays on it, so the folder waits for the login to move on (no problem for the owner).
         if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped)
-            return mapped.Active ? (null, $"#{mapped.Number}, this folder's account, is your login right now") : From([mapped]);
+            return mapped.Active && !_solo ? (null, $"#{mapped.Number}, this folder's account, is your login right now") : From([mapped]);
         // Held only for a folder that would start something, or has not read its issues yet.
         var theirs = _state.Repos.Where(r => r != repo && Active(r) && (r.LastScan == null || Next(r, Config.MaxOpenPrs, i => !Ready(i)) != null)).Select(r => ProjectMap.AccountFor(r.Path, accounts, _maps)).OfType<Account>().ToList();
         var pick = From(accounts.Where(a => !theirs.Contains(a) || AccountPicker.Key(a) == prefer).ToList()); // a session resumes where it lives
@@ -517,7 +520,7 @@ public sealed partial class Supervisor : IDisposable
             item.Route ??= Routing.Default; // started unrouted: escalation needs a base
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings), wt, item.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings, own: _solo && account.Active), wt, item.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
@@ -547,11 +550,12 @@ public sealed partial class Supervisor : IDisposable
         }
     }
 
-    /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login.
+    /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login. `own`: the one
+    /// account there is, and it is the default login (AccountPicker.Solo): the engine then launches plain claude on it, never a second copy of its login.
     /// Runs cannot push or call gh; reviewers cannot edit files either. Every run states its model, effort and ultracode.
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null) =>
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null, bool own = false) =>
     [
-        "run", account.ToString(), "--require-session", "--",
+        "run", account.ToString(), .. own ? (string[])[] : ["--require-session"], "--",
         "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", // a request that streams is never taken for a stall
         resume ? "--resume" : "--session-id", session,
         "--permission-mode", PermissionMode,

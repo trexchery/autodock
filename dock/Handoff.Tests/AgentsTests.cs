@@ -235,6 +235,27 @@ public class AccountPickerTests
     }
 
     [Fact]
+    public void TheOnlyAccountIsSharedAndQueuesWhileYouWorkOrItIsFull()
+    {
+        var only = new[] { A(1, 20, active: true) };
+        Assert.True(AccountPicker.Solo(only));
+        Assert.Equal(1, AccountPicker.Pick(only, 90, None, NoneCooled, Now, solo: true).Pick!.Number);
+        var (busy, why) = AccountPicker.Pick(only, 90, None, NoneCooled, Now, solo: true, ownBusy: true); // a window of yours is working: wait, close nothing
+        Assert.Null(busy);
+        Assert.Equal(AccountPicker.OwnBusy, why);
+        var (full, limit) = AccountPicker.Pick([A(1, 95, active: true)], 90, None, NoneCooled, Now, solo: true);
+        Assert.Null(full);
+        Assert.StartsWith(AccountPicker.AllNearLimits, limit);
+        Assert.NotNull(AccountPicker.EarliestReturn([A(1, 95, active: true)], NoneCooled, Now, 90, solo: true));
+        // Anything else is as before: a second account (excluded or not), a login not in use, a broken one.
+        Assert.False(AccountPicker.Solo([A(1, 0, active: true), A(2, 0, disabled: true)]));
+        Assert.False(AccountPicker.Solo([A(1, 0)]));
+        Assert.False(AccountPicker.Solo([A(1, 0, active: true, status: "api_key")]));
+        Assert.Null(AccountPicker.Pick(only, 90, None, NoneCooled, Now).Pick); // without the flag the default login is never used
+        Assert.Equal(2, AccountPicker.Pick([A(1, 0, active: true), A(2, 60)], 90, None, NoneCooled, Now).Pick!.Number);
+    }
+
+    [Fact]
     public void MostHeadroomWinsAndTheThresholdHolds()
     {
         Assert.Equal(3, AccountPicker.Pick([A(1, 0, active: true), A(2, 60), A(3, 10, 20)], 90, None, NoneCooled, Now).Pick!.Number);
@@ -854,6 +875,11 @@ public class AgentWorkerPolicyTests
         Assert.Contains("Bash(git push *)", work);
         Assert.Contains("Bash(gh *)", work);
         Assert.DoesNotContain("Edit", work);
+        // The only account, in use as the default login: the engine runs claude on it, never a second copy of its login; the rest stays.
+        var own = Supervisor.WorkerArgs(3, "sid", resume: false, review: false, own: true);
+        Assert.Equal(["run", "3", "--"], own[..3]);
+        Assert.DoesNotContain("--require-session", own);
+        Assert.Equal(work.Where(x => x != "--require-session"), own);
         var review = Supervisor.WorkerArgs(3, "sid", resume: true, review: true);
         Assert.Contains("--resume", review);
         Assert.Contains("Edit", review);

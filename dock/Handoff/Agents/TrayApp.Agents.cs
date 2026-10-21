@@ -39,8 +39,24 @@ public sealed partial class TrayApp
     async Task UpdateAgentAccountsAsync()
     {
         await _agentsThreshold;
-        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load(), LiveOrLaunching());
+        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load(), LiveOrLaunching(), await OwnBusyAsync(_snap.Accounts));
         MorningSummary(); // every tick too: with no agents terminal open, nothing else wakes it
+    }
+
+    /// With one Claude account agents share the default login: it is busy while a terminal of yours (not an agents terminal)
+    /// is working, or has a state the scan cannot read. Nothing is ever closed for them; they wait.
+    static async Task<bool> OwnBusyAsync(IReadOnlyList<Account> accounts)
+    {
+        if (!AccountPicker.Solo(accounts)) return false;
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var windows = ResumeStopped.Scan([(ResumeStopped.DefaultDir, null)], DateTime.UtcNow, includeBusy: true);
+                return ResumeStopped.LiveCounts(ResumeStopped.DefaultDir).Records > windows.Count || windows.Any(w => w.Status != "agents" && !w.Idle);
+            });
+        }
+        catch (Exception e) { Program.Log(e); return true; }
     }
 
     void ApplyAgentSettings()
