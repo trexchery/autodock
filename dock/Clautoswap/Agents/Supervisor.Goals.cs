@@ -68,7 +68,7 @@ public sealed partial class Supervisor
         // A step in a repository whose agents the owner stopped never moves, and no plan can reach it there.
         if (!_goalBusy.ContainsKey(goal) && _state.Repos.Where(r => !r.Authorized).SelectMany(r => r.Items.Where(i => i.Goal == key && i.State is not (ItemState.Done or ItemState.NeedsOwner)).Select(i => (r, i))).FirstOrDefault() is ({ } there, { } halted))
         {
-            GoalNeedsOwner(repo, goal, $"{halted.Label} is in {there.Leaf}, where agents are stopped; start them there, skip it, or answer how to proceed");
+            GoalNeedsOwner(repo, goal, $"{halted.Label} is in {there.Leaf}, where agents are stopped; skip it there, or start them there and ask for a new plan");
             return;
         }
         if (_goalBusy.ContainsKey(goal) || !GoalItems(key).All(i => i.State == ItemState.Done)) return;

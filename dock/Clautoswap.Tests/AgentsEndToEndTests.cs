@@ -683,7 +683,11 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         await Tool("agents_control", """{"action":"stop"}""", other);
         await Until(r => G(r).State == GoalState.NeedsOwner, "a step agents will never take up asks the owner");
-        Assert.Equal("w1 Serve greetings is in other, where agents are stopped; start them there, skip it, or answer how to proceed", await On(r => G(r).Note));
+        Assert.Equal("w1 Serve greetings is in other, where agents are stopped; skip it there, or start them there and ask for a new plan", await On(r => G(r).Note));
+        // The path the note names works: once agents run there again, a new plan is not sent straight back to the owner.
+        await Tool("agents_control", """{"action":"start"}""", other);
+        Assert.StartsWith("Goal g1: the director plans again", await Goal(new { action = "replan", goal = "g1" }));
+        await Until(_ => DirectorPrompts().Length == 2, "the owner's replan plans now");
         _sup!.Dispose();
     }
 
