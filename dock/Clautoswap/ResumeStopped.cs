@@ -313,10 +313,12 @@ public static class ResumeStopped
     }
 
     /// Live claude records and live `cswap run` wrapper markers in a profile dir. Throws when it cannot be listed.
-    /// A live claude with only a `{pid}.<hash>.key` (a Windows `--resume` may write no record) counts as a record, as in
-    /// the engine: one started after the key was written holds a recycled pid. shortcut: `Scan` and `LiveTranscripts`
-    /// still miss such a window (no record names its transcript), so it is only ever held, never moved; find its
-    /// transcript by the pid's newest projects file if those windows turn out common.
+    /// A live claude with only a `{pid}.<hash>.key` counts as a record, as in the engine: one started after the key was
+    /// written holds a recycled pid. Claude Code (2.1.30x) writes the key 0.4-4 s before the record at every start, and
+    /// writes no record at all for a session that is not persisted, an agent-team member or a parked spare, or when
+    /// registering fails. With no record its status is unknown (a turn may be running), so `Scan` never sees it as done
+    /// and it holds its profile and is never closed; its id on the command line would not change that (`--fork-session`
+    /// and `/resume` make it wrong anyway).
     public static (int Records, int Runs) LiveCounts(string dir)
     {
         var runs = Path.Combine(dir, ".cswap-runs");

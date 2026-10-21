@@ -450,6 +450,11 @@ public class LimitWatchTests
             File.WriteAllText(Path.Combine(root, "sessions", $"{self.Id}.abc.key"), ""); // a live claude without its record
             File.WriteAllText(Path.Combine(root, "sessions", "2147483000.abc.key"), "");
             Assert.Equal((1, 1), ResumeStopped.LiveCounts(root));
+            // A window nothing identifies is never seen as done, so its profile is held and it is never closed.
+            Assert.Empty(ResumeStopped.Scan([(root, 2)], DateTime.UtcNow, includeBusy: true));
+            Assert.Empty(ResumeStopped.LiveTranscripts([(root, 2)], DateTime.UtcNow));
+            Assert.False(ResumeStopped.Releasable([], records: 1, runs: 1));
+            Assert.Equal(["a window still working"], ResumeStopped.Holders([], records: 1, runs: 1));
             File.WriteAllText(Path.Combine(root, "sessions", "1.json"),
                 $$"""{"pid":{{self.Id}},"sessionId":"sid","procStart":"{{self.StartTime.ToUniversalTime().ToFileTimeUtc()}}"}""");
             File.WriteAllText(Path.Combine(root, "sessions", "2.json"), """{"pid":2147483000,"sessionId":"old","procStart":"1"}""");

@@ -324,8 +324,9 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
 def _keyed_sessions(sessions_dir: Path, known: set[int]) -> list[ClaudeSession]:
     """Live claudes with a ``{pid}.<hash>.key`` but no ``{pid}.json``.
 
-    Some sessions (seen on Windows with ``claude --resume``) run without their
-    record, leaving only the key file. They are still on this login, so a scan
+    Claude Code writes the key seconds before the record at start, and no
+    record at all for a session that is not persisted, an agent-team member,
+    a parked spare, or when registering fails. They are still on this login, so a scan
     or a guard must see them. Folder and status are unknown. A process that
     started after the key was written holds a recycled pid and is skipped.
     """
