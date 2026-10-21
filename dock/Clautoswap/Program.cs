@@ -78,13 +78,15 @@ static class Program
     }
 
     /// Local only, redacted, capped at ~1 MB.
-    internal static void Log(Exception? e)
+    internal static void Log(Exception? e) => Log(e?.ToString() ?? "unknown");
+
+    internal static void Log(string text)
     {
         try
         {
             Directory.CreateDirectory(DockSettings.Dir);
             if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 1_000_000) File.Delete(LogPath);
-            File.AppendAllText(LogPath, $"{DateTime.Now:O} {Engine.Redact(e?.ToString() ?? "unknown")}\n\n");
+            File.AppendAllText(LogPath, $"{DateTime.Now:O} {Engine.Redact(text)}\n\n");
         }
         catch { }
     }

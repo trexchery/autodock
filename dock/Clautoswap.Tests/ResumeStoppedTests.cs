@@ -157,6 +157,13 @@ public class ResumeStoppedTests
         finally { Directory.Delete(root, true); }
     }
 
+    /// A window record for this very process (a real, live pid), as `Unchanged` re-reads it.
+    static string Rec(string status)
+    {
+        var self = System.Diagnostics.Process.GetCurrentProcess();
+        return $$"""{"pid":{{self.Id}},"sessionId":"sid","status":"{{status}}","procStart":"{{self.StartTime.ToUniversalTime().ToFileTimeUtc()}}"}""";
+    }
+
     [Fact]
     public void AnyChangeSinceTheScanCancelsTheMove()
     {
@@ -166,12 +173,12 @@ public class ResumeStoppedTests
             var t = Path.Combine(root, "sid.jsonl");
             var rec = Path.Combine(root, "1.json");
             File.WriteAllText(t, Done);
-            File.WriteAllText(rec, """{"status":"idle"}""");
-            var s = new StoppedSession(1, "sid", root, root, 3, t, false, rec, File.GetLastWriteTimeUtc(t));
+            File.WriteAllText(rec, Rec("idle"));
+            var s = new StoppedSession(Environment.ProcessId, "sid", root, root, 3, t, false, rec, File.GetLastWriteTimeUtc(t));
             Assert.True(ResumeStopped.Unchanged(s));
-            File.WriteAllText(rec, """{"status":"busy"}""");
+            File.WriteAllText(rec, Rec("busy"));
             Assert.False(ResumeStopped.Unchanged(s));
-            File.WriteAllText(rec, """{"status":"idle"}""");
+            File.WriteAllText(rec, Rec("idle"));
             File.AppendAllText(t, "\n" + Typed);
             File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(1));
             Assert.False(ResumeStopped.Unchanged(s));
@@ -194,6 +201,230 @@ public class ResumeStoppedTests
             File.WriteAllText(path, "not json");
             Assert.Empty(ResumeStopped.LoadMoves(path));
             Assert.Empty(ResumeStopped.LoadMoves(Path.Combine(root, "missing.json")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    // The error as Claude Code writes it today: the structured API refusal with its window and reset.
+    const string LimitV2 = """{"type":"assistant","timestamp":"2026-10-20T22:33:03.355Z","apiError":"usage_limit_reached","isApiErrorMessage":true,"apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792546800,"rateLimitType":"five_hour"}},"message":{"role":"assistant","content":[{"type":"text","text":"You've hit your limit"}]}}""";
+    const string Notice = """{"type":"system","subtype":"informational","content":"Remote Control disconnected"}""";
+    const string TurnTime = """{"type":"system","subtype":"turn_duration"}""";
+    const string LocalCaveat = """{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}""";
+    const string LocalModel = """{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"}}""";
+    const string Compact = """{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"Summary"}}""";
+    const string LocalUsage = """{"type":"user","message":{"role":"user","content":"<command-name>/usage</command-name>"}}""";
+
+    static string LimitAt(DateTimeOffset t) => LimitV2.Replace("2026-10-20T22:33:03.355Z", t.ToString("O"));
+
+    static Clautoswap.Limit LimitStop(DateTimeOffset? resets, DateTimeOffset at, string? window = "five_hour") => new(window, resets, at);
+
+    [Fact]
+    public void StructuredLimitErrorIsReadWithItsReset()
+    {
+        var l = ResumeStopped.LimitOf([LimitV2, Notice, TurnTime]);
+        Assert.NotNull(l);
+        Assert.Equal("five_hour", l.Window);
+        Assert.Equal(DateTimeOffset.Parse("2026-10-21T01:40:00Z"), l.ResetsAt);
+        Assert.Equal(DateTimeOffset.Parse("2026-10-20T22:33:03.355Z"), l.At);
+        var old = ResumeStopped.LimitOf([Limit]); // an error without the details still counts
+        Assert.NotNull(old);
+        Assert.Null(old.Window);
+        Assert.Null(old.ResetsAt);
+    }
+
+    [Fact]
+    public void RewordedOrWeeklyLimitsStillCount()
+    {
+        Assert.True(ResumeStopped.EndsAtLimit(["""{"type":"assistant","apiError":"usage_limit_reached","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"Weekly limit reached"}]}}"""]));
+        Assert.False(ResumeStopped.EndsAtLimit(["""{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"API Error: 500"}]}}"""]));
+    }
+
+    [Fact]
+    public void LocalCommandsAfterTheLimitStillCount()
+    {
+        Assert.NotNull(ResumeStopped.LimitOf([LimitV2, LocalCaveat, LocalUsage]));
+        Assert.Null(ResumeStopped.LimitOf([LimitV2, Typed]));
+        Assert.Null(ResumeStopped.LimitOf([LimitV2, LocalModel])); // a command that changes the session is someone at the keyboard
+        Assert.Null(ResumeStopped.LimitOf([LimitV2, Compact]));
+    }
+
+    /// A window record and transcript in `root` for this very process (a real, live pid, stamped with its start time).
+    static void Stage(string root, string status, string[] lines, long? procStart = -1, int? pid = null)
+    {
+        var self = System.Diagnostics.Process.GetCurrentProcess();
+        var stamp = procStart == -1 ? self.StartTime.ToUniversalTime().ToFileTimeUtc() : procStart;
+        var project = Path.Combine(root, "projects", "C--w");
+        Directory.CreateDirectory(project);
+        Directory.CreateDirectory(Path.Combine(root, "sessions"));
+        File.WriteAllLines(Path.Combine(project, "sid.jsonl"), lines);
+        File.WriteAllText(Path.Combine(root, "sessions", "1.json"),
+            $$"""{"pid":{{pid ?? self.Id}},"sessionId":"sid","cwd":"C:\\w","status":"{{status}}","kind":"interactive"{{(stamp is { } f ? $",\"procStart\":\"{f}\"" : "")}}}""");
+    }
+
+    // `ahead` stands in for time passing: a stop must be this process's own (after it started), so staged errors are stamped now.
+    static List<StoppedSession> ScanOf(string root, double ahead = 10) => ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(ahead), DateTime.MinValue);
+
+    [Fact]
+    public async Task RenamedClaudeImageIsStillSeen()
+    {
+        // Claude Code's updater renames the running image: ProcessName becomes claude.exe.old.<stamp>.<pid>.
+        var root = Directory.CreateTempSubdirectory().FullName;
+        var exe = Path.Combine(root, "claude.exe.old.1792529213345.31388.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), exe);
+        using var old = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, "-n 120 127.0.0.1")
+            { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
+        try
+        {
+            Assert.StartsWith("claude.exe.old", old.ProcessName);
+            var stamp = old.StartTime.ToUniversalTime().ToFileTimeUtc();
+            var lines = new[] { Typed, LimitAt(DateTimeOffset.UtcNow) };
+            Stage(root, "idle", lines, stamp, old.Id);
+            var s = Assert.Single(ScanOf(root));
+            Assert.Equal(old.Id, s.Pid);
+            Assert.True(s.AtLimit);
+            Assert.Equal("five_hour", s.Limit?.Window);
+            Stage(root, "idle", lines, stamp + TimeSpan.TicksPerHour, old.Id); // a recycled pid: the stamp names another process
+            Assert.Empty(ScanOf(root));
+            Stage(root, "idle", lines, null, old.Id); // unstamped: the normalised name is claude
+            Assert.Single(ScanOf(root));
+        }
+        finally
+        {
+            if (!old.HasExited) old.Kill();
+            await old.WaitForExitAsync();
+            await Task.Delay(200); // the image stays locked a moment after exit
+            try { Directory.Delete(root, true); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { } // best effort: a slow exit can keep it locked
+        }
+    }
+
+    [Fact]
+    public void OnlyAnIdleWindowIsEverFound()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            string[] atLimit = [Typed, LimitAt(DateTimeOffset.UtcNow)];
+            Stage(root, "idle", atLimit);
+            Assert.Single(ScanOf(root));
+            Stage(root, "idle", [Typed, LimitAt(DateTimeOffset.UtcNow.AddDays(-1))]);
+            Assert.Empty(ScanOf(root)); // a stop from before this process started: a resumed window, not stopped again
+            Stage(root, "idle", atLimit);
+            // shell: idle with a background command still running; moving it would orphan the command.
+            foreach (var status in new[] { "shell", "waiting", "busy" })
+            {
+                Stage(root, status, atLimit);
+                Assert.Empty(ScanOf(root));
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void LimitStopNeedsOnlyAShortQuiet()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            Stage(root, "idle", [Typed, LimitAt(DateTimeOffset.UtcNow)]);
+            Assert.Single(ScanOf(root, 6));
+            Assert.Empty(ScanOf(root, 2));
+            Stage(root, "idle", [Typed, Done]);
+            File.SetLastWriteTimeUtc(Path.Combine(root, "projects", "C--w", "sid.jsonl"), DateTime.UtcNow.AddSeconds(-6));
+            Assert.Empty(ScanOf(root, 0)); // a finished turn still waits the longer quiet
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    static StoppedSession Refused(DateTimeOffset resets, bool own = true, string? window = "five_hour") =>
+        On(3) with { Limit = LimitStop(resets, resets.AddHours(-5), window), OwnRefused = own };
+
+    [Fact]
+    public void RefusedAccountIsNotReusedOnAStaleReading()
+    {
+        var now = DateTimeOffset.UtcNow;
+        Account[] stale = [A(1, 20), A(3, 80)]; // the cached reading predates the refusal
+        Assert.Equal(1, ResumeStopped.Target(Refused(now.AddHours(1)), stale, _ => true, now: now));
+        Assert.Equal(3, ResumeStopped.Target(Refused(now.AddMinutes(-1)), stale, _ => true, now: now));
+        Assert.Equal(3, ResumeStopped.Target(Refused(now.AddHours(1), own: false), stale, _ => true, now: now));
+    }
+
+    [Fact]
+    public void DefaultLoginStopBeforeTheSwitchBelongsToThePreviousAccount()
+    {
+        var at = DateTimeOffset.UtcNow;
+        Assert.False(ResumeStopped.OwnStop(true, at, at.UtcDateTime.AddSeconds(10)));
+        Assert.False(ResumeStopped.OwnStop(true, at, at.UtcDateTime.AddSeconds(-10))); // just after a switch: could be the old login's
+        Assert.True(ResumeStopped.OwnStop(true, at, at.UtcDateTime.AddSeconds(-60)));
+        Assert.False(ResumeStopped.OwnStop(true, at, DateTime.MaxValue));
+        Assert.True(ResumeStopped.OwnStop(false, at, at.UtcDateTime.AddSeconds(10)));
+        var before = Refused(at.AddHours(1), own: false);
+        Assert.True(ResumeStopped.Moved(before, 3)); // reopened on the account it is labelled with, but not the one that refused
+        Assert.Contains("on another account", ResumeStopped.Prompt(ResumeStopped.Moved(before, 3)));
+        Assert.False(ResumeStopped.Moved(Refused(at.AddHours(1)), 3));
+    }
+
+    [Fact]
+    public void OnePassSpreadsWindowsByHeadroom()
+    {
+        Account[] accounts = [A(1, 20), A(2, 25), A(3, 100)];
+        Assert.Equal(1, ResumeStopped.Target(On(3), accounts, _ => true));
+        Assert.Equal(2, ResumeStopped.Target(On(3), accounts, _ => true, load: new Dictionary<int, int> { [1] = 1 }));
+    }
+
+    [Fact]
+    public void LimitReportMarksTheRefusedWindowFullOnce()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var resets = now.AddHours(1);
+        var stop = Refused(resets) with { Limit = LimitStop(resets, now.AddSeconds(-10)) };
+        Account[] accounts = [A(1, 20), A(3, 80)];
+        var done = new HashSet<string>();
+        var doc = ResumeStopped.LimitReport([stop], accounts, now, done);
+        Assert.NotNull(doc);
+        using (var j = System.Text.Json.JsonDocument.Parse(doc))
+        {
+            var row = j.RootElement.GetProperty("accounts")[0];
+            Assert.Equal(1, j.RootElement.GetProperty("schemaVersion").GetInt32());
+            Assert.Equal("3@example.com", row.GetProperty("email").GetString());
+            Assert.Equal("", row.GetProperty("organizationUuid").GetString());
+            Assert.Equal("ok", row.GetProperty("usageStatus").GetString());
+            Assert.True(row.GetProperty("usageAgeSeconds").GetDouble() >= 0);
+            var usage = row.GetProperty("usage");
+            Assert.Equal(100, usage.GetProperty("fiveHour").GetProperty("pct").GetDouble());
+            Assert.Equal(resets.ToUnixTimeSeconds(), usage.GetProperty("fiveHour").GetProperty("resetsAt").GetDateTimeOffset().ToUnixTimeSeconds());
+            Assert.Equal(10, usage.GetProperty("sevenDay").GetProperty("pct").GetDouble()); // kept from the snapshot
+        }
+        Assert.Null(ResumeStopped.LimitReport([stop], accounts, now, done)); // already handed over
+        Assert.Null(ResumeStopped.LimitReport([Refused(resets, window: "seven_day_opus")], accounts, now, new HashSet<string>()));
+        Assert.Null(ResumeStopped.LimitReport([stop with { OwnRefused = false }], accounts, now, new HashSet<string>()));
+        Assert.Null(ResumeStopped.LimitReport([stop], accounts, resets.AddMinutes(1), new HashSet<string>())); // reset already passed
+    }
+
+    [Fact]
+    public void ALimitStopSurvivesClaudeCodesOwnNotices()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var t = Path.Combine(root, "sid.jsonl");
+            var rec = Path.Combine(root, "1.json");
+            File.WriteAllLines(t, [Typed, LimitV2]);
+            File.WriteAllText(rec, Rec("idle"));
+            var s = new StoppedSession(Environment.ProcessId, "sid", root, root, 3, t, true, rec, File.GetLastWriteTimeUtc(t), ResumeStopped.LimitOf([LimitV2]), true);
+            Assert.True(ResumeStopped.Unchanged(s));
+            File.AppendAllText(t, Notice + "\n");
+            File.SetLastWriteTimeUtc(t, s.Seen.AddSeconds(1));
+            Assert.True(ResumeStopped.Unchanged(s)); // Remote Control dropping on a switch is not someone typing
+            File.AppendAllText(t, Typed + "\n");
+            Assert.False(ResumeStopped.Unchanged(s));
+            File.WriteAllLines(t, [Typed, LimitV2]);
+            foreach (var status in new[] { "busy", "shell" })
+            {
+                File.WriteAllText(rec, Rec(status));
+                Assert.False(ResumeStopped.Unchanged(s));
+            }
+            File.WriteAllText(rec, Rec("idle").Replace("\"sid\"", "\"other\"")); // the pid now belongs to another session
+            Assert.False(ResumeStopped.Unchanged(s));
         }
         finally { Directory.Delete(root, true); }
     }
@@ -254,6 +485,21 @@ public class ResumeStoppedLiveTests(Xunit.Abstractions.ITestOutputHelper output)
         var dirs = ResumeStopped.ConfigDirs(null);
         foreach (var d in dirs) output.WriteLine($"dir {d.Account} {d.Dir}");
         foreach (var s in ResumeStopped.Scan(dirs, DateTime.UtcNow)) output.WriteLine($"stopped {s.Pid} {s.SessionId} {s.Cwd} #{s.Account}");
+        // Every window record, found or not: all live windows should read as visible, with their transcript.
+        foreach (var (dir, _) in dirs)
+            foreach (var rec in Directory.Exists(Path.Combine(dir, "sessions")) ? Directory.GetFiles(Path.Combine(dir, "sessions"), "*.json") : [])
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(rec));
+                    var r = doc.RootElement;
+                    string? Get(string n) => r.TryGetProperty(n, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() : null;
+                    var pid = r.GetProperty("pid").GetInt32();
+                    output.WriteLine($"record {pid} status={Get("status")} live={ResumeStopped.IsLiveClaude(pid, Get("procStart"))} " +
+                        $"transcript={Get("sessionId") is { } id && Get("cwd") is { } cwd && ResumeStopped.TranscriptOf(dir, id, cwd) != null}");
+                }
+                catch (Exception e) when (e is IOException or System.Text.Json.JsonException or KeyNotFoundException) { }
+            }
         foreach (var f in (Environment.GetEnvironmentVariable("CLAUTOSWAP_LIVE_TRANSCRIPTS") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
             output.WriteLine($"atLimit={ResumeStopped.EndsAtLimit(File.ReadLines(f))} {Path.GetFileName(f)}");
     }
