@@ -71,7 +71,7 @@ public static class Launch
     public static int? GeneralAccount(IEnumerable<Account> accounts)
     {
         var claude = accounts.Where(a => a.Provider == "claude" && !a.Disabled).ToList();
-        return (claude.FirstOrDefault(a => a.Active) ?? claude.OrderBy(Format.Peak).FirstOrDefault())?.Number;
+        return (claude.FirstOrDefault(a => a.Active) ?? claude.Where(a => a.UsageStatus == "ok" && a.ShownUsage != null).OrderBy(Format.Peak).FirstOrDefault())?.Number;
     }
 
     public static string GeneralFolder => Path.Combine(StoreSecurity.UserProfile, "clautoswap-general");

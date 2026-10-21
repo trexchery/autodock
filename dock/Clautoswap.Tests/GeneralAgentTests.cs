@@ -17,6 +17,14 @@ public class GeneralAgentTests
         Assert.Equal(3, Launch.GeneralAccount([A(1, 60), A(2, 5, disabled: true), A(3, 20), A(4, 0, provider: "codex")]));
 
     [Fact]
+    public void UnreadableUsageIsNeverTheMostRoom() =>
+        Assert.Equal(1, Launch.GeneralAccount([A(1, 40), new Account(2, "2@example.com", false, "error", null)]));
+
+    [Fact]
+    public void OnlyUnreadableUsageLeavesItToTheEngine() =>
+        Assert.Null(Launch.GeneralAccount([new Account(2, "2@example.com", false, "expired", null)]));
+
+    [Fact]
     public void NoClaudeAccountLeavesItToTheEngine() =>
         Assert.Null(Launch.GeneralAccount([A(4, 0, provider: "codex")]));
 
