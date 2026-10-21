@@ -6,5 +6,5 @@ Please report vulnerabilities privately through GitHub:
 Include what you found, how to reproduce it, and what an attacker could do with it.
 Never include real access tokens, refresh tokens or credential files. Use made-up values.
 
-In scope: handoff's tray app, the bundled engine, the build pipeline and release artifacts.
+In scope: Patch Goblins' tray app, the bundled engine, the build pipeline and release artifacts.
 Bugs in Claude Code itself belong with Anthropic.

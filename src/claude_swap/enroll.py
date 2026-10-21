@@ -1,4 +1,4 @@
-"""Enroll an account from an isolated Claude Code login (handoff).
+"""Enroll an account from an isolated Claude Code login (Patch Goblins).
 
 ``cswap add`` captures whatever the *default* profile is logged in as, so adding
 a second account normally means logging the default profile out of the first.

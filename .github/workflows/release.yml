@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build, test and publish handoff-win-x64.zip.
+# Push a tag like v0.1.0 to build, test and publish patch-goblins-win-x64.zip.
 on:
   push:
     tags: ['v*']
@@ -31,10 +31,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = 'dist/handoff-win-x64.zip'
+          $zip = 'dist/patch-goblins-win-x64.zip'
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           # LF line ending so `sha256sum -c` works on Linux/macOS too
-          [IO.File]::WriteAllText("$PWD/dist/handoff-win-x64.zip.sha256", "$hash  handoff-win-x64.zip`n")
-          gh release create $env:GITHUB_REF_NAME $zip dist/handoff-win-x64.zip.sha256 `
-            --title "handoff $env:GITHUB_REF_NAME" `
-            --notes "Portable build. Unzip and run handoff.exe. SHA-256: $hash"
+          [IO.File]::WriteAllText("$PWD/dist/patch-goblins-win-x64.zip.sha256", "$hash  patch-goblins-win-x64.zip`n")
+          gh release create $env:GITHUB_REF_NAME $zip dist/patch-goblins-win-x64.zip.sha256 `
+            --title "Patch Goblins $env:GITHUB_REF_NAME" `
+            --notes "Portable build. Unzip and run patch-goblins.exe. SHA-256: $hash"
