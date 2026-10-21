@@ -1186,6 +1186,48 @@ public class AgentGoalTests
     }
 
     [Fact]
+    public void AMergedFinishedItemsIssueDoesNotBlockWhatNeedsIt()
+    {
+        var done = I("7", ItemState.Done, pr: 3);
+        done.Merged = true; // agents' pull requests do not close issues: #7 stays open
+        var repo = Repo(done);
+        List<IssueInfo> issues = [new(7, "Seven", "", [], [], [], "owner"), new(8, "Eight", "Blocked by #7", [], [], [], "owner")];
+        var wanted = Supervisor.Takeable(repo, issues, "owner", [], [], null, new HashSet<int> { 7 });
+        Assert.Contains(wanted, i => i.Number == 8);
+    }
+
+    [Fact]
+    public void EndingAGoalLeavesWhatWaitsOnAnIssueThatStaysQueued()
+    {
+        var (adopted, step, other) = (I("7"), I("w5"), I("w6"));
+        var repo = Repo(adopted, step, other);
+        var (g1, g2) = (G(), new Goal { Id = "g2", Title = "Other" });
+        repo.Goals = [g1, g2];
+        var (k1, k2) = (Supervisor.Key(repo, g1), Supervisor.Key(repo, g2));
+        (adopted.Goal, step.Goal, other.Goal) = (k1, k2, k1);
+        (step.After, other.After) = ([Supervisor.Key(repo, adopted)], [Supervisor.Key(repo, adopted)]);
+        g2.Claim = "done";
+        Assert.Equal(2, Supervisor.UnplanEverywhere([repo], k1));
+        Assert.Equal([Supervisor.Key(repo, adopted)], step.After); // #7 is still queued as ordinary work: its dependents wait for it
+        Assert.Contains(step, repo.Items);
+        Assert.Equal("done", g2.Claim);
+        Assert.DoesNotContain(other, repo.Items); // a removed request of the goal is gone
+    }
+
+    [Fact]
+    public void EndingAGoalHoldsWhatWaitsOnItsRemovedRequest()
+    {
+        var (planned, step) = (I("w1"), I("w5"));
+        var repo = Repo(planned, step);
+        var (g1, g2) = (G(), new Goal { Id = "g2", Title = "Other" });
+        repo.Goals = [g1, g2];
+        var (k1, k2) = (Supervisor.Key(repo, g1), Supervisor.Key(repo, g2));
+        (planned.Goal, step.Goal, step.After) = (k1, k2, [Supervisor.Key(repo, planned)]);
+        Supervisor.UnplanEverywhere([repo], k1);
+        Assert.DoesNotContain(step, repo.Items); // a request cannot be held: it leaves too
+    }
+
+    [Fact]
     public void StateWrittenBeforeMergedExistedReadsTheNoteForIt()
     {
         var (merged, closed) = (I("w1", ItemState.Done, pr: 7), I("w2", ItemState.Done, pr: 8));

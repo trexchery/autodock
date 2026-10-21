@@ -902,7 +902,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var before = Lists();
         await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
         await Until(_ => Lists() > before, "the scan ran");
-        await Task.Delay(1500); // its judging of the queue follows the read
+        await Until(_ => !_sup!.Pumping, "the scan judged the queue"); // the read starts inside the pass that then judges
     }
 
     [Fact]
@@ -924,6 +924,31 @@ public sealed class AgentsEndToEndTests : IDisposable
         Issues($"[{Gh8.Replace("Blocked by #12.", "")}]"); // the owner closed #12
         await RescanAsync();
         Assert.Equal((ItemState.Queued, true), await On(r => (Item(r, 8).State, Item(r, 8).Goal != null)));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AClosedUnmergedPredecessorHoldsWhatWaitsOnIt()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.State, i.Pr, i.Merged, i.Worktree, i.Goal) = (ItemState.Done, 3, false, null, null); return 0; });
+        Issues($"[{Gh8}]"); // the owner closed #12 without its pull request merging
+        await RescanAsync();
+        Assert.Equal(ItemState.NeedsOwner, await On(r => Item(r, 8).State));
+        File.WriteAllText(_log + ".release", "");
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task APredecessorPrunedByTheScanHoldsWhatWaitsOnIt()
+    {
+        await AdoptTwelveAndEightAsync();
+        await _loop.Run(() => { var i = Item(_sup!.RepoFor(_repo)!, 12); (i.Goal, i.OwnRank, i.Rank, i.After) = (null, null, 0, []); return 0; }); // an ordinary find now
+        Issues($"[{Gh12.Replace("\"labels\":[]", "\"labels\":[{\"name\":\"on hold\"}]")},{Gh8}]");
+        await RescanAsync();
+        Assert.False(await On(r => r.Items.Any(i => i.Issue == 12)));
+        Assert.Equal(ItemState.NeedsOwner, await On(r => Item(r, 8).State));
         File.WriteAllText(_log + ".release", "");
         _sup!.Dispose();
     }

@@ -220,14 +220,14 @@ public sealed partial class Supervisor
     internal static List<IssueInfo> Takeable(RepoAgents repo, List<IssueInfo> issues, string me, HashSet<int> covered, HashSet<int> skip, HashSet<int>? only, IReadOnlySet<int>? sequenced)
     {
         var items = repo.Items.Where(i => i.State != ItemState.Done).Select(i => i.Issue).OfType<int>().ToHashSet();
-        var finished = repo.Items.Where(i => i.State == ItemState.Done).Select(i => i.Issue).OfType<int>().ToHashSet();
+        var finished = repo.Items.Where(i => i is { State: ItemState.Done } && !(i.Merged || i.Pr == null)).Select(i => i.Issue).OfType<int>().ToHashSet();
         var left = (sequenced ?? new HashSet<int>()).ToHashSet(); // a blocker the plan itself sequences is left to `after`: only while it is taken
         while (true)
         {
             var open = issues.Select(i => i.Number).ToHashSet();
             open.ExceptWith(left);
             var wanted = issues.Where(i => WantedBy(repo, i, me, open, covered, skip, only)).ToList();
-            // One not taken still blocks what waits on it, and so does a finished item's issue that is still open.
+            // One not taken still blocks what waits on it, and so does an unlanded finished item's issue that is still open (Ready counts a merged one as landed).
             if (left.RemoveWhere(n => finished.Contains(n) || !items.Contains(n) && wanted.All(w => w.Number != n)) == 0) return wanted;
         }
     }
@@ -525,12 +525,19 @@ public sealed partial class Supervisor
         (goal.State, goal.Note, goal.Claim, goal.Replan) = (state, why, null, false);
         if (state == GoalState.Achieved) (goal.Evidence, goal.AchievedAt) = (why, now);
         AddLog(goal, now, why);
-        var key = Key(repo, goal);
-        var left = new List<(RepoAgents, WorkItem)>();
-        var gone = _state.Repos.Sum(r => { var l = new List<WorkItem>(); var n = Unplan(r, key, r.Items, l); left.AddRange(l.Select(i => (r, i))); return n; });
-        foreach (var (r, i) in left) HoldDependents(_state.Repos, r, i, "which no longer serves its goal"); // what was planned on it must not start without it
+        var gone = UnplanEverywhere(_state.Repos, Key(repo, goal));
         Save();
         await StopWorkerAsync(goal, "owner");
+        return gone;
+    }
+
+    /// Stops the goal's unstarted work serving it. What was planned on a step that left must not start without it;
+    /// an adopted issue that stays queued keeps its dependents waiting (Ready), and the scan prunes it if it must go.
+    internal static int UnplanEverywhere(IReadOnlyList<RepoAgents> repos, string key)
+    {
+        var left = new List<(RepoAgents, WorkItem)>();
+        var gone = repos.Sum(r => { var l = new List<WorkItem>(); var n = Unplan(r, key, r.Items, l); left.AddRange(l.Select(i => (r, i))); return n; });
+        foreach (var (r, i) in left.Where(x => !x.Item1.Items.Contains(x.Item2))) HoldDependents(repos, r, i, "which no longer serves its goal");
         return gone;
     }
 

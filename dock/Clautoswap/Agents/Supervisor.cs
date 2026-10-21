@@ -321,7 +321,7 @@ public sealed partial class Supervisor : IDisposable
             // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest;
             // planned work waits for what it builds on.
             Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
-            while (!_disposed && !_launching && repo.Items.Count(i => i.State is ItemState.Working or ItemState.Checking) < cap)
+            while (!_disposed && !_launching && repo.LastScan != null && repo.Items.Count(i => i.State is ItemState.Working or ItemState.Checking) < cap) // not before a scan re-applied what an unplan stripped
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
@@ -711,6 +711,8 @@ public sealed partial class Supervisor : IDisposable
     /// An agents terminal opened for this folder, or linked up again after a restart.
     /// Settings changed: look for work again.
     public void Poke() => Pump();
+
+    internal bool Pumping => _pumping;
 
     public void Attach(string path)
     {
