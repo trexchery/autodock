@@ -1,11 +1,11 @@
-# clautoswap
+# handoff
 
 multi-account switcher for Claude Code, Codex, and Grok Build. live usage, reset timers, and one-click switching.
 
-**[download for Windows](https://github.com/trexchery/clautoswap/releases/latest)**
+**[download for Windows](https://github.com/trexchery/handoff/releases/latest)**
 
 <p align="center">
-  <img src="assets/clautoswap.png" width="420" alt="clautoswap tray dashboard listing Claude, Codex, and Grok Build accounts with 5-hour and weekly usage">
+  <img src="assets/handoff.png" width="420" alt="handoff tray dashboard listing Claude, Codex, and Grok Build accounts with 5-hour and weekly usage">
 </p>
 
 ## features
@@ -24,8 +24,8 @@ multi-account switcher for Claude Code, Codex, and Grok Build. live usage, reset
 
 **Windows 11 (64-bit)** and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) required. Codex and Grok Build optional.
 
-1. download `clautoswap-win-x64.zip` from the [latest release](https://github.com/trexchery/clautoswap/releases/latest).
-2. extract the zip and run `clautoswap\clautoswap.exe`.
+1. download `handoff-win-x64.zip` from the [latest release](https://github.com/trexchery/handoff/releases/latest).
+2. extract the zip and run `handoff\handoff.exe`.
 3. open the tray icon and use **+** to add accounts through official CLI sign-in.
 
 no installer or admin access required. unsigned releases may trigger Windows SmartScreen; a `.sha256` checksum is included with the download.
@@ -34,9 +34,9 @@ no installer or admin access required. unsigned releases may trigger Windows Sma
 
 - automatic switching is **off by default** and currently supports Claude accounts only.
 - switching updates the default CLI login. running Codex/Grok sessions need restarting to use the newly selected account; pinned Claude terminals remain on their assigned account.
-- Claude stops remote control when the signed-in account changes, and clautoswap never reconnects or types into a running session. pinned terminals keep their account, so their remote control is unaffected.
-- **continue in...** notes are built locally and clautoswap sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
-- saved credentials are encrypted locally with Windows DPAPI. a pinned Claude terminal holds a plaintext login only while it's open; clautoswap moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
+- Claude stops remote control when the signed-in account changes, and handoff never reconnects or types into a running session. pinned terminals keep their account, so their remote control is unaffected.
+- **continue in...** notes are built locally and handoff sends nothing, but the new agent sends them to its provider like any prompt. notes are deleted after 7 days.
+- saved credentials are encrypted locally with Windows DPAPI. a pinned Claude terminal holds a plaintext login only while it's open; handoff moves it back into the encrypted store when it closes. no telemetry, cloud sync, or browser-cookie access. [security policy](SECURITY.md).
 - Grok Build support has only been tested with synthetic data so far.
 - auto-prime is off by default and never sends on a schedule: each prime is one click of yours. that click doesn't make it allowed: Anthropic's consumer terms (§3) restrict automated or scripted access to a subscription, so whether to use it is your call. it skips excluded, API-key and paid-extra-usage accounts and any near a weekly or model limit, which makes a charge unlikely but can't rule one out. when it can't tell whether a prime went out, or can't record one, it stops rather than send again.
 
@@ -45,9 +45,9 @@ no installer or admin access required. unsigned releases may trigger Windows Sma
 requires [uv](https://docs.astral.sh/uv/), the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0), and PowerShell 7.
 
 ```powershell
-git clone https://github.com/trexchery/clautoswap.git
-cd clautoswap
+git clone https://github.com/trexchery/handoff.git
+cd handoff
 pwsh dock\build.ps1
 ```
 
-built on [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol. clautoswap additions by trexchery. [MIT license](LICENSE). independent project, not affiliated with Anthropic, OpenAI, or xAI; provider terms apply.
+built on [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol. handoff additions by trexchery. [MIT license](LICENSE). independent project, not affiliated with Anthropic, OpenAI, or xAI; provider terms apply.

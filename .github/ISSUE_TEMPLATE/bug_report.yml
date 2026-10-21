@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in clautoswap isn't working right
+description: Something in handoff isn't working right
 labels: [bug]
 body:
   - type: markdown
@@ -20,13 +20,13 @@ body:
   - type: input
     id: version
     attributes:
-      label: clautoswap version and Windows version
-      placeholder: clautoswap 0.1.0, Windows 11 24H2
+      label: handoff version and Windows version
+      placeholder: handoff 0.1.0, Windows 11 24H2
     validations:
       required: true
   - type: textarea
     id: log
     attributes:
       label: Log
-      description: Contents of `%LOCALAPPDATA%\clautoswap\clautoswap.log`, if it exists (it is already redacted).
+      description: Contents of `%LOCALAPPDATA%\handoff\handoff.log`, if it exists (it is already redacted).
       render: text
