@@ -66,6 +66,16 @@ public static class Launch
         return [.. a];
     }
 
+    /// The general agent: not tied to any repo, one fixed folder, on the active Claude account so auto-switch
+    /// keeps it on one with room (else the account with the most room; null: let the engine pick).
+    public static int? GeneralAccount(IEnumerable<Account> accounts)
+    {
+        var claude = accounts.Where(a => a.Provider == "claude" && !a.Disabled).ToList();
+        return (claude.FirstOrDefault(a => a.Active) ?? claude.OrderBy(Format.Peak).FirstOrDefault())?.Number;
+    }
+
+    public static string GeneralFolder => Path.Combine(StoreSecurity.UserProfile, "clautoswap-general");
+
     /// Continue-in Claude: through `cswap run` when an account is known, else null (launch claude directly).
     /// A folder-mapped account is left to the engine (no NUM); otherwise the active account is named.
     public static string[]? Continue(Account? mapped, Account? active, bool restoreRc, string prompt) =>
