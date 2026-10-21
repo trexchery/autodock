@@ -6,7 +6,7 @@ public sealed partial class TrayApp : ApplicationContext
     readonly DockSettings _settings = DockSettings.Load();
     readonly NotifyIcon _tray;
     readonly DashboardForm _dash = new();
-    readonly System.Windows.Forms.Timer _timer = new();
+    readonly System.Windows.Forms.Timer _timer = new(), _watch = new();
     readonly ContextMenuStrip _menu = new();
     Snapshot? _snap;
     string? _error;
@@ -14,21 +14,37 @@ public sealed partial class TrayApp : ApplicationContext
     readonly Dictionary<string, (Snapshot? Snap, string? Error)> _others = [];
     bool _busy;
     bool? _pending; // a request made during a busy pass: null none, else whether it forces a refresh
+    bool _pendingAuto; // whether a request made during a busy pass wants the auto-switch and reopen steps too
     DateTime _dashHiddenAt;
     DateTimeOffset? _lastExhaustedNotice;
     string? _lastBlockedNotice;
-    readonly Dictionary<string, DateTime> _resumed = ResumeStopped.LoadMoves(MovesPath); // session id → when it was last reopened
+    readonly Dictionary<string, DateTime> _resumed = ResumeStopped.LoadMoves(MovesPath); // "session id#account" → when it was last reopened there
+    readonly HashSet<string> _told = [], _reported = [], _skipped = []; // busy windows at a limit named in a balloon, limits handed to the engine, skips logged
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, Limit> _agentLimits = []; // session id → a limit error seen in its subagent/workflow files
+    readonly LimitWatch _limitWatch;
+    readonly LimitSwitch _limits;
+    readonly SynchronizationContext _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+    readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
+    bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
-    const int AutoSeconds = 90;
+    const int AutoSeconds = 30;
+    /// The poll under the file watchers: live windows' transcripts are read from where they were last read, and a nudge
+    /// that had to wait is tried again. Local only, no engine call.
+    const int WatchMs = 2000;
+    /// A window stopped at a limit is moved only after this much keyboard quiet anywhere, so nobody is closed mid-keystroke.
+    static readonly TimeSpan TypingPause = TimeSpan.FromSeconds(5);
     int TimerMs => (_settings.AutoSwitch ? Math.Min(_settings.RefreshSeconds, AutoSeconds) : _settings.RefreshSeconds) * 1000;
     QuotaAlerts _quota = new();
 
     public TrayApp(Engine engine, bool minimized)
     {
         _engine = engine;
+        _limits = new(() => _snap, ResumeStopped.DefaultLogin, () => LiveOrLaunching(),
+            _engine.ImportUsageAsync, _engine.SwitchNowAsync, _reported, Program.Log, threshold: () => _engineThreshold ?? 97);
+        _limitWatch = new(hit => _ui.Post(_ => _ = OnLimitAsync(hit), null), Program.Log);
         _tray = new NotifyIcon { Icon = TrayIcons.App, Text = "clautoswap", Visible = true, ContextMenuStrip = _menu };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleDashboard(); };
         _menu.Opening += (_, _) => BuildMenu();
@@ -51,6 +67,9 @@ public sealed partial class TrayApp : ApplicationContext
         _timer.Interval = TimerMs;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
         _timer.Start();
+        _watch.Interval = WatchMs;
+        _watch.Tick += (_, _) => _ = WatchAsync();
+        _watch.Start();
         _ = TickAsync(runAuto: true);
         if (_settings.Pinned)
         {
@@ -99,6 +118,7 @@ public sealed partial class TrayApp : ApplicationContext
         if (_busy)
         {
             _pending = refresh || _pending == true; // one re-run right after the current pass
+            _pendingAuto |= runAuto;
             return;
         }
         _busy = true;
@@ -106,7 +126,11 @@ public sealed partial class TrayApp : ApplicationContext
         var fresh = new List<(string Provider, Snapshot Snap)>(); // this pass's readings only; a failed poll never feeds the quota alerts
         try
         {
-            if (runAuto && _settings.AutoSwitch) await AutoTickAsync();
+            if (runAuto && _settings.AutoSwitch)
+            {
+                await ReportLimitsAsync(); // the engine learns of a limit the API just gave before it decides
+                await AutoTickAsync();
+            }
             var reread = _settings.AutoPrime && Prime.WantsReread(DateTimeOffset.Now);
             _snap = await _engine.ListAsync(refresh || reread);
             if (reread) Prime.Reread(DateTimeOffset.Now); // spent only on a reading that came back
@@ -143,9 +167,96 @@ public sealed partial class TrayApp : ApplicationContext
         if (_dash.Visible) RenderDash();
         if (_pending is { } again)
         {
-            _pending = null;
-            _ = TickAsync(runAuto: false, refresh: again);
+            var auto = _pendingAuto;
+            (_pending, _pendingAuto) = (null, false);
+            _ = TickAsync(runAuto: auto, refresh: again);
         }
+    }
+
+    /// The live login, as listed; a default-login stop is charged to it only while the engine's record agrees (an in-app /login, or a switch not listed yet, parts them).
+    /// Accounts with a `cswap run` window, and those a window was just reopened on (its marker appears a few seconds later).
+    HashSet<int> LiveOrLaunching()
+    {
+        var live = ResumeStopped.LiveProfiles(ResumeStopped.ConfigDirs(null));
+        foreach (var m in _resumed) // the UI thread's, as is every writer of it
+            if (DateTime.UtcNow - m.Value < TimeSpan.FromSeconds(30) && int.TryParse(m.Key[(m.Key.LastIndexOf('#') + 1)..], out var n)) live.Add(n);
+        return live;
+    }
+
+    List<StoppedSession> ScanStops(Snapshot? snap, bool includeBusy = false)
+    {
+        var (recorded, changed) = ResumeStopped.DefaultLogin();
+        var live = snap?.ActiveAccountNumber;
+        return ResumeStopped.Scan(ResumeStopped.ConfigDirs(live), DateTime.UtcNow, recorded == live ? changed : DateTime.MaxValue, includeBusy, _agentLimits);
+    }
+
+    /// The net under the file watchers, every couple of seconds: watchers are (re)started, live windows' files are read from
+    /// where they were last read (a missed event, or an overflow, costs nothing), and a nudge that had to wait is retried.
+    async Task WatchAsync()
+    {
+        if (_watching || !_settings.AutoSwitch) return;
+        _watching = true;
+        try
+        {
+            await Task.Run(() =>
+            {
+                var dirs = ResumeStopped.ConfigDirs(null);
+                _limitWatch.Sync(dirs.Select(d => d.Dir));
+                _limitWatch.Poll(ResumeStopped.LiveTranscripts(dirs, DateTime.UtcNow));
+            });
+            if (_retry && _snap != null) await ResumeStoppedAsync(_snap);
+        }
+        catch (Exception e) { Program.Log(e); }
+        finally { _watching = false; }
+    }
+
+    /// A usage-limit error was just written (any window, subagent or workflow agent): the default login leaves the refused
+    /// account within a second or two, from the latest reading, then windows stopped at the limit are reopened. Nothing
+    /// waits for a refresh, a tray pass or a quiet spell.
+    async Task OnLimitAsync(LimitHit hit)
+    {
+        if (!_settings.AutoSwitch) return;
+        try
+        {
+            // A hit in a subagent or workflow file stops its window too: mark the session for the move pass.
+            if (ResumeStopped.AgentSession(hit.ConfigDir, hit.File) is { } agentOf) _agentLimits[agentOf] = hit.Limit;
+            if (_snap == null) { _ = TickAsync(runAuto: true); return; } // no reading yet: the tray pass lists, then looks at the windows
+            var o = await _limits.OnLimitAsync(hit); // null: seen before; the windows are still looked at
+            if (o?.Switched is { Switched: true } sw)
+            {
+                _lastBlockedNotice = null;
+                Notify("", Format.SwitchNotice(sw.From, sw.To), ToolTipIcon.None);
+                // The list is re-read at the next pass; until then the reopened windows must see where the default login is.
+                if (_snap is { } s && sw.To?.Number is { } to)
+                    _snap = s with { ActiveAccountNumber = to, Accounts = [.. s.Accounts.Select(a => a with { Active = a.Number == to })] };
+            }
+            else if (o is { NoRoom: true } && o.Earliest != _lastExhaustedNotice)
+            {
+                _lastExhaustedNotice = o.Earliest;
+                Notify("All accounts near their limits", o.Earliest is { } t ? $"Earliest reset {Format.When(t, DateTimeOffset.Now)}." : "No reset time known.", ToolTipIcon.Warning);
+            }
+            else if (o?.Error != null)
+            {
+                Notify("Auto-switch can't move the default login", o!.Error, ToolTipIcon.Warning);
+                _ = TickAsync(runAuto: true); // the engine's own check, with its usage fetch
+            }
+            if (_snap != null) await ResumeStoppedAsync(_snap);
+        }
+        catch (Exception e) { Program.Log(e); _ = TickAsync(runAuto: true); }
+    }
+
+    /// Hands the engine the limits the API gave stopped windows (`cswap import-usage -`), so its next check sees the
+    /// account full and switches at once instead of waiting for its own usage reading.
+    async Task ReportLimitsAsync()
+    {
+        if (_snap == null) return;
+        try
+        {
+            var stops = await Task.Run(() => ScanStops(_snap));
+            if (ResumeStopped.LimitReport(stops, _snap.Accounts, DateTimeOffset.UtcNow, _reported) is { } doc)
+                await _engine.CommandWithInputAsync(doc, "import-usage", "-");
+        }
+        catch (Exception e) when (e is EngineException or IOException) { Program.Log(e); }
     }
 
     async Task PollProvidersAsync(bool refresh, List<(string Provider, Snapshot Snap)> fresh)
@@ -218,43 +329,128 @@ public sealed partial class TrayApp : ApplicationContext
     /// switch threshold once their turn is done (see ResumeStopped), onto an account with room.
     async Task ResumeStoppedAsync(Snapshot snap)
     {
+        await _movePass.WaitAsync();
+        // The caller's snapshot may predate a switch made while this pass waited: a reopened window must see where the default login is now.
+        try { await MovePassAsync(_snap ?? snap); }
+        finally { _movePass.Release(); }
+    }
+
+    async Task MovePassAsync(Snapshot snap)
+    {
         List<StoppedSession> stopped;
-        try { stopped = await Task.Run(() => ResumeStopped.Scan(ResumeStopped.ConfigDirs(snap.ActiveAccountNumber), DateTime.UtcNow)); }
+        try { stopped = await Task.Run(() => ScanStops(snap, includeBusy: true)); }
         catch (Exception e) { Program.Log(e); return; }
         if (stopped.Count > 0 && _engineThreshold == null) await ReadEngineThresholdAsync();
         var (threshold, hysteresis) = (_engineThreshold ?? 90, _engineHysteresis ?? 10);
-        var resumed = new List<string>();
-        var moved = new List<string>();
+        var now = DateTimeOffset.UtcNow;
+        var load = new Dictionary<int, int>();
+        var plan = new List<(StoppedSession S, Account To, string Dir)>();
+        var left = new List<string>();
+        var retry = false;
         foreach (var s in stopped)
         {
+            // Busy, in a shell or waiting: never closed, its background work would die. Its process refuses every request until the
+            // reset, whatever the login is now, so it is reopened once it is idle (the poll looks again).
+            if (!s.Idle)
+            {
+                if (s.AtLimit && s.Status != "waiting" && _told.Add($"{s.SessionId}@{s.Limit?.At.Ticks}"))
+                {
+                    left.Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} (#{s.Account})");
+                    Program.Log($"nudge {s.SessionId} left {s.Status}");
+                }
+                retry |= s.AtLimit;
+                continue;
+            }
             // The default login switches account in place; only a stop at the limit reopens its windows.
             // A finished turn waits until nobody is at the keyboard, so a prompt being typed is never closed.
             if (!s.AtLimit && (s.ConfigDir == ResumeStopped.DefaultDir || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60))) continue;
-            // One try per session per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
-            if (_resumed.TryGetValue(s.SessionId, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10)) continue;
-            if (ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis) is not { } target) continue;
-            if (!ResumeStopped.Unchanged(s)) continue; // someone typed, or a turn started, since the scan
-            var account = snap.Accounts.First(a => a.Number == target);
-            var dir = account.Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(target)!;
-            _resumed[s.SessionId] = DateTime.UtcNow;
-            try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
-            try
+            if (s.AtLimit && ResumeStopped.UserIdle() < TypingPause) { retry = true; continue; } // mid-keystroke somewhere: the next poll
+            if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
+            if (ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil) is not { } target)
             {
-                // Copied before the window closes (a failed copy leaves it untouched), then again after claude
-                // exits so nothing it writes on the way out is left behind.
-                await Task.Run(() => ResumeStopped.CopyTranscript(s, dir));
-                await ResumeStopped.CloseAsync(s.Pid);
-                try { await Task.Run(() => ResumeStopped.CopyTranscript(s, dir)); } catch (Exception e) { Program.Log(e); }
-                _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
-                    Launch.Run(target, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, target != s.Account)));
-                (s.AtLimit ? resumed : moved).Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{target}");
+                if (s.AtLimit) Skip(s, "no account has room"); // a finished turn below the threshold is just fine
+                continue;
             }
-            catch (Exception e) { Program.Log(e); Error("Could not reopen a stopped window", e); }
+            // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
+            var key = $"{s.SessionId}#{target}";
+            if (_resumed.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10))
+            {
+                Skip(s, $"reopened on #{target} under ten minutes ago");
+                continue;
+            }
+            if (ResumeStopped.MovesInLastHour(_resumed, s.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour)
+            {
+                if (Skip(s, $"moved {ResumeStopped.MovesPerHour} times in the last hour"))
+                    Notify("A window keeps stopping at limits", $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} was moved {ResumeStopped.MovesPerHour} times in the last hour and stays put.", ToolTipIcon.Warning);
+                continue;
+            }
+            if (!ResumeStopped.Unchanged(s)) { retry |= s.AtLimit; continue; } // someone typed, or a turn started, since the scan
+            var account = snap.Accounts.First(a => a.Number == target);
+            _resumed[key] = DateTime.UtcNow;
+            load[target] = load.GetValueOrDefault(target) + 1;
+            plan.Add((s, account, account.Active ? ResumeStopped.DefaultDir : ResumeStopped.ProfileDir(target)!));
         }
+        _retry = retry;
+        if (left.Count > 0)
+            Notify("Left running at a limit", $"{string.Join(", ", left)}: busy, so not closed. They cannot carry on until reopened: each is reopened on an account with room once it is idle (or close it yourself and resume).");
+        if (plan.Count == 0) return;
+        try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
+        var done = await Task.WhenAll(plan.Select(m => MoveAsync(m.S, m.To, m.Dir))); // windows are independent
+        var changed = false;
+        foreach (var (m, d) in plan.Zip(done))
+        {
+            if (d == null) changed |= _resumed.Remove($"{m.S.SessionId}#{m.To.Number}"); // not tried after all: no lockout
+            else { _agentLimits.TryRemove(m.S.SessionId, out _); _resumed[ResumeStopped.MoveStamp(m.S.SessionId, DateTime.UtcNow)] = DateTime.UtcNow; changed = true; } // one per move, for the cap per hour
+        }
+        if (changed) try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
+        var resumed = done.Where(d => d is { AtLimit: true }).Select(d => d!.Value.Label).ToList();
+        var moved = done.Where(d => d is { AtLimit: false }).Select(d => d!.Value.Label).ToList();
         if (resumed.Count > 0)
             Notify(resumed.Count == 1 ? "Reopened a window stopped at a limit" : $"Reopened {resumed.Count} windows stopped at a limit", string.Join(", ", resumed));
         if (moved.Count > 0)
             Notify(moved.Count == 1 ? "Moved a window before its limit" : $"Moved {moved.Count} windows before their limit", string.Join(", ", moved));
+    }
+
+    async Task<(bool AtLimit, string Label)?> MoveAsync(StoppedSession s, Account account, string dir)
+    {
+        try
+        {
+            // Copied before the window closes (a failed copy leaves it untouched), then again after claude
+            // exits so nothing it writes on the way out is left behind.
+            // The default login can change hands before `cswap run` looks (the engine, a limit hit), and it then runs in ~/.claude
+            // instead of the profile: the transcript is put where either would look.
+            string[] dirs = [.. new[] { dir, ResumeStopped.DefaultDir, ResumeStopped.ProfileDir(account.Number) }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase)];
+            // The copies carry the old errors again: remembered, they are not news, while a new refusal written there still is.
+            if (s.Limit is { } old) _limitWatch.Remember(old.At);
+            if (_agentLimits.TryGetValue(s.SessionId, out var sub)) _limitWatch.Remember(sub.At);
+            void Copy()
+            {
+                foreach (var d in dirs)
+                {
+                    ResumeStopped.CopyTranscript(s, d);
+                }
+            }
+            await Task.Run(Copy);
+            // The copy can take long: someone may have typed, or the window closed, meanwhile.
+            if (!ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < (s.AtLimit ? TypingPause : TimeSpan.FromSeconds(60))) return null;
+            await ResumeStopped.CloseAsync(s.Pid);
+            try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); }
+            _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
+            _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
+                Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, ResumeStopped.Moved(s, account.Number))));
+            Program.Log($"moved {s.SessionId} #{s.Account} to #{account.Number}");
+            Program.Log($"nudge {s.SessionId} relaunched on #{account.Number}");
+            return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
+        }
+        catch (Exception e) { Program.Log(e); Error("Could not reopen a stopped window", e); return null; }
+    }
+
+    /// Why a stopped window was left alone, logged once per session and reason.
+    bool Skip(StoppedSession s, string reason)
+    {
+        if (!_skipped.Add($"{s.SessionId} {reason}")) return false;
+        Program.Log($"left {s.SessionId} (#{s.Account}) stopped: {reason}");
+        return true;
     }
 
     static string MovesPath => Path.Combine(DockSettings.Dir, "resumed.json");
@@ -650,6 +846,8 @@ public sealed partial class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _watch.Stop();
+        _limitWatch.Dispose();
         _link?.Dispose();
         _agents?.Dispose(); // workers keep running; the next start re-attaches them, or stops them without their terminal
         _tray.Visible = false;

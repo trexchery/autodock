@@ -2207,3 +2207,45 @@ class TestImportUsage:
                 s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
             )
         assert not s._usage_store.path.exists()
+
+
+class TestImportedLimit:
+    def test_imported_limit_triggers_at_limit_without_fetch(self, temp_home: Path):
+        """The tray's contract: a limit error the API already gave is handed over as a 100% reading
+        (`cswap import-usage -`), so the active account switches at once, with no usage fetch for it."""
+        from claude_swap import oauth
+        from claude_swap.autoswitch import SwitchEvent, TickOutcome
+        from claude_swap.transfer import import_usage
+
+        from .test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=4_102_444_800_000)
+        h.seed(2, "b@example.com", expires_at=4_102_444_800_000)
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        def hand_over(pct: float) -> None:
+            row = _usage_row("b@example.com", pct=pct, age_s=0.0)
+            row["usage"]["fiveHour"]["resetsAt"] = "2099-01-01T00:00:00Z"
+            doc = io.StringIO(_usage_document(row))
+            with patch.object(sys, "stdin", doc):
+                import_usage(h.switcher, "-")
+
+        hand_over(80.0)  # fresh and below the threshold
+        h.clock.advance(5)
+        hand_over(100.0)  # the limit error, newer
+
+        def fetch(num, email, creds, **kwargs):
+            assert email != "b@example.com", "the refused account must not be fetched"
+            return oauth.UsageOutcome({"five_hour": {"pct": 10.0}, "seven_day": {"pct": 0.0}})
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fetch):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert h.active_number() == 1

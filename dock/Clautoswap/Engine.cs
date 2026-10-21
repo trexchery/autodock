@@ -40,9 +40,9 @@ public sealed partial class Engine(string exe)
 
     /// `unset`: variables the child must not inherit; `workDir`: instead of the user's profile folder.
     public async Task<EngineResult> RunAsync(IEnumerable<string> args, TimeSpan? timeout = null, string? input = null, CancellationToken ct = default,
-        IEnumerable<string>? unset = null, string? workDir = null)
+        IEnumerable<string>? unset = null, string? workDir = null, bool gated = true)
     {
-        await _gate.WaitAsync(ct);
+        if (gated) await _gate.WaitAsync(ct);
         try
         {
             var psi = new ProcessStartInfo(Exe)
@@ -80,12 +80,12 @@ public sealed partial class Engine(string exe)
             }
             return new EngineResult(p.ExitCode, await stdout, Redact(await stderr));
         }
-        finally { _gate.Release(); }
+        finally { if (gated) _gate.Release(); }
     }
 
-    async Task<T> RunJsonAsync<T>(params string[] args)
+    async Task<T> RunJsonAsync<T>(string[] args, bool gated = true)
     {
-        var r = await RunAsync(args);
+        var r = await RunAsync(args, gated: gated);
         var err = Json.TryError(r.Stdout);
         if (err != null) throw new EngineException(Redact(err.Message ?? err.Type ?? "engine error"));
         if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.Stdout))
@@ -104,9 +104,20 @@ public sealed partial class Engine(string exe)
     public Task<SwitchResult> SwitchAsync(int number, string provider = "claude") =>
         RunJsonAsync<SwitchResult>(Args(provider, ["switch", number.ToString(), "--json"]));
 
+    /// The two calls a usage-limit error makes, not queued behind the gate (an `auto --once` can hold it for ~30 s). Safe:
+    /// the engine serializes what it mutates itself, as it must for several terminals (the store's FileLock, Claude Code's
+    /// credential lock; `import-usage` under the usage store's), so only the call order is ours.
+    public Task<SwitchResult> SwitchNowAsync(int number) => RunJsonAsync<SwitchResult>(["switch", number.ToString(), "--json"], gated: false);
+
+    public async Task ImportUsageAsync(string document)
+    {
+        var r = await RunAsync(["import-usage", "-"], TimeSpan.FromSeconds(30), document, gated: false);
+        if (r.ExitCode != 0) throw new EngineException(LastLine(r.Stderr) ?? $"engine exited {r.ExitCode}");
+    }
+
     /// Writes local hand-off notes from `source`'s newest session in `folder`; returns their path.
     public Task<HandoffResult> HandoffAsync(string source, string folder) =>
-        RunJsonAsync<HandoffResult>("handoff", "--from", source, "--dir", folder, "--json");
+        RunJsonAsync<HandoffResult>(["handoff", "--from", source, "--dir", folder, "--json"]);
 
     /// `cswap codex …` / `cswap grok …` route to the provider engines; Claude is the bare CLI.
     internal static string[] Args(string provider, params string[] args) =>

@@ -2,18 +2,29 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Clautoswap;
 
 /// A Claude Code window waiting for someone to type: stopped on a usage-limit error (`AtLimit`), or done
 /// with its turn. `Record` and `Seen` (the transcript's write time) let the move check nothing changed since.
+/// `Limit` is the error as recorded; `OwnRefused`: the API refused the window's own account (not one it was
+/// only labelled with after a switch). `Status` is the record's: only an `idle` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
-    bool AtLimit = true, string? Record = null, DateTime Seen = default);
+    bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle")
+{
+    public bool Idle => Status == "idle";
+}
+
+/// A usage-limit stop as Claude Code recorded it: the window that ran out ("five_hour", "seven_day", ...), when it
+/// resets, and when the stop happened. Default fields: an older error without the details.
+public sealed record Limit(string? Window, DateTimeOffset? ResetsAt, DateTimeOffset At);
 
 /// With auto-switch on: windows stopped at a limit are reopened (`claude --resume`) on an account with
 /// room, the default login's own when it has some again, so their work carries on unattended. A `cswap run`
 /// window whose account is at the switch threshold is moved the same way once its turn is done, before the
-/// limit stops it. (The default login needs no move: the engine switches its account in place.)
+/// limit stops it. (A default-login window before its limit needs no move: the engine switches its account in place. One
+/// already stopped does: its process keeps refusing until the reset, so it is reopened like the rest.)
 /// Only an idle session, quiet a while, is touched: nothing that is working, or that someone has typed
 /// into since, is ever stopped.
 public static class ResumeStopped
@@ -21,6 +32,10 @@ public static class ResumeStopped
     /// A reading at or above this is no room: the engine's own at-limit line.
     public const double Full = 99;
     static readonly TimeSpan Quiet = TimeSpan.FromSeconds(20);
+    /// What a window already sent to an account this pass costs that account's room, so one pass spreads stopped windows.
+    public const double PerWindow = 10;
+    /// A window moved this often within an hour is left where it is: it keeps stopping, and reopening it again won't help.
+    public const int MovesPerHour = 3;
     public static string Prompt(bool moved) =>
         "This session stopped at a usage limit and clautoswap reopened it" + (moved ? " on another account" : " now that the limit has reset") +
         ". Continue exactly where you left off.";
@@ -29,6 +44,10 @@ public static class ResumeStopped
     /// just waits for its user again.
     public static string[] ResumeArgs(StoppedSession s, bool moved) =>
         s.AtLimit ? ["--resume", s.SessionId, Prompt(moved)] : ["--resume", s.SessionId];
+
+    /// Whether the reopened window is on another account than the one that refused it. A default-login stop from
+    /// before a switch is: its label already names the new default, but the account that said no was the old one.
+    public static bool Moved(StoppedSession s, int target) => target != s.Account || s.AtLimit && !s.OwnRefused;
 
     public static string DefaultDir => Path.Combine(StoreSecurity.UserProfile, ".claude");
     static string ProfilesDir => Path.Combine(StoreSecurity.BackupRoot, "sessions");
@@ -47,9 +66,32 @@ public static class ResumeStopped
         return dirs;
     }
 
-    public static List<StoppedSession> Scan(IEnumerable<(string Dir, int? Account)> dirs, DateTime nowUtc)
+    /// The default login's account and when the engine last wrote `sequence.json` (it does on every switch). Read
+    /// errors: `(null, MaxValue)`, so nothing is attributed.
+    public static (int? Account, DateTime ChangedAt) DefaultLogin()
+    {
+        try
+        {
+            var path = Path.Combine(StoreSecurity.BackupRoot, "sequence.json");
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var n = doc.RootElement.TryGetProperty("activeAccountNumber", out var a) && a.ValueKind == JsonValueKind.Number && a.TryGetInt32(out var v) ? v : (int?)null; // null until the first switch
+            return (n, File.GetLastWriteTimeUtc(path));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return (null, DateTime.MaxValue); }
+    }
+
+    /// A stop in a profile is always that profile's account; one in `~/.claude` belongs to today's default login
+    /// only if it landed well after the last switch: a refusal just after one can still be the old login's (a
+    /// request in flight, or one sent before Claude Code reread the login). Subtraction, as `defaultSince` can be MaxValue.
+    public static bool OwnStop(bool defaultDir, DateTimeOffset at, DateTime defaultSince) => !defaultDir || at.UtcDateTime - defaultSince >= TimeSpan.FromSeconds(30);
+
+    /// `includeBusy`: also windows stopped at a limit that are busy, in a shell or waiting (never moved: they are only told about).
+    /// `agentLimits`: session id → a limit error seen in that session's subagent or workflow files.
+    public static List<StoppedSession> Scan(IEnumerable<(string Dir, int? Account)> dirs, DateTime nowUtc, DateTime? defaultLoginChanged = null, bool includeBusy = false,
+        IReadOnlyDictionary<string, Limit>? agentLimits = null)
     {
         var found = new List<StoppedSession>();
+        var defaultSince = defaultLoginChanged ?? DefaultLogin().ChangedAt;
         foreach (var (dir, account) in dirs)
         {
             string[] records;
@@ -61,16 +103,26 @@ public static class ResumeStopped
                 {
                     using var doc = JsonDocument.Parse(File.ReadAllText(rec));
                     var r = doc.RootElement;
-                    if (Str(r, "status") != "idle" || Str(r, "kind") is { } k && k != "interactive") continue;
+                    // Only idle: "shell" (idle with a background command running) would orphan that command if moved.
+                    var status = Str(r, "status") ?? "";
+                    if (status != "idle" && !includeBusy || Str(r, "kind") is { } k && k != "interactive") continue;
                     if (Str(r, "sessionId") is not { } id || Str(r, "cwd") is not { } cwd || !r.TryGetProperty("pid", out var pidEl)) continue;
                     var pid = pidEl.GetInt32();
-                    if (!IsLiveClaude(pid, Str(r, "procStart"))) continue;
-                    if (TranscriptOf(dir, id) is not { } t) continue;
+                    var stamp = Str(r, "procStart");
+                    if (!IsLiveClaude(pid, stamp)) continue;
+                    var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : DateTime.MinValue;
+                    if (TranscriptOf(dir, id, cwd) is not { } t) continue;
                     var seen = File.GetLastWriteTimeUtc(t);
-                    if (nowUtc - seen < Quiet) continue;
                     var tail = Tail(t).ToList();
-                    if (EndsAtLimit(tail) || EndsTurn(tail))
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, EndsAtLimit(tail), rec, seen));
+                    // A limit hit only in a subagent or workflow file stops the process just the same.
+                    // A prompt typed after the error does not clear it: the process refuses every request until the reset, so while the reset is ahead and no reply followed, it is still stopped.
+                    var limit = LimitOf(tail) ?? (LimitOf(tail, sticky: true) is { ResetsAt: { } until } held && until.UtcDateTime > nowUtc ? held : null) ?? agentLimits?.GetValueOrDefault(id);
+                    // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
+                    // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
+                    if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status));
+                    else if (status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
@@ -79,7 +131,11 @@ public static class ResumeStopped
     }
 
     /// Whether the conversation's last message is Claude Code's own usage-limit error.
-    public static bool EndsAtLimit(IEnumerable<string> lines)
+    public static bool EndsAtLimit(IEnumerable<string> lines) => LimitOf(lines) != null;
+
+    /// The usage-limit error the conversation ends with, or null. A look at the limit (/usage, /status) typed after it doesn't hide it; any other command does.
+    /// `sticky`: a typed prompt after it doesn't hide it either (the stopped process refuses it locally), only a reply does.
+    public static Limit? LimitOf(IEnumerable<string> lines, bool sticky = false)
     {
         foreach (var line in lines.Reverse())
         {
@@ -88,15 +144,23 @@ public static class ResumeStopped
                 using var doc = JsonDocument.Parse(line);
                 var r = doc.RootElement;
                 var type = Str(r, "type");
-                if (type is not ("assistant" or "user")) continue;
-                if (type == "user" || !r.TryGetProperty("isApiErrorMessage", out var err) || err.ValueKind != JsonValueKind.True) return false;
+                if (type is not ("assistant" or "user") || type == "user" && (IsLook(r) || IsNotice(r) || sticky && !IsCommand(r))) continue;
+                if (type == "user" || !r.TryGetProperty("isApiErrorMessage", out var err) || err.ValueKind != JsonValueKind.True) return null;
+                JsonElement info = default;
+                var refused = r.TryGetProperty("apiErrorParams", out var p) && p.ValueKind == JsonValueKind.Object
+                    && p.TryGetProperty("rate_limit_info", out info) && info.ValueKind == JsonValueKind.Object;
                 var text = r.TryGetProperty("message", out var m) ? m.ToString() : "";
-                return text.Contains("limit", StringComparison.OrdinalIgnoreCase)
-                    && (text.Contains("hit your", StringComparison.OrdinalIgnoreCase) || text.Contains("usage", StringComparison.OrdinalIgnoreCase));
+                if (Str(r, "apiError") != "usage_limit_reached" && !(refused && Str(info, "status") == "rejected")
+                    && !(text.Contains("limit", StringComparison.OrdinalIgnoreCase)
+                        && (text.Contains("hit your", StringComparison.OrdinalIgnoreCase) || text.Contains("usage", StringComparison.OrdinalIgnoreCase)))) return null;
+                var resets = refused && info.TryGetProperty("resetsAt", out var ra) && ra.ValueKind == JsonValueKind.Number && ra.TryGetInt64(out var unix)
+                    ? DateTimeOffset.FromUnixTimeSeconds(unix) : (DateTimeOffset?)null;
+                var at = r.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String && ts.TryGetDateTimeOffset(out var t) ? t : default;
+                return new Limit(refused ? Str(info, "rateLimitType") : null, resets, at);
             }
-            catch (JsonException) { } // a line cut by the tail window, or one being written
+            catch (Exception e) when (e is JsonException or ArgumentOutOfRangeException) { } // a line cut by the tail window, or one being written
         }
-        return false;
+        return null;
     }
 
     /// Whether the conversation's last message is Claude's own finished reply: no tool call left open, no
@@ -129,6 +193,20 @@ public static class ResumeStopped
         || r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text
            && (text.StartsWith("<command-name>") || text.StartsWith("<local-command-"));
 
+    /// A user line nobody typed: a background task's notification and the like carry an origin other than "human".
+    static bool IsNotice(JsonElement r) =>
+        r.TryGetProperty("origin", out var o) && o.ValueKind == JsonValueKind.Object && Str(o, "kind") is { } kind && kind != "human";
+
+    /// A slash command the user ran (/model, /login): unlike a typed prompt, it changes the window, so even a sticky limit gives way to it.
+    static bool IsCommand(JsonElement r) =>
+        r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text && text.StartsWith("<command-name>/");
+
+    /// A user line that only looks at the limit: a /usage or /status command, or local command output. Nothing else (/model, /compact) is.
+    static bool IsLook(JsonElement r) =>
+        r.TryGetProperty("isMeta", out var meta) && meta.ValueKind == JsonValueKind.True
+        || r.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.Object && Str(m, "content") is { } text
+           && (text.StartsWith("<command-name>/usage<") || text.StartsWith("<command-name>/status<") || text.StartsWith("<local-command-"));
+
     /// How long since the last keyboard or mouse input anywhere in this session. A finished turn is only
     /// moved after a quiet spell, so a prompt someone is still typing is never closed under them.
     public static TimeSpan UserIdle()
@@ -142,33 +220,194 @@ public static class ResumeStopped
     /// Done with a turn: only when its own account reads at or above `threshold`, onto one below it by at
     /// least `hysteresis` points, so two accounts near the line never trade a window back and forth.
     /// Null: stay put (nowhere has room yet, or no move is due).
+    /// An account the API refused the window on stays out until its reset, whatever a stale reading says; `load`
+    /// (windows already sent to each account this pass) lowers an account's room, so one pass spreads them. `refusedUntil`
+    /// (any window's refusal the tray saw, account → reset) keeps an account out the same way for every window.
     public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
-        double threshold = Full, double hysteresis = 0)
+        double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
+        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null)
     {
+        double Weight(Account a) => Format.Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
         bool Read(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null;
-        bool Room(Account a) => Read(a) && Format.Peak(a) < Full;
+        bool Room(Account a) => Read(a) && Format.Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow));
         var own = accounts.FirstOrDefault(a => a.Number == s.Account);
-        if (s.AtLimit && own != null && Room(own)) return own.Number;
+        var refused = s.OwnRefused && s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow);
+        if (s.AtLimit && own != null && Room(own) && !refused) return own.Number;
         if (!s.AtLimit && (own == null || !Read(own) || Format.Peak(own) < threshold)) return null;
         return accounts.Where(a => a.Number != s.Account && Room(a) && (a.Active || hasProfile(a.Number)))
             .Where(a => s.AtLimit || Format.Peak(a) < threshold && Format.Peak(own!) - Format.Peak(a) >= hysteresis)
-            .OrderBy(Format.Peak).ThenByDescending(a => a.Active)
+            .OrderBy(Weight).ThenByDescending(a => a.Active)
             .Select(a => (int?)a.Number).FirstOrDefault();
     }
 
+    /// The account a usage-limit error is charged to: a profile's own; in `~/.claude`, the one whose window resets when the
+    /// error says (a refusal just after an in-place switch is the previous login's), else the default login when the
+    /// stop landed well after its last switch (`OwnStop`). Null: unknown, so nothing is imported or switched on it.
+    /// `refusedUntil`: a refusal replayed by a stuck window (new timestamp, old reset) matches the account already recorded for that reset, not the login.
+    public static int? Refuser(Limit l, int? profile, IReadOnlyList<Account> accounts, (int? Account, DateTime ChangedAt) login,
+        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null)
+    {
+        if (profile != null) return profile;
+        var match = accounts.Where(a => a.ShownUsage is { } u && l.ResetsAt is { } t
+            && Windows(u).Any(w => w.ResetsAt is { } r && Math.Abs((r - t).TotalSeconds) <= 120)).Select(a => a.Number).ToList();
+        if (match.Count == 1) return match[0];
+        var known = refusedUntil?.Where(k => l.ResetsAt is { } t && Math.Abs((k.Value - t).TotalSeconds) <= 120).Select(k => k.Key).ToList();
+        if (known is { Count: 1 }) return known[0];
+        return login.Account is { } n && OwnStop(true, l.At, login.ChangedAt) ? n : null;
+    }
+
+    static IEnumerable<Window> Windows(Usage u) => new[] { u.FiveHour, u.SevenDay }.Concat(u.Scoped ?? []).OfType<Window>();
+
+    /// A profile dir's account (`N-email`); null for `~/.claude`, whose account is whichever login is live.
+    public static int? ProfileAccount(string dir) =>
+        dir != DefaultDir && int.TryParse(Path.GetFileName(dir.TrimEnd('\\', '/')).Split('-')[0], out var n) ? n : null;
+
+    /// Where the default login can move when `refused` ran out, best (most room) first. Usage read and below full; enabled;
+    /// not refused until a reset still ahead, whatever a reading older than the refusal says; and not run by a `cswap run`
+    /// window (`liveProfiles`): two live copies of one rotating login would strand one. The engine's `switch` only warns of that.
+    /// Below the engine's `threshold` first (above it the engine would switch again at once); only if none, anything below full.
+    public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
+        IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
+    {
+        var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Format.Peak(a) < Full
+                && !liveProfiles.Contains(a.Number) && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
+        return [.. (open.Any(a => Format.Peak(a) < threshold) ? open.Where(a => Format.Peak(a) < threshold) : open).OrderBy(a => Format.Peak(a)).Select(a => a.Number)];
+    }
+
+    /// When the first account frees up: the soonest reset ahead among the accounts refused and the windows read as full.
+    public static DateTimeOffset? EarliestReset(IReadOnlyList<Account> accounts, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now) =>
+        refusedUntil.Values.Concat(accounts.Where(a => a.ShownUsage != null).SelectMany(a => Windows(a.ShownUsage!).Where(w => w.Pct >= Full).Select(w => w.ResetsAt ?? default)))
+            .Where(t => t > now).Select(t => (DateTimeOffset?)t).Min();
+
+    /// Accounts with a `cswap run` window right now: a live claude in the profile, or its wrapper's run marker (a headless
+    /// run writes no record). Not knowing (unlistable dir) counts as in use.
+    public static HashSet<int> LiveProfiles(IEnumerable<(string Dir, int? Account)> dirs)
+    {
+        var live = new HashSet<int>();
+        foreach (var (dir, account) in dirs)
+        {
+            if (account is not { } n || dir == DefaultDir) continue;
+            try
+            {
+                var runs = Path.Combine(dir, ".cswap-runs");
+                var records = Path.Combine(dir, "sessions");
+                if (Directory.Exists(runs) && Directory.EnumerateFiles(runs).Any(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid))
+                    || Directory.Exists(records) && Directory.EnumerateFiles(records, "*.json").Any(IsLiveRecord))
+                    live.Add(n);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { live.Add(n); }
+        }
+        return live;
+    }
+
+    static bool IsRunning(int pid)
+    {
+        try { using var p = Process.GetProcessById(pid); return !p.HasExited; }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
+    }
+
+    static bool IsLiveRecord(string rec)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(rec));
+            return doc.RootElement.TryGetProperty("pid", out var pid) && pid.TryGetInt32(out var id) && IsLiveClaude(id, Str(doc.RootElement, "procStart"));
+        }
+        catch (JsonException) { return false; } // half-written: the next look sees it
+    }
+
+    /// The transcripts of live windows, for the poll: each main transcript, and the subagent and workflow-agent files of its
+    /// session written lately. ponytail: a walk of the session's folder per poll; a watcher event is the fast path anyway.
+    public static List<(string File, string Dir)> LiveTranscripts(IEnumerable<(string Dir, int? Account)> dirs, DateTime nowUtc)
+    {
+        var found = new List<(string, string)>();
+        foreach (var (dir, _) in dirs)
+        {
+            string[] records;
+            try { records = Directory.GetFiles(Path.Combine(dir, "sessions"), "*.json"); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { continue; }
+            foreach (var rec in records)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(rec));
+                    var r = doc.RootElement;
+                    if (Str(r, "sessionId") is not { } id || Str(r, "cwd") is not { } cwd || !r.TryGetProperty("pid", out var pid) || !IsLiveClaude(pid.GetInt32(), Str(r, "procStart"))) continue;
+                    if (TranscriptOf(dir, id, cwd) is not { } t) continue;
+                    found.Add((t, dir));
+                    var extra = Path.Combine(Path.GetDirectoryName(t)!, id);
+                    if (Directory.Exists(extra))
+                        found.AddRange(Directory.EnumerateFiles(extra, "*.jsonl", SearchOption.AllDirectories)
+                            .Where(f => nowUtc - File.GetLastWriteTimeUtc(f) < TimeSpan.FromMinutes(2)).Select(f => (f, dir)));
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
+            }
+        }
+        return found;
+    }
+
+    /// The move guard's record key for one move of a session (`session#@ticks`): unlike `session#account` it is never overwritten.
+    public static string MoveStamp(string sessionId, DateTime nowUtc) => $"{sessionId}#@{nowUtc.Ticks}";
+
+    /// How often a session was reopened in the last hour, from the move guard's `MoveStamp` entries.
+    public static int MovesInLastHour(IReadOnlyDictionary<string, DateTime> moves, string sessionId, DateTime nowUtc) =>
+        moves.Count(m => m.Key.StartsWith(sessionId + "#@", StringComparison.Ordinal) && nowUtc - m.Value < TimeSpan.FromHours(1));
+
+    /// The session a subagent or workflow file belongs to (`projects/<cwd>/<session>/...`); null for a main transcript.
+    public static string? AgentSession(string configDir, string file)
+    {
+        var parts = Path.GetRelativePath(Path.Combine(configDir, "projects"), file).Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return parts.Length >= 3 && parts[0] != ".." ? parts[1] : null;
+    }
+
     /// Whether `s` is exactly as the scan saw it: still idle, transcript untouched. Checked right before the
-    /// window is closed, so a turn started (or a message sent) since the scan is never cut off.
+    /// window is closed, so a turn started (or a message sent) since the scan is never cut off, nor a recycled pid hit. A stop at a limit
+    /// holds while the error is still the last message: notices Claude Code writes after it don't cancel the move.
     public static bool Unchanged(StoppedSession s)
     {
         try
         {
-            if (File.GetLastWriteTimeUtc(s.Transcript) != s.Seen) return false;
+            // A limit seen only in an agent file leaves the main transcript without one: it must just be as quiet as at the scan.
+            if (s.AtLimit && s.Limit is { } limit && LimitOf(Tail(s.Transcript)) is { } now ? now.At != limit.At : File.GetLastWriteTimeUtc(s.Transcript) != s.Seen) return false;
             if (s.Record == null) return true;
             using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
-            return Str(doc.RootElement, "status") == "idle";
+            var r = doc.RootElement;
+            return Str(r, "status") == "idle" && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
+
+    /// The `cswap import-usage -` document that hands the engine the limits the API just gave these windows (one
+    /// row per account, 100% on the window that ran out), or null. `done` holds `account:reset` keys already sent.
+    /// Only a refused own account with a known future reset on the 5-hour or 7-day window counts. The engine keeps
+    /// a newer real reading over this one; `spend` is not carried (display only, back with the next real fetch).
+    public static string? LimitReport(IEnumerable<StoppedSession> stops, IReadOnlyList<Account> accounts, DateTimeOffset now, ISet<string> done)
+    {
+        var rows = new List<object>();
+        foreach (var s in stops)
+        {
+            if (!s.OwnRefused || s.Limit is not { Window: "five_hour" or "seven_day", ResetsAt: { } reset } l || reset <= now) continue;
+            if (accounts.FirstOrDefault(a => a.Number == s.Account) is not { } a || !done.Add($"{a.Number}:{reset.ToUnixTimeSeconds()}")) continue;
+            var u = a.ShownUsage;
+            var full = new Window(100, reset);
+            rows.Add(new
+            {
+                email = a.Email,
+                organizationUuid = a.OrganizationUuid ?? "",
+                usageStatus = "ok",
+                usageAgeSeconds = Math.Max(0, (now - l.At).TotalSeconds),
+                usage = new { fiveHour = l.Window == "five_hour" ? full : u?.FiveHour, sevenDay = l.Window == "seven_day" ? full : u?.SevenDay, scoped = u?.Scoped },
+            });
+        }
+        return rows.Count == 0 ? null
+            : JsonSerializer.Serialize(new { schemaVersion = 1, accounts = rows }, LimitJson);
+    }
+
+    static readonly JsonSerializerOptions LimitJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull, // usage_from_json rejects a null window
+    };
 
     /// When each session was last reopened, kept across tray restarts so a restart never re-arms a move.
     public static Dictionary<string, DateTime> LoadMoves(string path)
@@ -213,16 +452,19 @@ public static class ResumeStopped
             }
     }
 
-    /// Ends the stopped claude, lets a `cswap run` wrapper around it exit on its own (it seals the profile's
-    /// login), then closes the shell that held it, so the window it sat in goes away.
+    /// Ends the stopped claude and returns; a `cswap run` wrapper around it is then left to exit on its own (it
+    /// seals the profile's login) and the shell that held it is closed, so the window it sat in goes away. The
+    /// new `cswap run` need not wait for that: it registers its run marker first, which a peer's seal respects.
     public static async Task CloseAsync(int pid)
     {
-        var chain = new List<(int Pid, string Name)>();
+        var chain = new List<(int Pid, string Name, DateTime Start)>();
         for (var (p, guard) = (pid, 0); guard < 4 && ParentOf(p) is { } parent; p = parent, guard++)
         {
             var name = NameOf(parent);
             if (name is not ("cswap" or "cmd" or "powershell" or "pwsh")) break;
-            chain.Add((parent, name));
+            // A real parent started before its child: a pid the system has since given to a newer process is not one.
+            if (StartOf(p) is not { } child || StartOf(parent) is not { } start || start > child) break;
+            chain.Add((parent, name, start));
         }
         using (var claude = Process.GetProcessById(pid))
         {
@@ -230,11 +472,23 @@ public static class ResumeStopped
             try { await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
             catch (OperationCanceledException) { } // slow to go: the window is still reopened
         }
-        foreach (var (p, name) in chain)
+        _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+    }
+
+    static DateTime? StartOf(int pid)
+    {
+        try { using var p = Process.GetProcessById(pid); return p.StartTime; }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return null; }
+    }
+
+    static async Task CloseShellsAsync(List<(int Pid, string Name, DateTime Start)> chain)
+    {
+        foreach (var (p, name, start) in chain)
         {
             try
             {
                 using var proc = Process.GetProcessById(p);
+                if (proc.StartTime != start) continue; // the pid went to another process meanwhile: never kill that
                 if (name == "cswap") { try { await proc.WaitForExitAsync(new CancellationTokenSource(30_000).Token); } catch (OperationCanceledException) { } }
                 else proc.Kill();
             }
@@ -243,21 +497,27 @@ public static class ResumeStopped
         }
     }
 
-    static bool IsLiveClaude(int pid, string? procStart)
+    internal static bool IsLiveClaude(int pid, string? procStart)
     {
         try
         {
             using var p = Process.GetProcessById(pid);
-            if (!p.ProcessName.Equals("claude", StringComparison.OrdinalIgnoreCase)) return false;
-            // A recycled pid: the record names the process it was written by.
-            return procStart == null || !long.TryParse(procStart, out var ft)
-                || Math.Abs(p.StartTime.ToUniversalTime().ToFileTimeUtc() - ft) < TimeSpan.TicksPerSecond * 2;
+            // The record's start stamp names the process that wrote it, so a recycled pid never matches. The image name
+            // is only a fallback for unstamped records: Claude Code's updater renames a running claude.exe to
+            // claude.exe.old.<stamp>.<pid>, which would hide every window older than the update.
+            if (long.TryParse(procStart, out var ft))
+                return Math.Abs(p.StartTime.ToUniversalTime().ToFileTimeUtc() - ft) < TimeSpan.TicksPerSecond * 2;
+            return NameOf(p.Id) == "claude";
         }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
     }
 
-    static string? TranscriptOf(string dir, string sessionId)
+    internal static string? TranscriptOf(string dir, string sessionId, string cwd)
     {
+        // Where Claude Code files it: the cwd with every other character as "-". The search covers long (hashed)
+        // paths, and a session that outlived a `cd`.
+        var direct = Path.Combine(dir, "projects", Regex.Replace(cwd, "[^A-Za-z0-9]", "-"), sessionId + ".jsonl");
+        if (File.Exists(direct)) return direct;
         try { return Directory.EnumerateFiles(Path.Combine(dir, "projects"), sessionId + ".jsonl", SearchOption.AllDirectories).FirstOrDefault(); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
@@ -286,7 +546,7 @@ public static class ResumeStopped
 
     static string? NameOf(int pid)
     {
-        try { using var p = Process.GetProcessById(pid); return p.ProcessName.ToLowerInvariant(); }
+        try { using var p = Process.GetProcessById(pid); return p.ProcessName.Split('.')[0].ToLowerInvariant(); }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { return null; }
     }
 
