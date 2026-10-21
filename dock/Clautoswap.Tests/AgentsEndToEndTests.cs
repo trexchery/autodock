@@ -469,6 +469,28 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task AnAccountYieldedForTheOwnersLoginRestsWhileItsWorkContinuesElsewhere()
+    {
+        Issues("""[{"number":64,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 64).State == ItemState.Working && Item(r, 64).Run is { Pid: > 0 }, "the run starts");
+        var (pid, worktree, email) = await On(r => (Item(r, 64).Run!.Pid, Item(r, 64).Worktree!, Item(r, 64).Run!.Email));
+        var held = Accounts.Single(a => a.Email == email);
+        var runs = Runs.Length;
+        Assert.Equal(1, await _loop.Run(() => _sup!.RunsOn(held)));
+        Assert.Equal(1, await _loop.Run(() => _sup!.YieldAsync(held, TimeSpan.FromMinutes(30))));
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid)); // gone before the tray switches the default login there
+        await Until(r => Item(r, 64).State == ItemState.Open, "the work continues on another account");
+        Assert.DoesNotContain(Runs.Skip(runs), r => r.StartsWith($"run {held.Number} ")); // it rests: nothing starts on it again
+        Assert.NotEmpty(Runs.Skip(runs));
+        Assert.Equal(worktree, await On(r => Item(r, 64).Worktree)); // in the same worktree
+        Assert.Equal(0, await On(r => Item(r, 64).Failures)); // yielding is not the work's fault
+        Assert.Equal(0, await _loop.Run(() => _sup!.YieldAsync(held, TimeSpan.FromMinutes(30)))); // nothing left on it
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task ClosingTheTerminalPausesTheWorkAndReopeningContinuesIt()
     {
         Issues("""[{"number":61,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");

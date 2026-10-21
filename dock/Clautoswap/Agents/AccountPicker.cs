@@ -41,7 +41,7 @@ public static class AccountPicker
         var headroom = open.Where(a => Peak(a, now) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();
         // The default login near its line can only switch to an account no `cswap run` holds: keep the roomiest one free of agents.
-        // shortcut: runs already holding every such account keep them until they end; stop one for the default login if that stalls it too long.
+        // Runs already holding every such account yield one once the default login reaches its line (TrayApp.FreePinnedAsync, Supervisor.YieldAsync).
         var kept = accounts.FirstOrDefault(a => a.Active) is { } own && Peak(own, now) is { } p0 && p0 >= threshold - MinRoom
             ? headroom.Where(a => busy.GetValueOrDefault(Key(a)) == 0).OrderBy(a => Peak(a, now) ?? threshold).FirstOrDefault() : null;
         if (kept != null) free.Remove(kept);

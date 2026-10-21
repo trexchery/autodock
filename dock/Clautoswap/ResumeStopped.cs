@@ -302,6 +302,11 @@ public static class ResumeStopped
     public static bool Releasable(IReadOnlyCollection<StoppedSession> windows, int records, int runs) =>
         records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle);
 
+    /// Whether only agent runs keep a profile from being `Releasable`: every window in it idle, and each run without a window
+    /// (`runs` above `records`) one of the `agentRuns` the agents have on that account, so they can yield it.
+    public static bool AgentsOnly(IReadOnlyCollection<StoppedSession> windows, int records, int runs, int agentRuns) =>
+        windows.Count == records && windows.All(w => w.Idle) && runs > records && agentRuns >= runs - records;
+
     /// What keeps a profile that is not `Releasable`, for the user: each window not idle by folder and status, a window the
     /// scan did not see as done, a run without a window (an agent's, or a headless `cswap run`).
     public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
