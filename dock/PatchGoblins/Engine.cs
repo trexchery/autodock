@@ -35,6 +35,13 @@ public sealed partial class Engine(string exe)
             .Select(d => Path.Combine(d.Trim('"'), file))
             .FirstOrDefault(File.Exists);
 
+    /// On PATH, else where Windows puts it (a tray started with a cut-down PATH still finds it).
+    internal static string? FindProgram(string file, params string[] knownDirs) =>
+        FindOnPath(file) ?? knownDirs.Select(d => Path.Combine(d, file)).FirstOrDefault(File.Exists);
+
+    /// Where Windows keeps app-execution aliases such as wt.exe.
+    static string WindowsApps => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps");
+
     /// Absolute, so cmd is never resolved through the current directory or PATH.
     internal static string Cmd => Path.Combine(Environment.SystemDirectory, "cmd.exe");
 
@@ -173,7 +180,7 @@ public sealed partial class Engine(string exe)
 
     public static void LaunchConsoleWith(string Exe, string title, string? workDir, string[] args, IReadOnlyDictionary<string, string>? env)
     {
-        var wt = FindOnPath("wt.exe");
+        var wt = FindProgram("wt.exe", WindowsApps);
         var shell = Shell;
         var psi = wt != null
             ? new ProcessStartInfo(wt) { UseShellExecute = false }
@@ -260,7 +267,7 @@ public sealed partial class Engine(string exe)
 
     /// The shell a console runs: PowerShell 7 where installed, else Windows PowerShell (always there), else cmd.
     internal static string Shell =>
-        FindOnPath("pwsh.exe") ?? (File.Exists(WindowsPowerShell) ? WindowsPowerShell : Cmd);
+        FindProgram("pwsh.exe", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PowerShell", "7"), WindowsApps) ?? (File.Exists(WindowsPowerShell) ? WindowsPowerShell : Cmd);
 
     static string WindowsPowerShell => Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
 

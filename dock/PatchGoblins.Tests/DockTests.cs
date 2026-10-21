@@ -199,6 +199,16 @@ public class FormatTests
     }
 
     [Fact]
+    public void FindProgramFallsBackToKnownDirectories()
+    {
+        using var t = new TempDir();
+        var exe = Path.Combine(t.Path, "pg-nowhere-on-path.exe");
+        File.WriteAllText(exe, "");
+        Assert.Equal(exe, Engine.FindProgram("pg-nowhere-on-path.exe", Path.Combine(t.Path, "missing"), t.Path));
+        Assert.Null(Engine.FindProgram("pg-nowhere-on-path.exe", Path.Combine(t.Path, "missing")));
+    }
+
+    [Fact]
     public void TheConsoleShellIsPowerShellWithCmdAsTheFallback()
     {
         Assert.Equal(["-NoLogo", "-NoExit", "-Command", @"& 'C:\Program Files\x\cswap.exe' 'run' '3' '--' '--resume' 'sid' 'it''s'"],
