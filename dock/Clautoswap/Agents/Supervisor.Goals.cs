@@ -287,9 +287,7 @@ public sealed partial class Supervisor
         foreach (var note in (plan.Memory ?? []).Take(5)) Memory.Add(repo.Memory, note, "plan " + goal.Id, false, now);
         if (plan.Status == "working") // achieved and blocked plans add and drop nothing
         {
-            var left = new List<WorkItem>();
-            dropped = Unplan(repo, key, (plan.Drop ?? []).Select(Ref).OfType<string>().Select(r => Find(repo, r)).OfType<WorkItem>().Distinct(), left);
-            foreach (var l in left) HoldDependents(repos, repo, l, "which the plan dropped"); // what was planned on it must not start without it
+            dropped = Unplan(repo, key, (plan.Drop ?? []).Select(Ref).OfType<string>().Select(r => Find(repo, r)).OfType<WorkItem>().Distinct()); // the plan kept what it did not list: a removed step reads as landed
             var keys = new Dictionary<string, WorkItem>(StringComparer.OrdinalIgnoreCase); // steps taken so far, so `after` cannot loop
             var declared = (plan.Items ?? []).Take(MaxSteps).Select(x => Ref(x.Key)).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
             // A step's key never means an existing item: a skipped step's key, or one in a cycle, is unknown, not whatever item is named alike.

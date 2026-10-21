@@ -189,6 +189,7 @@ public sealed partial class Supervisor
                     it.Guidance = text;
                     Memory.Add(repo.Memory, $"{it.Label}: {text}", "answer", true, DateTimeOffset.Now);
                 }
+                if (Held(it)) it.OwnRank = null; // the owner chose to run it: the scan's re-judge leaves it, as for a prioritized one
                 (it.State, it.Failures, it.Note, it.AskedAt, it.HoldFor, it.Reviews) = (ItemState.Queued, 0, null, null, null, 0);
                 if (it.Followups > MaxFollowups) it.Followups = 0;
                 Save();

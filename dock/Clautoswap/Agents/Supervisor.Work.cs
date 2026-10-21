@@ -401,9 +401,10 @@ public sealed partial class Supervisor
         var byNumber = issues.ToDictionary(i => i.Number);
         // The director's unstarted picks (raised from below the owner's rank) are judged as a plan judges them: unwanted now,
         // they leave their goal and the line below takes them; what was planned on them asks the owner or leaves too.
-        var takeable = Takeable(repo, issues, me, covered, skip, only, repo.Items.Select(i => i.Issue).OfType<int>().ToHashSet()).Select(i => i.Number).ToHashSet();
+        // A blocker that is an item, in any state, is left to `after`: Ready counts a merged one as landed, Tend flags one closed unmerged.
+        var sequenced = open.Except(repo.Items.Select(i => i.Issue).OfType<int>()).ToHashSet();
         foreach (var i in repo.Items.Where(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null, Goal: not null, OwnRank: < OwnerRank, Issue: { } n }
-                                                && byNumber.ContainsKey(n) && !takeable.Contains(n)).ToList())
+                                                && byNumber.TryGetValue(n, out var picked) && !WantedBy(repo, picked, _me, sequenced, covered, skip, only)).ToList())
         {
             if (GoalOf(i.Goal) is { } g) { AddLog(g, DateTimeOffset.Now, $"{i.Label} left: agents may no longer take it"); g.Claim = null; }
             Unplan(repo, i.Goal!, [i]);
@@ -429,14 +430,15 @@ public sealed partial class Supervisor
             foreach (var gone in repo.Items.Where(Gone).ToList())
             {
                 if (!Gone(gone)) continue; // its run ended while an earlier one was stopping, and its check took over
+                var landed = gone is { State: ItemState.Done } && (gone.Merged || gone.Pr == null); // closing the issue of work that merged changes nothing for what waits on it
                 if (gone.State != ItemState.Done)
                 {
                     await StopWorkerAsync(gone, "skipped");
                     await FinishAsync(repo, gone, "its issue was closed");
                 }
-                if (GoalOf(gone.Goal) is { } g) g.Claim = null; // ended unmerged: the claim may have counted on it
+                if (!landed && GoalOf(gone.Goal) is { } g) g.Claim = null; // ended unmerged: the claim may have counted on it
                 repo.Items.Remove(gone);
-                HoldDependents(_state.Repos, repo, gone, "whose issue was closed"); // a missing predecessor reads as landed
+                if (!landed) HoldDependents(_state.Repos, repo, gone, "whose issue was closed"); // a missing predecessor reads as landed
             }
             foreach (var g in repo.Goals.Where(g => g is { State: GoalState.Active or GoalState.NeedsOwner, Issue: { } n } && !open.Contains(n)).ToList())
                 await EndGoalAsync(repo, g, GoalState.Dropped, $"its issue #{g.Issue} was closed");

@@ -1161,7 +1161,7 @@ public class AgentGoalTests
     }
 
     [Fact]
-    public void DroppingAStepHoldsWhatWasPlannedAfterIt()
+    public void DroppingAStepLeavesWhatThePlanKept()
     {
         var (w1, w2, adopted) = (I("w1"), I("w2"), I("7"));
         var repo = Repo(w1, w2, adopted);
@@ -1171,8 +1171,8 @@ public class AgentGoalTests
         (w1.Goal, w2.Goal, adopted.Goal) = (key, key, key);
         (w2.After, adopted.After) = ([Supervisor.Key(repo, w1)], [Supervisor.Key(repo, w1)]);
         Ingest(repo, goal, """{"status":"working","drop":["w1"]}""");
-        Assert.DoesNotContain(w2, repo.Items); // not started on a base without it
-        Assert.Equal(ItemState.NeedsOwner, adopted.State);
+        Assert.Contains(w2, repo.Items); // the plan kept it: a dropped step reads as landed, and nothing holds or deletes what the plan kept
+        Assert.Equal(ItemState.Queued, adopted.State);
     }
 
     [Fact]
