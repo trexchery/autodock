@@ -223,6 +223,7 @@ public sealed partial class Supervisor
         {
             (item.Pr, item.PrUrl) = found;
             item.PrSeen ??= DateTimeOffset.Now;
+            item.PrOpened ??= DateTimeOffset.Now;
             return;
         }
         var body = Path.Combine(_store.RunDir(repo, item), "pr-body.md");
@@ -233,7 +234,7 @@ public sealed partial class Supervisor
             throw new AgentsException("could not open a pull request: " + r.Why);
         item.Pr = int.Parse(m.Groups[1].Value);
         item.PrUrl = m.Value;
-        item.PrSeen = DateTimeOffset.Now;
+        item.PrSeen = item.PrOpened = DateTimeOffset.Now;
         Notify?.Invoke("Pull request ready", $"{repo.Leaf} #{item.Pr} · {item.Title}");
     }
 

@@ -453,6 +453,18 @@ public class LimitWatchTests
         Assert.Equal(["w (busy)", "w (shell)"], ResumeStopped.Holders([Window("idle"), Window("busy", "t"), Window("shell", "u")], records: 3, runs: 3));
         Assert.Equal(["a window still working"], ResumeStopped.Holders([Window("idle")], records: 2, runs: 2));
         Assert.Equal(["2 agent or headless runs"], ResumeStopped.Holders([Window("idle")], records: 1, runs: 3));
+        Assert.Equal(["the agents terminal in w"], ResumeStopped.Holders([Window("agents")], records: 1, runs: 1));
+    }
+
+    [Fact]
+    public void OnlyTheConsoleTheTrayOpenedIsEnded()
+    {
+        Assert.True(ResumeStopped.TrayConsole(@"C:\WINDOWS\system32\cmd.exe /k C:\Apps\clautoswap\engine\cswap.exe run 3 --restore-rc -- --resume sid"));
+        Assert.True(ResumeStopped.TrayConsole(@"""C:\WINDOWS\system32\cmd.exe"" /k ""title Claude · a · moved && ""C:\Program Files\clautoswap\engine\cswap.exe"" run 3"""));
+        Assert.False(ResumeStopped.TrayConsole(@"""C:\Program Files\PowerShell\7\pwsh.exe"" -NoLogo")); // the user's own shell
+        Assert.False(ResumeStopped.TrayConsole(@"C:\WINDOWS\system32\cmd.exe")); // an interactive cmd tab
+        Assert.False(ResumeStopped.TrayConsole(@"cmd.exe /c claude & npm test")); // a script running claude
+        Assert.False(ResumeStopped.TrayConsole(null));
     }
 
     [Fact]

@@ -235,7 +235,7 @@ public sealed partial class Supervisor
     public string? Summary(DateTimeOffset since)
     {
         var items = Repos.SelectMany(r => r.Items).ToList();
-        var opened = items.Where(i => i.Pr != null && i.PrSeen >= since).ToList();
+        var opened = items.Where(i => i.Pr != null && i.PrOpened >= since).ToList();
         var asks = items.Count(i => i.State == ItemState.NeedsOwner && !Problem(i));
         var stuck = items.Count(Problem);
         var achieved = Repos.SelectMany(r => r.Goals).Count(g => g.State == GoalState.Achieved && g.AchievedAt >= since);

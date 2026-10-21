@@ -39,9 +39,17 @@ static class Program
         var old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "autodock");
         var oldRun = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run")?.GetValue("autodock") is string;
         if (!Directory.Exists(old) && !oldRun) return true;
+        // Only the old tray holds its mutex; another autodock process is an old agents terminal's `autodock agents-mcp` bridge.
+        if (Mutex.TryOpenExisting(@"Local\Autodock-" + Environment.UserName, out var oldTray))
+        {
+            oldTray.Dispose();
+            MessageBox.Show("The old autodock tray is still running. Quit it (tray icon, Exit), then start clautoswap again: it carries over your settings and agents.",
+                "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
         if (System.Diagnostics.Process.GetProcessesByName("autodock").Length > 0)
         {
-            MessageBox.Show("The old autodock tray is still running. Quit it (tray icon, Exit), then start clautoswap again: it carries over your settings and agents.",
+            MessageBox.Show("An agents terminal the old autodock tray opened is still open. Close it (or end its Claude Code session), then start clautoswap again: it carries over your settings and agents.",
                 "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }

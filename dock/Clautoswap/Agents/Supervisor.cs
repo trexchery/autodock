@@ -192,7 +192,7 @@ public sealed partial class Supervisor : IDisposable
             else if (AccountPicker.SpendsMoney(a) && (a.Usage == null || AccountPicker.Peak(a) >= Config.Threshold))
             {
                 // Past the threshold, or unknown, an account with extra usage on could start billing.
-                _cooled[w.Account] = AccountPicker.NextReset(a, null, DateTimeOffset.Now) ?? DateTimeOffset.Now.AddHours(1);
+                _cooled[w.Account] = AccountPicker.NextReset(a, null, DateTimeOffset.Now, Config.Threshold) ?? DateTimeOffset.Now.AddHours(1);
                 Fire(() => StopWorkerAsync(item, "limit"));
             }
         }
@@ -355,12 +355,12 @@ public sealed partial class Supervisor : IDisposable
             .Why?.StartsWith(AccountPicker.AllNearLimits) == true;
         if (allOut && !_allOut)
         {
-            var back = AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now);
-            Notify?.Invoke("Agents waiting for usage", "Every Claude account is near its limit" + (back is { } t ? $"; they continue by themselves around {t.ToLocalTime():h:mm tt}." : "."));
+            var back = AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold);
+            Notify?.Invoke("Agents waiting for usage", "Every Claude account is near its limit" + (back is { } t ? $"; they continue by themselves {Format.When(t, DateTimeOffset.Now)}." : "."));
         }
         else if (!allOut && _allOut && (started || _workers.Count > 0)) Notify?.Invoke("Agents resumed", "A Claude account has usage again.");
         _allOut = allOut;
-        _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
+        _resumeAt = allOut ? (AccountPicker.EarliestReturn(_accounts, _cooled, DateTimeOffset.Now, Config.Threshold) ?? DateTimeOffset.Now.AddMinutes(2)) + TimeSpan.FromSeconds(30) : null;
     }
 
     /// The repository's next item: the one already under way, then pull request follow-ups, then new
@@ -644,7 +644,7 @@ public sealed partial class Supervisor : IDisposable
     void CoolAccount(string key)
     {
         var acct = _accounts?.FirstOrDefault(a => AccountPicker.Key(a) == key);
-        _cooled[key] = (acct is null ? null : AccountPicker.NextReset(acct, null, DateTimeOffset.Now)) ?? DateTimeOffset.Now.AddHours(1);
+        _cooled[key] = (acct is null ? null : AccountPicker.NextReset(acct, null, DateTimeOffset.Now, Config.Threshold)) ?? DateTimeOffset.Now.AddHours(1);
     }
 
     static void EnterChecking(WorkItem item, string summary)

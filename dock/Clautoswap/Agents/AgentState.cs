@@ -44,6 +44,8 @@ public sealed class WorkItem
     public int? OwnRank { get; set; }
     /// PR feedback after this moment is new.
     public DateTimeOffset? PrSeen { get; set; }
+    /// When the pull request was opened (or first found open), for the morning summary.
+    public DateTimeOffset? PrOpened { get; set; }
     public int Failures { get; set; }
     public int Followups { get; set; }
     /// The next run reviews the change instead of working on it.

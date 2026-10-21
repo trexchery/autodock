@@ -215,6 +215,18 @@ public class AccountPickerTests
     static readonly Dictionary<string, DateTimeOffset> NoneCooled = [];
 
     [Fact]
+    public void AFiveHourLimitBenchesTheAccountUntilTheFiveHourResetNotTheWeekly()
+    {
+        var a = A(2, 100, 40); // 5h resets in 2 h, weekly in 3 days
+        Assert.Equal(Now.AddHours(2), AccountPicker.NextReset(a, null, Now, 90));
+        Assert.Equal(Now.AddHours(2), AccountPicker.EarliestReturn([a], NoneCooled, Now, 90));
+        Assert.Equal(Now.AddDays(3), AccountPicker.NextReset(A(2, 100, 95), null, Now, 90)); // both out: the later one
+        Assert.Equal(Now.AddHours(2), AccountPicker.NextReset(A(2, 50, 40), null, Now, 90)); // a stale reading: the soonest reset
+        var cooled = new Dictionary<string, DateTimeOffset> { [AccountPicker.Key(a)] = Now.AddHours(3) };
+        Assert.Equal(Now.AddHours(3), AccountPicker.NextReset(A(2, 50, 40), cooled, Now, 90)); // cooled, nothing out: the cooling
+    }
+
+    [Fact]
     public void NeverTheSignedInAccountExcludedOrBrokenOnes()
     {
         var (pick, why) = AccountPicker.Pick([A(1, 0, active: true), A(2, 0, disabled: true), A(3, 0, status: "relogin_required"), A(4, 0, status: "api_key")], 90, None, NoneCooled, Now);

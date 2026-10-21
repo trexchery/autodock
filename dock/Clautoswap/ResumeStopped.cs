@@ -109,7 +109,9 @@ public static class ResumeStopped
                     if (status != "idle" && !includeBusy || Str(r, "kind") is { } k && k != "interactive" || Headless(r)) continue;
                     if (Str(r, "sessionId") is not { } id || Str(r, "cwd") is not { } cwd || !r.TryGetProperty("pid", out var pidEl)) continue;
                     var pid = pidEl.GetInt32();
-                    if (bridged.Contains(pid)) continue; // an agents terminal: reopened without its --mcp-config, the agents would stop
+                    // An agents terminal: reopened without its --mcp-config the agents would stop, so it is never closed or moved.
+                    // Stopped at a limit it is reported as "agents" (never idle), so the owner is told to reopen it from the Agents menu.
+                    if (bridged.Contains(pid)) { if (!includeBusy) continue; status = "agents"; }
                     var stamp = Str(r, "procStart");
                     if (!IsLiveClaude(pid, stamp)) continue;
                     var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue; // unstamped record: the process's own start
@@ -318,7 +320,8 @@ public static class ResumeStopped
     /// scan did not see as done, a run without a window (an agent's, or a headless `cswap run`).
     public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
     {
-        var held = windows.Where(w => !w.Idle).Select(w => $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
+        var held = windows.Where(w => !w.Idle).Select(w => w.Status == "agents" ? $"the agents terminal in {Path.GetFileName(w.Cwd.TrimEnd('\\'))}"
+            : $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
         if (records > windows.Count) held.Add(records - windows.Count == 1 ? "a window still working" : $"{records - windows.Count} windows still working");
         if (runs > records) held.Add(runs - records == 1 ? "an agent or headless run" : $"{runs - records} agent or headless runs");
         return held;
@@ -535,6 +538,8 @@ public static class ResumeStopped
         {
             var name = NameOf(parent);
             if (name is not ("cswap" or "cmd" or "powershell" or "pwsh")) break;
+            // Only the console the tray opened (`cmd /k <engine> run …`): a shell the user started holds their own script or state.
+            if (name != "cswap" && !TrayConsole(CommandLineOf(parent))) break;
             // A real parent started before its child: a pid the system has since given to a newer process is not one.
             if (StartOf(p) is not { } child || StartOf(parent) is not { } start || start > child) break;
             chain.Add((parent, name, start));
@@ -546,6 +551,30 @@ public static class ResumeStopped
             catch (OperationCanceledException) { } // slow to go: the window is still reopened
         }
         _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+    }
+
+    /// Whether a shell's command line is one `Engine.LaunchConsole` started: `cmd /k <…\cswap[.exe]> run …` (Windows Terminal),
+    /// or `cmd /k "title … && <…\cswap[.exe]> run …"` (conhost).
+    internal static bool TrayConsole(string? commandLine) =>
+        commandLine != null && Regex.IsMatch(commandLine, @"^""?[^""]*\bcmd(\.exe)?""?\s+/k\s.*\bcswap(\.exe)?""?\s+run\b", RegexOptions.IgnoreCase);
+
+    /// A process's command line, null when it cannot be read.
+    static string? CommandLineOf(int pid)
+    {
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            NtQueryInformationProcess(p.Handle, 60, 0, 0, out var size); // ProcessCommandLineInformation: a UNICODE_STRING, then its text
+            if (size <= 0) return null;
+            var buf = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (NtQueryInformationProcess(p.Handle, 60, buf, size, out _) != 0) return null;
+                return Marshal.PtrToStringUni(Marshal.ReadIntPtr(buf, IntPtr.Size), Marshal.ReadInt16(buf) / 2);
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return null; }
     }
 
     static DateTime? StartOf(int pid)
@@ -690,6 +719,7 @@ public static class ResumeStopped
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool Process32First(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Process32Next(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(nint h, int infoClass, nint info, int length, out int returned);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(nint h, uint exitCode);
 
     [StructLayout(LayoutKind.Sequential)]

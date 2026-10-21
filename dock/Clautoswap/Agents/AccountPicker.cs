@@ -49,7 +49,7 @@ public static class AccountPicker
         if (free.Count == 0)
         {
             if (headroom.Count > 0) return (null, "every account is already running its share of agents");
-            var reset = usable.Select(a => NextReset(a, cooled, now)).Where(t => t != null).Min();
+            var reset = usable.Select(a => NextReset(a, cooled, now, threshold)).Where(t => t != null).Min();
             return (null, AllNearLimits + (reset is { } r ? $"; earliest reset {Format.When(r, now)}" : ""));
         }
         if (prefer != null && free.FirstOrDefault(a => Key(a) == prefer) is { } same) return (same, null);
@@ -77,19 +77,20 @@ public static class AccountPicker
     }
 
     /// When the first account that is out of usage comes back, if any reading says.
-    public static DateTimeOffset? EarliestReturn(IEnumerable<Account> accounts, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now) =>
-        accounts.Where(Usable).Select(a => NextReset(a, cooled, now)).Where(t => t != null).Min();
+    public static DateTimeOffset? EarliestReturn(IEnumerable<Account> accounts, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now, double threshold = ResumeStopped.Full) =>
+        accounts.Where(Usable).Select(a => NextReset(a, cooled, now, threshold)).Where(t => t != null).Min();
 
     public static string Key(Account a) => a.Email + "|" + (a.OrganizationUuid ?? "");
 
-    /// When an exhausted (or cooled) account is expected back.
-    public static DateTimeOffset? NextReset(Account a, IReadOnlyDictionary<string, DateTimeOffset>? cooled, DateTimeOffset now)
+    /// When an exhausted (or cooled) account is expected back: the latest reset among the windows at or above `threshold`
+    /// (a weekly window with room never benches it until its own reset), and the cooling. Neither: the soonest reset ahead.
+    public static DateTimeOffset? NextReset(Account a, IReadOnlyDictionary<string, DateTimeOffset>? cooled, DateTimeOffset now, double threshold = ResumeStopped.Full)
     {
         var times = new List<DateTimeOffset>();
         if (cooled != null && cooled.TryGetValue(Key(a), out var c) && c > now) times.Add(c);
-        if (a.ShownUsage is { } u)
-            foreach (var w in new[] { u.FiveHour, u.SevenDay })
-                if (w is { ResetsAt: { } t } && t > now) times.Add(t);
+        var ahead = a.ShownUsage is { } u ? new[] { u.FiveHour, u.SevenDay }.Where(w => w is { ResetsAt: { } t } && t > now).ToList() : [];
+        times.AddRange(ahead.Where(w => w!.Pct >= threshold).Select(w => w!.ResetsAt!.Value));
+        if (times.Count == 0 && ahead.Count > 0) return ahead.Min(w => w!.ResetsAt!.Value); // a stale reading: the soonest is the likeliest
         return times.Count == 0 ? null : times.Max();
     }
 }
