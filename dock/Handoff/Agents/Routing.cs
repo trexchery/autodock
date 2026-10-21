@@ -112,10 +112,14 @@ public static class Routing
     }
 
     /// Ultracode runs only when the owner turned it on, it is recommended, the account runs nothing else, and its usage
-    /// (every window, the model's own included) is known and at least UltracodeRoom below the threshold. Any model, any effort.
+    /// (every window it has, the model's own included) is known and at least UltracodeRoom below the threshold. Any model, any effort.
     public static bool UltracodeOn(Route r, bool allowed, Account a, int othersOnAccount, double threshold) =>
-        allowed && r.Ultracode && othersOnAccount == 0 && Snap(a, r.Model) is { FiveHour: { } h, SevenDay: { } w } s
-        && Math.Max(Math.Max(h, w), s.Model ?? 0) <= threshold - UltracodeRoom;
+        allowed && r.Ultracode && othersOnAccount == 0 && Peak(Snap(a, r.Model)) <= threshold - UltracodeRoom;
+
+    /// A reading's highest window, as AccountPicker.Peak: one the account does not have (organization plans report no
+    /// overall weekly window) counts as empty; null when neither the 5-hour nor the weekly window is known.
+    public static double? Peak(QuotaSnap? s) =>
+        s is { } q && (q.FiveHour ?? q.SevenDay) != null ? Math.Max(Math.Max(q.FiveHour ?? 0, q.SevenDay ?? 0), q.Model ?? 0) : null;
 
     public static QuotaSnap? Snap(Account? a, string? model, DateTimeOffset? now = null)
     {

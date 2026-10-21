@@ -817,7 +817,7 @@ public sealed partial class Supervisor
     {
         var usable = (_accounts ?? []).Where(AccountPicker.Usable).ToList();
         var room = usable.Count(a => AccountPicker.Peak(a) is { } p && p < Config.Threshold);
-        var opus = usable.Count(a => Routing.Snap(a, "opus") is { } s && Math.Max(s.FiveHour ?? 100, Math.Max(s.SevenDay ?? 100, s.Model ?? 0)) < Config.Threshold);
+        var opus = usable.Count(a => Routing.Peak(Routing.Snap(a, "opus")) < Config.Threshold);
         var cap = Config.MaxConcurrent > 0 ? $"{Config.MaxConcurrent}" : "one per account with room";
         return $"Capacity: agents run {cap} item(s) at once; {room} Claude account(s) have room now, {opus} of them for Opus. Ultracode is {(Config.Ultracode ? "allowed by the owner, and runs only on an account with ample room" : "off (the owner has not allowed it)")}.";
     }

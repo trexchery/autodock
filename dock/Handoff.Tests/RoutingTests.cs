@@ -66,6 +66,12 @@ public class RoutingTests
         var opus = Routing.Validate("hard", "opus", "high", true, null);
         Assert.False(Routing.UltracodeOn(opus, true, A(10, opus: 70), 0, 90)); // the model's own weekly window counts
         Assert.True(Routing.UltracodeOn(opus, true, A(10, opus: 20), 0, 90));
+        // An organization plan's live reading: a 5-hour window and per-model weekly ones, no overall weekly window.
+        Account Org(double fiveHour) => new(3, "a3@example.com", false, "ok", new Usage(new Window(fiveHour, Now.AddHours(2)), null, [new Window(75, Now.AddDays(2), "Fable")], null));
+        Assert.True(Routing.UltracodeOn(on, true, Org(7), 0, 90));
+        Assert.False(Routing.UltracodeOn(on, true, Org(64), 0, 90));
+        Assert.Equal(7, Routing.Peak(Routing.Snap(Org(7), "opus")));
+        Assert.Null(Routing.Peak(new QuotaSnap(null, null, 20))); // only a model's window known: unknown
     }
 
     [Fact]
