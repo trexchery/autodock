@@ -261,10 +261,11 @@ public static class ResumeStopped
     /// Null: stay put (nowhere has room yet, or no move is due).
     /// An account the API refused the window on stays out until its reset, whatever a stale reading says; `load`
     /// (windows already sent to each account this pass) lowers an account's room, so one pass spreads them. `refusedUntil`
-    /// (any window's refusal the tray saw, account → reset) keeps an account out the same way for every window.
+    /// (any window's refusal the tray saw, account → reset) keeps an account out the same way for every window. `live`: accounts
+    /// other `cswap run` windows hold, which the default login cannot switch to either.
     public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
         double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
-        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null)
+        IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null, ISet<int>? live = null)
     {
         double Weight(Account a) => Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
         bool Read(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null;
@@ -277,7 +278,7 @@ public static class ResumeStopped
         // there makes it a live profile, which the engine never switches onto. (A stopped window cannot wait, so it may take it.)
         var login = accounts.FirstOrDefault(a => a.Active);
         var kept = !s.AtLimit && login != null && login.Number != s.Account && Read(login) && Peak(login) >= threshold - hysteresis
-            ? SwitchTargets(accounts, login.Number, new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold)
+            ? SwitchTargets(accounts, login.Number, live ?? new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold)
                 .Select(n => (int?)n).FirstOrDefault()
             : null;
         return accounts.Where(a => a.Number != s.Account && a.Number != kept && Room(a) && (a.Active || hasProfile(a.Number)))

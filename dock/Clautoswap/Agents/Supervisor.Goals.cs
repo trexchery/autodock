@@ -164,6 +164,7 @@ public sealed partial class Supervisor
         try
         {
             await w.Proc.ReapAsync();
+            _workers.Remove(goal); // its wrapper is gone: the GitHub calls below must not count as a run on its account
             if (goal.Run is not { } run) return;
             run.Live = false;
             if (goal.State != GoalState.Active || !repo.Goals.Contains(goal)) return; // ended meanwhile: that decides

@@ -78,6 +78,7 @@ public sealed partial class Supervisor : IDisposable
     readonly System.Threading.Timer _timer;
     IReadOnlyList<Account>? _accounts;
     IReadOnlyList<ProjectMapping> _maps = [];
+    IReadOnlySet<int> _live = new HashSet<int>();
     bool _allOut;
     DateTimeOffset? _resumeAt;
     bool _pumping, _pumpAgain, _launching, _disposed, _stopping;
@@ -177,10 +178,12 @@ public sealed partial class Supervisor : IDisposable
     }
 
     /// The tray's latest Claude accounts (each refresh) and folder assignments.
-    public void UpdateAccounts(IReadOnlyList<Account> claude, IReadOnlyList<ProjectMapping> maps)
+    /// `live`: accounts a `cswap run` window holds (the tray's view), which the default login can never switch to.
+    public void UpdateAccounts(IReadOnlyList<Account> claude, IReadOnlyList<ProjectMapping> maps, IReadOnlySet<int>? live = null)
     {
         _accounts = claude;
         _maps = maps;
+        _live = live ?? new HashSet<int>();
         foreach (var (item, w) in _workers)
         {
             if (w.StopReason != null || claude.FirstOrDefault(a => AccountPicker.Key(a) == w.Account) is not { } a) continue;
@@ -225,7 +228,7 @@ public sealed partial class Supervisor : IDisposable
                         if (repo.Items.Any(Watched) && Due(_prPolled.GetValueOrDefault(repo), Config.PrEvery))
                             await WatchPullRequestsAsync(repo);
                         // Checks interrupted by a restart or a pause pick up where they were.
-                        foreach (var item in repo.Items.Where(i => i.State == ItemState.Checking && !_checks.Contains(i)).ToList())
+                        foreach (var item in repo.Items.Where(i => i.State == ItemState.Checking && !_checks.Contains(i) && _notBefore.GetValueOrDefault(i) <= DateTimeOffset.Now).ToList())
                             Fire(() => CheckAsync(repo, item));
                         foreach (var goal in repo.Goals.Where(g => g.State == GoalState.Active).ToList()) Tend(repo, goal);
                     }
@@ -330,8 +333,8 @@ public sealed partial class Supervisor : IDisposable
             // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest;
             // planned work waits for what it builds on.
             Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
-            // Counted over every folder: the setting is the tray's, not each repository's.
-            while (!_disposed && !_launching && _state.Repos.Sum(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)) < cap)
+            // Counted over every working folder: the setting is the tray's, not each repository's; a paused or closed one's checks wait.
+            while (!_disposed && !_launching && _state.Repos.Where(Active).Sum(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)) < cap)
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
@@ -390,8 +393,10 @@ public sealed partial class Supervisor : IDisposable
         var busy = _workers.Values.GroupBy(w => w.Account).ToDictionary(g => g.Key, g => g.Count());
         var prefer = item is { ReviewNext: false, Session: { } s } ? s.Email + "|" + s.Org : null;
         (Account?, string?) From(IReadOnlyList<Account> pool) =>
-            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst);
-        if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped) return From([mapped]);
+            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst, _live);
+        // The folder's account as the default login: work code stays on it, so the folder waits for the login to move on (no problem for the owner).
+        if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped)
+            return mapped.Active ? (null, $"#{mapped.Number}, this folder's account, is your login right now") : From([mapped]);
         // Held only for a folder that would start something, or has not read its issues yet.
         var theirs = _state.Repos.Where(r => r != repo && Active(r) && (r.LastScan == null || Next(r, Config.MaxOpenPrs, i => !Ready(i)) != null)).Select(r => ProjectMap.AccountFor(r.Path, accounts, _maps)).OfType<Account>().ToList();
         var pick = From(accounts.Where(a => !theirs.Contains(a) || AccountPicker.Key(a) == prefer).ToList()); // a session resumes where it lives
@@ -708,13 +713,20 @@ public sealed partial class Supervisor : IDisposable
     /// meanwhile. Returns once their claudes are gone; each `cswap run` wrapper then exits and seals the profile on its own.
     public async Task<int> YieldAsync(Account account, TimeSpan rest)
     {
+        Rest(account, rest);
         var key = AccountPicker.Key(account);
-        var until = DateTimeOffset.Now + rest;
-        if (_cooled.GetValueOrDefault(key) < until) _cooled[key] = until;
         var runs = _workers.Where(kv => kv.Value.Account == key && kv.Value.StopReason == null).Select(kv => kv.Key).ToList();
         await Task.WhenAll(runs.Select(k => StopWorkerAsync(k, "limit")));
         Pump();
         return runs.Count;
+    }
+
+    /// Nothing new starts on `account` for `rest` (runs already there go on).
+    public void Rest(Account account, TimeSpan rest)
+    {
+        var key = AccountPicker.Key(account);
+        var until = DateTimeOffset.Now + rest;
+        if (_cooled.GetValueOrDefault(key) < until) _cooled[key] = until;
     }
 
     /// Resting since it was picked: a run that starts on it now would hold the account a yield just freed.

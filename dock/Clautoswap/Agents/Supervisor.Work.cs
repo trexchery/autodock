@@ -166,7 +166,7 @@ public sealed partial class Supervisor
                     item.State = ItemState.Queued;
                     return;
                 }
-                throw new AgentsException("could not push: " + push.Why);
+                throw new AgentsException("could not push: " + push.Why, transient: Offline.IsMatch(push.Err + push.Out));
             }
             // Pushing is idempotent: a pause now leaves it in Checking, and resuming opens the pull request.
             if (!Active(repo) || Dropped(repo, item)) return;
@@ -180,9 +180,17 @@ public sealed partial class Supervisor
         }
         catch (Exception e)
         {
-            // Parked, whatever it was: a check that throws must not be retried in a loop.
-            if (e is not AgentsException) Program.Log(e);
-            Park(repo, item, e is AgentsException ? e.Message : "the check could not run: " + e.Message);
+            // Offline: the check runs again after a pause (the pump waits for it). Anything else is parked: a check that throws must not be retried in a loop.
+            if (e is AgentsException { Transient: true })
+            {
+                _notBefore[item] = DateTimeOffset.Now + Config.LaunchBackoff;
+                item.Note = Engine.Redact(e.Message);
+            }
+            else
+            {
+                if (e is not AgentsException) Program.Log(e);
+                Park(repo, item, e is AgentsException ? e.Message : "the check could not run: " + e.Message);
+            }
         }
         finally
         {
@@ -230,12 +238,15 @@ public sealed partial class Supervisor
         File.WriteAllText(body, PullRequestBody(repo, item, summary));
         string[] create = ["pr", "create", "--base", repo.Base, "--head", item.Branch!, "--title", item.Title, "--body-file", body];
         var r = await _cli.GhAsync(wt, Config.DraftPrs ? [.. create, "--draft"] : create);
+        var draft = Config.DraftPrs && r.Ok;
+        // GitHub Free has no drafts on private repositories: a ready pull request rather than none.
+        if (Config.DraftPrs && !r.Ok && (r.Err + r.Out).Contains("draft", StringComparison.OrdinalIgnoreCase)) r = await _cli.GhAsync(wt, create);
         if (!r.Ok || Regex.Match(r.Out, @"https://\S+/pull/(\d+)") is not { Success: true } m)
-            throw new AgentsException("could not open a pull request: " + r.Why);
+            throw new AgentsException("could not open a pull request: " + r.Why, transient: Offline.IsMatch(r.Err + r.Out));
         item.Pr = int.Parse(m.Groups[1].Value);
         item.PrUrl = m.Value;
         item.PrSeen = item.PrOpened = DateTimeOffset.Now;
-        Notify?.Invoke("Pull request ready", $"{repo.Leaf} #{item.Pr} · {item.Title}");
+        Notify?.Invoke(draft ? "Draft pull request opened" : "Pull request ready", $"{repo.Leaf} #{item.Pr} · {item.Title}");
     }
 
     internal static (int, string)? ParsePrList(string json)
@@ -334,8 +345,10 @@ public sealed partial class Supervisor
                 asks.Add($"These checks failed: {string.Join(", ", pr.FailedChecks)}.{logs}");
             }
             if (pr.Conflicting) asks.Add($"The pull request conflicts with {repo.Base}. clautoswap fetched it: merge origin/{repo.Base} into this branch and resolve the conflicts.");
-            var inline = await _cli.GhAsync(repo.Path, "api", $"repos/{{owner}}/{{repo}}/pulls/{item.Pr}/comments");
-            var feedback = pr.Feedback.Concat(inline.Ok ? PullRequestState.InlineComments(inline.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me) : []).ToList();
+            // Newest first: GitHub lists the oldest page first. shortcut: the newest 100 per poll, paginate if a review ever leaves more between polls.
+            var inline = await _cli.GhAsync(repo.Path, "api", $"repos/{{owner}}/{{repo}}/pulls/{item.Pr}/comments?sort=created&direction=desc&per_page=100");
+            if (!inline.Ok) continue; // PrSeen must not pass comments nobody read: the next poll tries again
+            var feedback = pr.Feedback.Concat(PullRequestState.InlineComments(inline.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me).Reverse()).ToList();
             if (feedback.Count > 0) asks.Add("Review feedback to address:\n" + Engine.Redact(string.Join("\n\n", feedback)));
             if (asks.Count == 0) continue;
             item.PrSeen = seen;

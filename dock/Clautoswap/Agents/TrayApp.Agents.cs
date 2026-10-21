@@ -39,7 +39,8 @@ public sealed partial class TrayApp
     async Task UpdateAgentAccountsAsync()
     {
         await _agentsThreshold;
-        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
+        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load(), LiveOrLaunching());
+        MorningSummary(); // every tick too: with no agents terminal open, nothing else wakes it
     }
 
     void ApplyAgentSettings()
@@ -68,7 +69,8 @@ public sealed partial class TrayApp
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (_agents != null) _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";
         }
-        catch (Exception e) when (e is EngineException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException) { }
+        catch (Exception e) when (e is EngineException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException
+            or System.ComponentModel.Win32Exception or IOException) { Program.Log(e); } // never faulted: every tick awaits it
     }
 
     DateTimeOffset _lastAutoPrime;

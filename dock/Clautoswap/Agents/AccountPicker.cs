@@ -33,17 +33,17 @@ public static class AccountPicker
 
     public static (Account? Pick, string? Why) Pick(IReadOnlyList<Account> accounts, double threshold,
         IReadOnlyDictionary<string, int> busy, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now,
-        int perAccount = 2, string? prefer = null, bool consumeFirst = false)
+        int perAccount = 2, string? prefer = null, bool consumeFirst = false, IReadOnlySet<int>? live = null)
     {
         var usable = accounts.Where(Usable).ToList();
         if (usable.Count == 0) return (null, accounts.Any(a => a.Active) ? OnlyYours : NoneUsable);
         var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now)).ToList();
         var headroom = open.Where(a => Peak(a, now) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();
-        // The default login near its line can only switch to an account no `cswap run` holds: keep the roomiest one free of agents.
+        // The default login near its line can only switch to an account no `cswap run` holds (`live`: the owner's pinned windows too): keep the roomiest one free of agents.
         // Runs already holding every such account yield one once the default login reaches its line (TrayApp.FreePinnedAsync, Supervisor.YieldAsync).
         var kept = accounts.FirstOrDefault(a => a.Active) is { } own && Peak(own, now) is { } p0 && p0 >= threshold - MinRoom
-            ? headroom.Where(a => busy.GetValueOrDefault(Key(a)) == 0).OrderBy(a => Peak(a, now) ?? threshold).FirstOrDefault() : null;
+            ? headroom.Where(a => busy.GetValueOrDefault(Key(a)) == 0 && live?.Contains(a.Number) != true).OrderBy(a => Peak(a, now) ?? threshold).FirstOrDefault() : null;
         if (kept != null) free.Remove(kept);
         if (free.Count == 0 && kept != null) return (null, $"#{kept.Number} is kept free for your own login, which is near its limit");
         if (free.Count == 0)
