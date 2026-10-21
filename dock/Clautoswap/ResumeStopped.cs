@@ -520,6 +520,30 @@ public static class ResumeStopped
     internal static bool SafeToClose(int target, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, bool switching, int? loginAtPlan, int? loginNow, DateTimeOffset now) =>
         !(refusedUntil.GetValueOrDefault(target) > now) && !switching && loginAtPlan == loginNow;
 
+    /// Accounts a window was just reopened on (a `session#account` stamp under 30 s old; its run marker appears a few seconds later): a switch must not pick them.
+    internal static IEnumerable<int> Launching(IReadOnlyDictionary<string, DateTime> resumed, DateTime nowUtc) =>
+        resumed.Where(m => nowUtc - m.Value < TimeSpan.FromSeconds(30) && int.TryParse(m.Key[(m.Key.LastIndexOf('#') + 1)..], out _))
+            .Select(m => int.Parse(m.Key[(m.Key.LastIndexOf('#') + 1)..]));
+
+    /// Whether the transcript has a reply of Claude's own (not an error) written after `since`: the session carried on after that error.
+    internal static bool RanSince(string file, DateTimeOffset since)
+    {
+        try
+        {
+            foreach (var line in Tail(file))
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var r = doc.RootElement;
+                    if (Str(r, "type") == "assistant" && !(r.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True)
+                        && r.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String && ts.TryGetDateTimeOffset(out var t) && t > since) return true;
+                }
+                catch (JsonException) { } // a line cut by the tail window, or one being written
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return false;
+    }
+
     /// Whether `key` has been seen for at least `grace`: stamps it on first sight only.
     internal static bool BusyPast(Dictionary<string, DateTime> since, string key, DateTime now, TimeSpan grace)
     {

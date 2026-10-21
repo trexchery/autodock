@@ -145,7 +145,9 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
     /// Accounts the API refused, until their reset: no reading, however fresh it looks, puts one back before then.
     public Dictionary<int, DateTimeOffset> RefusedUntil { get; } = [];
     readonly HashSet<string> _handled = [];
-    readonly Dictionary<(string Session, long Reset), int> _chargedTo = []; // default-login refusals: a stuck window replays its error, so the same session and reset is the same refuser
+    readonly Dictionary<(string File, long Reset), (int Account, DateTimeOffset At, string Session)> _chargedTo = []; // default-login refusals: a stuck window replays its error, so the same transcript and reset is the same refuser, until it runs again
+    /// The tray moved a session: its old refusals are not its next ones.
+    public void Forget(string session) { lock (_chargedTo) foreach (var k in _chargedTo.Where(c => c.Value.Session == session).Select(c => c.Key).ToList()) _chargedTo.Remove(k); }
     DateTimeOffset _lastTry; // when every try last failed
     readonly SemaphoreSlim _one = new(1, 1); // one move at a time; separate from the engine's own gate on purpose
     /// A switch is running: a window move planned before it must not launch a profile of the account it moves to.
@@ -162,10 +164,14 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
             var reset = l.ResetsAt!.Value; // LimitWatch hands over only errors that say when
             if (snap == null) return null; // not listed yet: nothing is recorded, so the caller can look again
             var profile = ResumeStopped.ProfileAccount(hit.ConfigDir);
-            var window = (ResumeStopped.AgentSession(hit.ConfigDir, hit.File) ?? Path.GetFileNameWithoutExtension(hit.File), reset.ToUnixTimeSeconds());
-            // A replay (the same window, same reset, a new timestamp) keeps its first refuser; only another window's refusal with an aligned reset is the login's.
-            var refused = profile == null && _chargedTo.TryGetValue(window, out var first) ? first : ResumeStopped.Refuser(l, profile, snap.Accounts, login());
-            if (profile == null && refused is { } charged) _chargedTo.TryAdd(window, charged);
+            var window = (hit.File, reset.ToUnixTimeSeconds());
+            // A replay (the same transcript, same reset, a new timestamp, nothing run in between) keeps its first refuser; a transcript that carried on after the switch, or another window's refusal with an aligned reset, is the login's.
+            (int Account, DateTimeOffset At, string Session) first = default;
+            bool replay;
+            lock (_chargedTo) replay = profile == null && _chargedTo.TryGetValue(window, out first) && !ResumeStopped.RanSince(hit.File, first.At);
+            var refused = replay ? first.Account : ResumeStopped.Refuser(l, profile, snap.Accounts, login());
+            if (!replay && profile == null && refused is { } charged)
+                lock (_chargedTo) _chargedTo[window] = (charged, l.At, ResumeStopped.AgentSession(hit.ConfigDir, hit.File) ?? Path.GetFileNameWithoutExtension(hit.File));
             // A refusal seen again is not logged or reported again, but the switch still happens while the default login is on the refuser (it may have come back).
             var again = !_handled.Add($"{refused?.ToString() ?? "?"}:{reset.ToUnixTimeSeconds()}");
             if (again && (now - _lastTry < TimeSpan.FromSeconds(30) || !(refused is { } rn && (login().Account ?? snap.ActiveAccountNumber) == rn && RefusedUntil.TryGetValue(rn, out var until0) && until0 > now))) return null; // a repeat retries at most every 30 s: a burst of agents is not a burst of ungated spawns

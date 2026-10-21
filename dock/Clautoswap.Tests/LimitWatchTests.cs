@@ -461,6 +461,49 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public async Task ASessionThatCarriedOnAfterTheSwitchIsRefusedByTheNewLogin()
+    {
+        var root = TempRoot();
+        try
+        {
+            var resets = Now.AddHours(2);
+            var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets), A(3, 60)); // Auto-Prime: 1 and 2 reset together
+            var f = Write(root, "sid.jsonl", LimitLine(Now, resets));
+            Assert.Equal(2, (await rig.Hit(Now, resets, file: f))!.Switched!.To!.Number);
+            rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+            rig.Changed = DateTime.UtcNow.AddMinutes(-90);
+            File.AppendAllLines(f, [$$$"""{"type":"assistant","timestamp":"{{{Now.AddMinutes(1):O}}}","message":{"role":"assistant","content":[{"type":"text","text":"carried on"}],"stop_reason":"end_turn"}}""",
+                LimitLine(Now.AddMinutes(90), resets)]);
+            Assert.Equal(3, (await rig.Hit(Now.AddMinutes(90), resets, file: f))!.Switched!.To!.Number); // ran on 2 since: 2's refusal, not 1's replayed
+            Assert.Contains(2, rig.Switch.RefusedUntil.Keys);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task AMovedSessionsEarlierRefusalsAreForgotten()
+    {
+        var resets = Now.AddHours(2);
+        var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets), A(3, 60));
+        await rig.Hit(Now, resets); // sid is charged to 1
+        rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+        rig.Changed = DateTime.UtcNow.AddMinutes(-90);
+        rig.Switch.Forget("sid"); // the tray reopened it
+        Assert.Equal(3, (await rig.Hit(Now.AddMinutes(90), resets))!.Switched!.To!.Number);
+    }
+
+    [Fact]
+    public void AWindowReopenedOnAnAccountIsNeverPickedBySwitchTargetsMeanwhile()
+    {
+        var resets = Now.AddHours(2);
+        var accounts = new[] { A(1, 10, active: true, resets: resets), A(2, 20), A(3, 60) };
+        var stamps = new Dictionary<string, DateTime> { ["sid#2"] = DateTime.UtcNow, ["old#3"] = DateTime.UtcNow.AddMinutes(-5), ["sid#@123"] = DateTime.UtcNow };
+        var live = ResumeStopped.Launching(stamps, DateTime.UtcNow).ToHashSet();
+        Assert.Equal([2], live); // the plan-time stamp counts; an old one and a move stamp do not
+        Assert.Equal([3], ResumeStopped.SwitchTargets(accounts, 1, live, new Dictionary<int, DateTimeOffset>(), Now));
+    }
+
+    [Fact]
     public void AnythingTheOwnerDidAfterTheErrorMeansTheWindowIsNotStopped()
     {
         var limit = LimitLine(Now, Now.AddHours(1));

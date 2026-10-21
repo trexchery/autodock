@@ -186,8 +186,7 @@ public sealed partial class TrayApp : ApplicationContext
     HashSet<int> LiveOrLaunching()
     {
         var live = ResumeStopped.LiveProfiles(ResumeStopped.ConfigDirs(null));
-        foreach (var m in _resumed) // the UI thread's, as is every writer of it
-            if (DateTime.UtcNow - m.Value < TimeSpan.FromSeconds(30) && int.TryParse(m.Key[(m.Key.LastIndexOf('#') + 1)..], out var n)) live.Add(n);
+        live.UnionWith(ResumeStopped.Launching(_resumed, DateTime.UtcNow)); // the UI thread's, as is every writer of it
         return live;
     }
 
@@ -382,7 +381,7 @@ public sealed partial class TrayApp : ApplicationContext
                 case ResumeStopped.Step.Left: // never closed while working; reopened once it is idle at the limit (the poll looks again)
                     // The grace is per error (a window refused again gets its own), the balloon per reset: every agent of a busy window is refused
                     // on its own. A window still marked busy just after writing its error is about to go idle: told about only if it stays busy past the grace.
-                    var told = $"{s.SessionId}@{s.Limit?.ResetsAt}";
+                    var told = $"{s.SessionId}@{s.Limit?.ResetsAt ?? s.Limit?.At}";
                     if (!_told.Contains(told) && ResumeStopped.BusyPast(_busySince, $"{s.SessionId}@{s.Limit?.At.Ticks}", DateTime.UtcNow, BusyGrace) && _told.Add(told))
                     {
                         // A default-login window's account is the live login, not the one that refused: no number for it.
@@ -422,7 +421,7 @@ public sealed partial class TrayApp : ApplicationContext
         foreach (var (m, d) in plan.Zip(done))
         {
             if (d == null) changed |= _resumed.Remove($"{m.S.SessionId}#{m.To.Number}"); // not tried after all: no lockout
-            else { _agentLimits.TryRemove(m.S.SessionId, out _); _resumed[ResumeStopped.MoveStamp(m.S.SessionId, DateTime.UtcNow)] = DateTime.UtcNow; changed = true; } // one per move, for the cap per hour
+            else { _agentLimits.TryRemove(m.S.SessionId, out _); _limits.Forget(m.S.SessionId); _told.RemoveWhere(t => t.StartsWith(m.S.SessionId + "@")); _resumed[ResumeStopped.MoveStamp(m.S.SessionId, DateTime.UtcNow)] = DateTime.UtcNow; changed = true; } // one per move, for the cap per hour
         }
         if (changed) try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
         var resumed = done.Where(d => d is { AtLimit: true }).Select(d => d!.Value.Label).ToList();
