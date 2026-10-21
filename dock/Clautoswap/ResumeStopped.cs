@@ -481,6 +481,13 @@ public static class ResumeStopped
         catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return null; }
     }
 
+    /// Exit code 0, unlike Process.Kill's: Windows Terminal closes a tab whose shell exits 0, and keeps one that died with -1 open as a dead tab.
+    /// The handle is the one whose start time was just checked, so a recycled pid is never hit.
+    internal static void EndShell(Process proc)
+    {
+        if (!TerminateProcess(proc.SafeHandle.DangerousGetHandle(), 0)) throw new InvalidOperationException("TerminateProcess failed");
+    }
+
     static async Task CloseShellsAsync(List<(int Pid, string Name, DateTime Start)> chain)
     {
         foreach (var (p, name, start) in chain)
@@ -490,7 +497,7 @@ public static class ResumeStopped
                 using var proc = Process.GetProcessById(p);
                 if (proc.StartTime != start) continue; // the pid went to another process meanwhile: never kill that
                 if (name == "cswap") { try { await proc.WaitForExitAsync(new CancellationTokenSource(30_000).Token); } catch (OperationCanceledException) { } }
-                else proc.Kill();
+                else EndShell(proc);
             }
             catch (ArgumentException) { } // already gone
             catch (InvalidOperationException) { }
@@ -579,6 +586,7 @@ public static class ResumeStopped
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool Process32First(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Process32Next(nint snap, ref PROCESSENTRY32 e);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(nint h, uint exitCode);
 
     [StructLayout(LayoutKind.Sequential)]
     struct LASTINPUTINFO { public uint cbSize, dwTime; }

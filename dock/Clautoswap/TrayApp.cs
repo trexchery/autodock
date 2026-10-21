@@ -27,6 +27,9 @@ public sealed partial class TrayApp : ApplicationContext
     readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
+    double Threshold => _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
+    readonly Dictionary<string, DateTime> _busySince = []; // busy windows at a limit → when first seen so: only ones still busy after a grace are told about
+    static readonly TimeSpan BusyGrace = TimeSpan.FromSeconds(10);
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
@@ -43,7 +46,7 @@ public sealed partial class TrayApp : ApplicationContext
     {
         _engine = engine;
         _limits = new(() => _snap, ResumeStopped.DefaultLogin, () => LiveOrLaunching(),
-            _engine.ImportUsageAsync, _engine.SwitchNowAsync, _reported, Program.Log, threshold: () => _engineThreshold ?? 97);
+            _engine.ImportUsageAsync, _engine.SwitchNowAsync, _reported, Program.Log, threshold: () => Threshold);
         _limitWatch = new(hit => _ui.Post(_ => _ = OnLimitAsync(hit), null), Program.Log);
         _tray = new NotifyIcon { Icon = TrayIcons.App, Text = "clautoswap", Visible = true, ContextMenuStrip = _menu };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleDashboard(); };
@@ -341,7 +344,7 @@ public sealed partial class TrayApp : ApplicationContext
         try { stopped = await Task.Run(() => ScanStops(snap, includeBusy: true)); }
         catch (Exception e) { Program.Log(e); return; }
         if (stopped.Count > 0 && _engineThreshold == null) await ReadEngineThresholdAsync();
-        var (threshold, hysteresis) = (_engineThreshold ?? 90, _engineHysteresis ?? 10);
+        var (threshold, hysteresis) = (Threshold, _engineHysteresis ?? 10);
         var now = DateTimeOffset.UtcNow;
         var load = new Dictionary<int, int>();
         var plan = new List<(StoppedSession S, Account To, string Dir)>();
@@ -353,7 +356,10 @@ public sealed partial class TrayApp : ApplicationContext
             // reset, whatever the login is now, so it is reopened once it is idle (the poll looks again).
             if (!s.Idle)
             {
-                if (s.AtLimit && s.Status != "waiting" && _told.Add($"{s.SessionId}@{s.Limit?.At.Ticks}"))
+                // A window still marked busy just after writing its error is about to go idle: told about only if it stays busy past the grace.
+                var told = $"{s.SessionId}@{s.Limit?.At.Ticks}";
+                if (s.AtLimit && s.Status != "waiting" && !_told.Contains(told)
+                    && DateTime.UtcNow - _busySince.GetValueOrDefault(told, _busySince[told] = DateTime.UtcNow) >= BusyGrace && _told.Add(told))
                 {
                     left.Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} (#{s.Account})");
                     Program.Log($"nudge {s.SessionId} left {s.Status}");
