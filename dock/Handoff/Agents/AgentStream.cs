@@ -7,7 +7,11 @@ namespace Handoff;
 public abstract record StreamEvent;
 public sealed record InitEvent(string? SessionId, string? Model) : StreamEvent;
 public sealed record TextEvent(string Text) : StreamEvent;
-public sealed record ToolEvent(string Name, string? Target) : StreamEvent;
+public sealed record ToolEvent(string Name, string? Target, string? Id = null) : StreamEvent;
+/// A tool call's result came back (`user` message content).
+public sealed record ToolDoneEvent(string Id) : StreamEvent;
+/// Claude's own list of background tasks (shells, subagents, workflows) changed: how many are still running.
+public sealed record BackgroundEvent(int Running) : StreamEvent;
 public sealed record TurnEvent(string MessageId, long OutputTokens) : StreamEvent;
 public sealed record ResultEvent(bool IsError, string? Subtype, string Text, double? CostUsd, int? Turns, long? OutputTokens, Tokens? Tokens = null, long? DurationMs = null) : StreamEvent;
 /// A run's tokens: every model's, subagents and workflow agents included when Claude reports `modelUsage`. A resumed
@@ -76,6 +80,7 @@ public sealed class StreamTail(string path)
     {
         line = line.Trim("\r\n\t "u8);
         if (line.Length < 2 || line[0] != (byte)'{') return;
+        if (line.StartsWith("{\"type\":\"stream_event\""u8)) return; // partial-message deltas: only their arrival matters (the file grows)
         try
         {
             using var doc = JsonDocument.Parse(line.ToArray());
@@ -84,6 +89,13 @@ public sealed class StreamTail(string path)
             {
                 case "system" when Str(root, "subtype") == "init":
                     into.Add(new InitEvent(Str(root, "session_id"), Str(root, "model")));
+                    break;
+                case "system" when Str(root, "subtype") == "background_tasks_changed" && root.TryGetProperty("tasks", out var tasks) && tasks.ValueKind == JsonValueKind.Array:
+                    into.Add(new BackgroundEvent(tasks.GetArrayLength()));
+                    break;
+                case "user" when root.TryGetProperty("message", out var um) && um.ValueKind == JsonValueKind.Object && um.TryGetProperty("content", out var uc) && uc.ValueKind == JsonValueKind.Array:
+                    foreach (var c in uc.EnumerateArray())
+                        if (Str(c, "type") == "tool_result" && Str(c, "tool_use_id") is { } done) into.Add(new ToolDoneEvent(done));
                     break;
                 case "assistant" when root.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object:
                     if (Str(msg, "id") is { } id)
@@ -97,7 +109,7 @@ public sealed class StreamTail(string path)
                                 into.Add(new TextEvent(t));
                                 break;
                             case "tool_use":
-                                into.Add(new ToolEvent(Str(c, "name") ?? "tool", c.TryGetProperty("input", out var input) ? Target(input) : null));
+                                into.Add(new ToolEvent(Str(c, "name") ?? "tool", c.TryGetProperty("input", out var input) ? Target(input) : null, Str(c, "id")));
                                 break;
                         }
                     }
@@ -169,5 +181,33 @@ public sealed class StreamTail(string path)
         if (s.IndexOfAny(['\\', '/']) < 0 || s.Contains(' ')) return s;
         var parts = s.Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
         return parts.Length <= 3 ? s : "…/" + string.Join('/', parts[^3..]);
+    }
+}
+
+/// What a run is waiting on, read from its own stream as it grows: tool calls whose result has not come back, the
+/// background tasks Claude reports (shells, subagents, workflows), and whether it already gave its final answer.
+/// Silence while something is pending is waiting, not a stall; an answer is final only with a HANDOFF marker, since a
+/// run can answer "still running in the background" and go on once that work ends.
+public sealed class RunActivity
+{
+    internal static readonly System.Text.RegularExpressions.Regex FinalMarker = new(@"HANDOFF:\s*(DONE|BLOCKED|APPROVED|CHANGES|PLAN)\b");
+    readonly HashSet<string> _tools = [];
+
+    public int Background { get; private set; }
+    /// When a result carrying a final marker arrived; cleared when the run goes on after it.
+    public DateTimeOffset? Answered { get; private set; }
+    public bool Pending => _tools.Count > 0 || Background > 0;
+
+    public void Add(IEnumerable<StreamEvent> events, DateTimeOffset now)
+    {
+        foreach (var e in events)
+            switch (e)
+            {
+                case ToolEvent { Id: { } id }: _tools.Add(id); Answered = null; break;
+                case ToolDoneEvent d: _tools.Remove(d.Id); break;
+                case BackgroundEvent b: Background = b.Running; break;
+                case ResultEvent r: Answered = FinalMarker.IsMatch(r.Text) ? now : r.Text.Trim().Length > 0 ? null : Answered; _tools.Clear(); break; // a turn ended: its calls are over
+                case InitEvent or TurnEvent or TextEvent: Answered = null; break; // it went on
+            }
     }
 }

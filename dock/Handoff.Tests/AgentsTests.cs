@@ -883,7 +883,13 @@ public class AgentWorkerPolicyTests
         Assert.Equal("1", env["CLAUDE_CODE_DISABLE_WORKFLOWS"]);
         Assert.True(env.ContainsKey("ANTHROPIC_MODEL") && env["ANTHROPIC_MODEL"] == null);
         Assert.True(env.ContainsKey("MAX_THINKING_TOKENS") && env["MAX_THINKING_TOKENS"] == null);
-        Assert.Null(Supervisor.WorkerEnvironment(Path.Combine(tmp.Path, "no-gh"), ultracode: true).GetValueOrDefault("CLAUDE_CODE_DISABLE_WORKFLOWS"));
+        Assert.Equal("1", env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"]); // no hidden consultation of another model
+        Assert.False(env.ContainsKey("CLAUDE_CODE_SUBAGENT_MODEL_FORCE"));
+        var fanned = Supervisor.WorkerEnvironment(Path.Combine(tmp.Path, "no-gh"), new RunSettings("haiku", "low", true));
+        Assert.Null(fanned.GetValueOrDefault("CLAUDE_CODE_DISABLE_WORKFLOWS"));
+        // Subagents and workflow agents run on the run's own model, whatever a repository's settings allow.
+        Assert.Equal(("haiku", "1"), (fanned["CLAUDE_CODE_SUBAGENT_MODEL"], fanned["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]));
+        Assert.Contains("--include-partial-messages", work); // a request that streams shows progress
     }
 }
 

@@ -1,6 +1,7 @@
 # Fake claude-swap engine for the handoff agents tests. Synthetic only: no credentials anywhere.
 # `run N --require-session -- <claude args>` plays a headless Claude Code worker; prompt markers pick
-# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:hold] [fake:break] [fake:learn]; a prompt with
+# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:hold] [fake:break] [fake:learn] [fake:think]
+# [fake:bgwait] [fake:linger]; a prompt with
 # `HANDOFF: PLAN` plays the director: it answers with the oldest $FAKE_LOG.plan-*.json (used once), else a plan that changes nothing.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -59,7 +60,14 @@ Emit @{ type = 'system'; subtype = 'init'; session_id = $session; model = 'fake-
 
 function Finish([string]$text, [bool]$isError = $false) {
     $sub = if ($isError) { 'error_during_execution' } else { 'success' }
-    Emit @{ type = 'result'; subtype = $sub; is_error = $isError; result = $text; num_turns = 2; total_cost_usd = 0.01; session_id = $session }
+    $linger = $prompt -match '\[fake:linger\]' -and $prompt -notmatch 'You are reviewing'
+    # As Claude does with background work: an answer that it still runs first, and an empty result last.
+    if ($linger) { Emit @{ type = 'result'; subtype = 'success'; is_error = $false; result = 'The agent is still running in the background.'; session_id = $session } }
+    Emit @{ type = 'result'; subtype = $sub; is_error = $isError; result = $text; num_turns = 2; total_cost_usd = 0.01; session_id = $session; duration_ms = 1200 }
+    if ($linger) {
+        Emit @{ type = 'result'; subtype = 'success'; is_error = $false; result = ''; session_id = $session; duration_ms = 5 }
+        Start-Sleep -Seconds 120 # answered, but the process stays: handoff closes it
+    }
     if ($isError) { exit 1 } else { exit 0 }
 }
 
@@ -93,6 +101,20 @@ if ($prompt -match '\[fake:hold\]') {
         Emit @{ type = 'assistant'; message = @{ id = "h$k"; content = @(@{ type = 'text'; text = "hold $k" }) } }
         Start-Sleep -Milliseconds 300
     }
+}
+if ($prompt -match '\[fake:think\]') {
+    # Reasoning that only streams partial deltas: no message, no tool, no CPU to speak of.
+    for ($k = 0; $k -lt 16; $k++) {
+        [Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}')
+        [Console]::Out.Flush()
+        Start-Sleep -Seconds 1
+    }
+}
+if ($prompt -match '\[fake:bgwait\]' -and $prompt -notmatch 'You are reviewing') {
+    # A background task Claude waits on, quietly.
+    Emit @{ type = 'system'; subtype = 'background_tasks_changed'; tasks = @(@{ task_id = 'b1'; task_type = 'local_bash'; description = 'wait' }) }
+    Start-Sleep -Seconds 16
+    Emit @{ type = 'system'; subtype = 'background_tasks_changed'; tasks = @() }
 }
 if ($prompt -match 'HANDOFF: PLAN') {
     $plan = '{"status":"working","summary":"nothing new","items":[]}'

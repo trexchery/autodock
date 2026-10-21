@@ -10,7 +10,14 @@ public sealed class AgentsConfig
     /// (the engine's, else the tray's one fallback) before the first dispatch, so runs and window moves agree.
     public double Threshold { get; set; } = 90;
     public bool ConsumeFirst { get; set; }
-    public TimeSpan Stall { get; set; } = TimeSpan.FromMinutes(15);
+    /// No output and no CPU this long while nothing is pending: stalled (a hung request or a hidden prompt). Reasoning and
+    /// writing stream (partial messages, thinking tokens), so a live request is never this quiet.
+    public TimeSpan Stall { get; set; } = TimeSpan.FromMinutes(10);
+    /// The same while a tool call or a background task is pending, or ultracode fans out: they may wait quietly on the
+    /// network. Above Claude's own 10-minute limit on a foreground command and its 10-minute idle wait for background work.
+    public TimeSpan PendingStall { get; set; } = TimeSpan.FromMinutes(25);
+    /// A run that gave its final answer with nothing pending but has not exited after this is closed and judged.
+    public TimeSpan FinishGrace { get; set; } = TimeSpan.FromSeconds(15);
     public TimeSpan ScanEvery { get; set; } = TimeSpan.FromMinutes(15);
     public TimeSpan PrEvery { get; set; } = TimeSpan.FromMinutes(10);
     public TimeSpan StopGrace { get; set; } = TimeSpan.FromSeconds(60);
@@ -130,6 +137,10 @@ public sealed partial class Supervisor : IDisposable
         public string? StopReason;
         /// Ultracode: its workflow agents can wait on the network for long, quiet stretches.
         public bool Fanned;
+        public StreamTail Tail { get; } = new(outPath);
+        public RunActivity Activity { get; } = new();
+        /// Its account's run count when it started (Measure).
+        public int StartedAs;
         public Task? Finished;
     }
 
@@ -190,6 +201,7 @@ public sealed partial class Supervisor : IDisposable
     public void UpdateAccounts(IReadOnlyList<Account> claude, IReadOnlyList<ProjectMapping> maps, IReadOnlySet<int>? live = null)
     {
         _accounts = claude;
+        FlushMeasures(force: false); // a reading taken after a run ended completes its line
         _maps = maps;
         _live = live ?? new HashSet<int>();
         foreach (var (item, w) in _workers)
@@ -266,6 +278,9 @@ public sealed partial class Supervisor : IDisposable
         void Min(TimeSpan t) { if (next is not { } n || t < n) next = t < TimeSpan.Zero ? TimeSpan.Zero : t; }
         if (retry) Min(TimeSpan.FromSeconds(30));
         if (_workers.Count > 0) Min(TimeSpan.FromSeconds(Math.Clamp(Config.Stall.TotalSeconds / 4, 1, 60)));
+        // An answered run with nothing pending is closed once it has been quiet for FinishGrace: wake then, never sooner.
+        foreach (var w in _workers.Values.Where(w => w is { StopReason: null, Activity: { Answered: not null, Pending: false } }))
+            Min(TimeSpan.FromMilliseconds(Math.Max(w.LastProgress + Config.FinishGrace.TotalMilliseconds - AgentProcess.UnbiasedMilliseconds, Config.FinishGrace.TotalMilliseconds / 4)));
         if (_workers.Count > 0 && DateTimeOffset.Now - _lastLaunch < Config.Ramp) Min(_lastLaunch + Config.Ramp - DateTimeOffset.Now); // the gap between starts ends
         if ((_workers.Count > 0 || _verifying.Count > 0) && DateTimeOffset.Now - _started < Config.Relink) Min(_started + Config.Relink - DateTimeOffset.Now);
         foreach (var repo in _state.Repos.Where(Active))
@@ -303,16 +318,25 @@ public sealed partial class Supervisor : IDisposable
         foreach (var (item, w) in _workers.ToList())
         {
             if (w.StopReason != null) continue;
+            // What it waits on, from what it wrote since the last look (partial-message deltas are skipped unparsed).
+            // At most 2 MB a look: a re-attached run's long file catches up over a few looks instead of holding up the tray.
+            for (var (k, at) = (0, -1L); k < 8 && w.Tail.Offset != at; k++) { at = w.Tail.Offset; w.Activity.Add(w.Tail.Read(), DateTimeOffset.Now); }
             var len = FileLength(w.OutPath);
             var cpu = w.Proc.CpuTime;
-            if (len != w.LastLen || cpu - w.LastCpu > TimeSpan.FromSeconds(2))
-            {
-                (w.LastLen, w.LastCpu, w.LastProgress) = (len, cpu, now);
-                continue;
-            }
-            if (now - w.LastProgress > Config.Stall.TotalMilliseconds * (w.Fanned ? 3 : 1)) Fire(() => StopWorkerAsync(item, "stalled"));
+            if (len != w.LastLen || cpu - w.LastCpu > TimeSpan.FromSeconds(2)) (w.LastLen, w.LastCpu, w.LastProgress) = (len, cpu, now);
+            if (Verdict(w.Activity, w.Fanned, TimeSpan.FromMilliseconds(now - w.LastProgress), DateTimeOffset.Now, Config) is { } verdict)
+                Fire(() => StopWorkerAsync(item, verdict));
         }
     }
+
+    /// What a run's quiet means. "finished": it gave its final answer, nothing it started still runs, and it has been
+    /// quiet for FinishGrace since (a turn starting again streams first), yet Claude has not exited; it is closed and
+    /// judged like any finished run. "stalled": no output and no CPU for Stall, or PendingStall while a tool call or
+    /// background task is pending (or ultracode fans out). Quiet alone is never taken for completion: only the answer is.
+    internal static string? Verdict(RunActivity a, bool fanned, TimeSpan idle, DateTimeOffset now, AgentsConfig c) =>
+        a is { Answered: { } at, Pending: false } && now - at >= c.FinishGrace && idle >= c.FinishGrace ? "finished"
+        : idle > (fanned || a.Pending ? c.PendingStall : c.Stall) ? "stalled"
+        : null;
 
     async Task DispatchAsync()
     {
@@ -330,7 +354,6 @@ public sealed partial class Supervisor : IDisposable
                 var triage = goal == repo.Triage;
                 var settings = triage ? Routing.Triage : Routing.Plan;
                 var (planner, why) = PickAccount(repo, null, settings.Model);
-                if (planner == null && triage) (planner, settings) = (PickAccount(repo, null, Routing.TriageFallback.Model).Item1, Routing.TriageFallback);
                 if (planner == null) { if (!triage) waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why; }
                 else if (_workers.Count == 0 || DateTimeOffset.Now - _lastLaunch >= Config.Ramp)
                 {
@@ -495,7 +518,7 @@ public sealed partial class Supervisor : IDisposable
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
             var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings), wt, item.Run.Job,
-                promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings.Ultracode));
+                promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
             Watch(repo, item, proc);
@@ -529,7 +552,7 @@ public sealed partial class Supervisor : IDisposable
     internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null) =>
     [
         "run", account.ToString(), "--require-session", "--",
-        "-p", "--output-format", "stream-json", "--verbose",
+        "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", // a request that streams is never taken for a stall
         resume ? "--resume" : "--session-id", session,
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
@@ -542,8 +565,10 @@ public sealed partial class Supervisor : IDisposable
     /// pull requests itself, after verifying and review. Runs act as the owner's Windows user, so this
     /// stops mistakes and casual attempts, not a determined program; Claude's own auto-mode classifier,
     /// the owner-only issue and comment rules, and holding workflow changes for the owner do the rest.
-    /// Nothing that remaps a model alias or sets thinking comes along; without `ultracode`, workflows are off outright.
-    internal static Dictionary<string, string?> WorkerEnvironment(string noGh, bool ultracode = false)
+    /// Nothing that remaps a model alias or sets thinking comes along. A run's subagents and workflow agents run on its
+    /// own model (a repository's settings cannot widen the allowlist for them); no advisor consults another model behind
+    /// its back; without ultracode, workflows are off outright.
+    internal static Dictionary<string, string?> WorkerEnvironment(string noGh, RunSettings? run = null)
     {
         Directory.CreateDirectory(noGh);
         var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -571,7 +596,9 @@ public sealed partial class Supervisor : IDisposable
         };
         foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
             if (e.Key is string k && (k.StartsWith("CLAUDE_CODE_", StringComparison.OrdinalIgnoreCase) || k.StartsWith("ANTHROPIC_DEFAULT_", StringComparison.OrdinalIgnoreCase))) env[k] = null;
-        if (!ultracode) env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1";
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1";
+        if (run?.Ultracode != true) env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1";
+        if (run != null) (env["CLAUDE_CODE_SUBAGENT_MODEL"], env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]) = (run.Model, "1");
         return env;
     }
 
@@ -593,6 +620,7 @@ public sealed partial class Supervisor : IDisposable
     void Watch(RepoAgents repo, object key, Run run, string outPath, AgentProcess proc, Func<Worker, Task> finish)
     {
         var w = new Worker(repo, proc, outPath, run.Email + "|" + run.Org) { LastCpu = proc.CpuTime, Fanned = run.Settings?.Ultracode == true };
+        w.StartedAs = _starts[w.Account] = _starts.GetValueOrDefault(w.Account) + 1; // a reading taken after this counts this run too
         w.LastLen = FileLength(outPath);
         _workers[key] = w;
         w.Finished = Fire(async () =>
@@ -615,7 +643,7 @@ public sealed partial class Supervisor : IDisposable
     async Task FinishRunAsync(RepoAgents repo, WorkItem item, Worker? w)
     {
         if (_disposed) return; // the next start re-attaches or judges it
-        var reason = w?.StopReason;
+        var reason = w?.StopReason is "finished" ? null : w?.StopReason; // closed after its final answer: judged as finished
         if (w != null)
         {
             await w.Proc.ReapAsync(); // still listed meanwhile: its account stays busy until the run is judged
@@ -638,7 +666,7 @@ public sealed partial class Supervisor : IDisposable
         }
         var events = StreamTail.ReadAll(_store.RunFile(repo, item, run.Attempt, "out"));
         var started = events.OfType<InitEvent>().Any();
-        var result = events.OfType<ResultEvent>().LastOrDefault();
+        var result = FinalResult(events);
         var text = result?.Text ?? "";
         var err = TailOf(_store.RunFile(repo, item, run.Attempt, "err"), 2000);
         // Found ended at start with no result: something outside stopped it (a restart, a sign-out,
@@ -695,7 +723,7 @@ public sealed partial class Supervisor : IDisposable
         else if (!started) { outcome = "did not start"; _notBefore[item] = DateTimeOffset.Now + Config.LaunchBackoff; Charge(repo, item, "Claude did not start: " + OneLine(err)); }
         else if (!review && result is { IsError: false }) { outcome = "done"; EnterChecking(item, LastLine(text)); }
         else { outcome = "error"; Charge(repo, item, result == null ? "the run ended without a result" : OneLine(text)); } // an API or tool error: not the work's to escalate
-        Measure(repo, item.Label, run, outcome, events, run.Settings?.Model);
+        Measure(repo, item.Label, run, outcome, events, run.Settings?.Model, w);
         Save();
         if (item.State == ItemState.Checking) await CheckAsync(repo, item);
         Pump();
@@ -714,27 +742,65 @@ public sealed partial class Supervisor : IDisposable
         else if (repo.Triage is { } t) AddLog(t, DateTimeOffset.Now, $"{item.Label}: {up.Why}, now {up.Line}");
     }
 
+    /// The run's answer. A run can end with several results (one saying its background work still runs, an empty one
+    /// last), so: the last that carries a HANDOFF marker, else the last with text, else the last.
+    internal static ResultEvent? FinalResult(List<StreamEvent> events)
+    {
+        var results = events.OfType<ResultEvent>().ToList();
+        return results.LastOrDefault(r => RunActivity.FinalMarker.IsMatch(r.Text)) ?? results.LastOrDefault(r => r.Text.Trim().Length > 0) ?? results.LastOrDefault();
+    }
+
+    /// Finished runs waiting for their account's next usage reading, and when each account last started a run.
+    /// `Starts`: the account's run count at the end, -1 when another run shared the account meanwhile, -2 when no one watched it end.
+    readonly List<(Dictionary<string, object?> Line, string Account, string? Model, DateTimeOffset Ended, int Starts)> _unmeasured = [];
+    /// Runs started (or re-attached) per account: a count that moves during or after a run means its readings are shared.
+    readonly Dictionary<string, int> _starts = [];
+
     /// One finished run's measurements, appended to metrics.jsonl (local, never sent anywhere): what it ran with, what
-    /// Claude says it ran on, how long, its tokens, and its account's usage at start and now. Quota is the usage
-    /// readings' difference, never the price-table cost Claude also reports.
-    void Measure(RepoAgents repo, string what, Run run, string outcome, List<StreamEvent> events, string? model)
+    /// Claude says it ran on, how long, its tokens, and its account's usage before and after. Quota is the usage
+    /// readings' difference, never the price-table cost Claude also reports. The line waits for the tray's next reading
+    /// of the account (FlushMeasures): the one at hand is older than the end.
+    void Measure(RepoAgents repo, string what, Run run, string outcome, List<StreamEvent> events, string? model, Worker? w)
     {
         (run.Outcome, run.Ended) = (outcome, DateTimeOffset.Now);
-        var result = events.OfType<ResultEvent>().LastOrDefault();
+        var result = events.OfType<ResultEvent>().LastOrDefault(r => r.Tokens != null) ?? events.OfType<ResultEvent>().LastOrDefault(); // modelUsage is the session's running total
         var line = new Dictionary<string, object?>
         {
             ["at"] = run.Ended, ["repo"] = repo.Leaf, ["item"] = what, ["kind"] = run.Kind, ["attempt"] = run.Attempt,
             ["model"] = run.Settings?.Model, ["effort"] = run.Settings?.Effort, ["ultracode"] = run.Settings?.Ultracode,
             ["ran_on"] = events.OfType<InitEvent>().LastOrDefault()?.Model,
             ["seconds"] = (int)(run.Ended.Value - run.Started).TotalSeconds,
-            ["claude_ms"] = result?.DurationMs, ["turns"] = result?.Turns, ["tokens"] = result?.Tokens,
+            ["claude_ms"] = events.OfType<ResultEvent>().Sum(r => r.DurationMs ?? 0), ["turns"] = result?.Turns, ["tokens"] = result?.Tokens,
             ["resumed"] = run.Resumed, // a resumed conversation's tokens are its whole history's
             ["quota_start"] = run.QuotaStart,
-            ["quota_end"] = Routing.Snap(_accounts?.FirstOrDefault(a => AccountPicker.Key(a) == run.Email + "|" + run.Org), model),
+            ["quota_end"] = null,
             ["outcome"] = outcome,
         };
-        try { File.AppendAllText(Path.Combine(_store.Root, "metrics.jsonl"), JsonSerializer.Serialize(line, Json.Options) + "\n"); }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Program.Log(e); }
+        var account = run.Email + "|" + run.Org;
+        var starts = _starts.GetValueOrDefault(account);
+        _unmeasured.Add((line, account, model, run.Ended.Value,
+            w == null ? -2 : starts != w.StartedAs || _workers.Values.Any(o => o != w && o.Account == account) ? -1 : starts));
+    }
+
+    /// Writes the lines whose end reading has come: a live reading of the account taken after the run ended. It stays
+    /// empty, with why, when another run started there first, a usage window reset during the run, or no fresh reading
+    /// came within half an hour or before handoff stopped (`force`): a stale or shared reading would mislead.
+    void FlushMeasures(bool force)
+    {
+        foreach (var m in _unmeasured.ToList())
+        {
+            var end = Routing.Snap(_accounts?.FirstOrDefault(a => AccountPicker.Key(a) == m.Account), m.Model);
+            var fresh = end is { At: { } at } && at > m.Ended;
+            if (!fresh && !force && DateTimeOffset.Now - m.Ended < TimeSpan.FromMinutes(30)) continue;
+            var shared = m.Starts == -1 || m.Starts >= 0 && _starts.GetValueOrDefault(m.Account) != m.Starts;
+            var reset = (m.Line["quota_start"] as QuotaSnap)?.ResetsAt is { } r && end?.At >= r;
+            m.Line["quota_end"] = fresh && !shared && !reset && m.Starts != -2 ? end : null;
+            if (m.Line["quota_end"] == null)
+                m.Line["quota_note"] = m.Starts == -2 ? "it ended while handoff was not running" : shared ? "another run shared the account" : !fresh ? "no fresh reading after the run" : "a usage window reset during the run";
+            try { File.AppendAllText(Path.Combine(_store.Root, "metrics.jsonl"), JsonSerializer.Serialize(m.Line, Json.Options) + "\n"); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Program.Log(e); }
+            _unmeasured.Remove(m);
+        }
     }
 
     /// Not the run's fault: rest its account until it resets (an hour when unknown).
@@ -959,6 +1025,7 @@ public sealed partial class Supervisor : IDisposable
     {
         _disposed = true;
         _timer.Dispose();
+        FlushMeasures(force: true);
         // Runs keep going; the next start re-attaches them, and stops them unless their terminal is open.
         foreach (var w in _workers.Values) w.Proc.Dispose();
         _workers.Clear();

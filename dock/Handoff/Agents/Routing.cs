@@ -33,7 +33,8 @@ public sealed class Route
 public sealed record RunSettings(string Model, string Effort, bool Ultracode);
 
 /// An account's usage when a run started or ended, in percent; not money.
-public sealed record QuotaSnap(double? FiveHour, double? SevenDay, double? Model);
+/// `At`: when the reading was taken; `ResetsAt`: the soonest reset among its windows (a delta across it means nothing).
+public sealed record QuotaSnap(double? FiveHour, double? SevenDay, double? Model, DateTimeOffset? At = null, DateTimeOffset? ResetsAt = null);
 
 /// Deterministic routing: validates the director's recommendations, picks reviewer and planner settings, escalates
 /// after genuine failures, and gates ultracode. The director advises; this decides.
@@ -77,8 +78,9 @@ public static class Routing
         _ => new(work.Model == "opus" ? "opus" : "sonnet", "medium", false),
     };
 
-    /// A goal's plan reads the whole project: Opus. Routing the backlog is lighter: Opus when there is room, else Sonnet.
-    public static readonly RunSettings Plan = new("opus", "high", false), Triage = new("opus", "medium", false), TriageFallback = new("sonnet", "high", false);
+    /// A goal's plan reads the whole project and decides its architecture: Opus. Routing the backlog judges bounded
+    /// descriptions and runs whenever new issues arrive: Sonnet, at high effort, keeps Opus for the work that needs it.
+    public static readonly RunSettings Plan = new("opus", "high", false), Triage = new("sonnet", "high", false);
 
     /// After a genuine failure: one lever moves, chosen by the kind of failure. A review that found problems wants better
     /// reasoning (model first); a check that keeps failing wants more care (effort first); with both at the top, ultracode.
@@ -117,11 +119,12 @@ public static class Routing
 
     public static QuotaSnap? Snap(Account? a, string? model, DateTimeOffset? now = null)
     {
-        if (a?.ShownUsage is not { } u) return null;
+        if (a?.Usage is not { } u) return null; // live only: the last good reading may be hours old
         var t = now ?? DateTimeOffset.Now;
         double? Live(Window? w) => w is null ? null : w.ResetsAt is { } r && r <= t ? 0 : w.Pct;
         var scoped = model == null ? null : (u.Scoped ?? []).Where(w => w.Name?.Contains(model, StringComparison.OrdinalIgnoreCase) == true).Select(Live).Max();
-        return new(Live(u.FiveHour), Live(u.SevenDay), scoped);
+        var resets = new[] { u.FiveHour, u.SevenDay }.Concat(u.Scoped ?? []).Select(w => w?.ResetsAt).Where(r => r > t).Min();
+        return new(Live(u.FiveHour), Live(u.SevenDay), scoped, a.UsageFetchedAt ?? (a.UsageAgeSeconds is { } s ? t - TimeSpan.FromSeconds(s) : null), resets);
     }
 
     /// The flags that fix a run's model, effort and ultracode, so nothing is inherited from the profile's settings. The

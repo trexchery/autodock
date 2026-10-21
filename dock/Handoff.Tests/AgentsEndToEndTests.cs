@@ -446,7 +446,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         // The triage plans nothing and is read-only, without workflows; the work run uses its route, the reviewer is never Haiku.
         Assert.Equal(2, await On(r => r.Items.Count));
         Assert.Contains("NotebookEdit", Runs[0]);
-        Assert.Contains("--model opus --effort medium", Runs[0]);
+        Assert.Contains("--model sonnet --effort high", Runs[0]); // routing the backlog spends no Opus
         Assert.Contains("\"ultracode\":false", Runs[0]);
         Assert.Contains("issue #41", Read(_log + ".prompts").Split("---- account")[2]);
         Assert.Contains("--model haiku --effort high", Runs[1]);
@@ -460,13 +460,47 @@ public sealed class AgentsEndToEndTests : IDisposable
         // The triage is no goal of the owner's; every run was measured, quota as usage, never as cost.
         Assert.Equal("No goals yet.", await Tool("agents_goal", """{"action":"list"}"""));
         Assert.Contains("route haiku · low (trivial, director)", await Tool("agents_details", """{"item":"#40"}"""));
-        var metrics = Read(Path.Combine(P("agents"), "metrics.jsonl")).Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.True(metrics.Length >= 5);
-        using var first = JsonDocument.Parse(metrics[0]);
-        Assert.Equal(("plan", "plan", "opus", "fake-model"), (first.RootElement.GetProperty("kind").GetString(), first.RootElement.GetProperty("outcome").GetString(),
-            first.RootElement.GetProperty("model").GetString(), first.RootElement.GetProperty("ran_on").GetString()));
-        Assert.True(first.RootElement.GetProperty("quota_start").GetProperty("fiveHour").GetDouble() >= 0);
-        Assert.DoesNotContain("cost", metrics[0], StringComparison.OrdinalIgnoreCase);
+        // A line waits for a usage reading taken after its run ended: the one at hand is older.
+        Assert.False(File.Exists(Path.Combine(P("agents"), "metrics.jsonl")));
+        var fresh = Accounts.Select(a => a with { UsageFetchedAt = DateTimeOffset.Now.AddSeconds(1) }).ToList();
+        await _loop.Run(() => { _sup!.UpdateAccounts(fresh, []); return 0; });
+        var metrics = Read(Path.Combine(P("agents"), "metrics.jsonl")).Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => JsonDocument.Parse(l).RootElement).ToList();
+        Assert.True(metrics.Count >= 5);
+        Assert.Equal(("plan", "plan", "sonnet", "fake-model"), (metrics[0].GetProperty("kind").GetString(), metrics[0].GetProperty("outcome").GetString(),
+            metrics[0].GetProperty("model").GetString(), metrics[0].GetProperty("ran_on").GetString()));
+        Assert.True(metrics[0].GetProperty("quota_start").GetProperty("fiveHour").GetDouble() >= 0);
+        Assert.All(metrics, m => Assert.DoesNotContain("cost", m.GetRawText(), StringComparison.OrdinalIgnoreCase));
+        // Runs one after another on one account: only the last one's reading is its own; the others say why they have none.
+        var ends = metrics.Where(m => m.GetProperty("quota_end").ValueKind == JsonValueKind.Object).ToList();
+        Assert.NotEmpty(ends);
+        Assert.All(ends, m => Assert.True(m.GetProperty("quota_end").GetProperty("at").GetDateTimeOffset() > m.GetProperty("at").GetDateTimeOffset()));
+        Assert.All(metrics.Except(ends), m => Assert.Equal("another run shared the account", m.GetProperty("quota_note").GetString()));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task QuietButBusyRunsAreNotStalledAndALingeringAnsweredRunIsClosedAtOnce()
+    {
+        Issues("""
+        [
+          {"number":50,"title":"Think","body":"[fake:think] Reason quietly.","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":51,"title":"Wait","body":"[fake:bgwait] Wait on a background task.","labels":[],"assignees":[],"author":{"login":"owner"}},
+          {"number":52,"title":"Linger","body":"[fake:linger] Answer, then stay.","labels":[],"assignees":[],"author":{"login":"owner"}}
+        ]
+        """);
+        var config = Fast();
+        // Short windows: 16 s of streamed thinking and of a quiet background wait both outlast Stall.
+        (config.Stall, config.PendingStall, config.FinishGrace) = (TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(1));
+        await StartAsync(config);
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 50).State == ItemState.Open, "streamed reasoning is progress", 120);
+        await Until(r => Item(r, 51).State == ItemState.Open, "a pending background task is waiting, not a stall", 120);
+        var started = DateTime.UtcNow;
+        await Until(r => Item(r, 52).State == ItemState.Open, "an answered run that stays is closed and judged", 120);
+        Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(100), "not after the run's own two minutes");
+        Assert.Equal((0, 0, 0), await On(r => (Item(r, 50).Failures, Item(r, 51).Failures, Item(r, 52).Failures)));
+        // Its answer is the one with the marker, not the empty result after it nor the "still running" one before it.
+        Assert.Equal("added issue-52.txt", await On(r => Item(r, 52).Summary));
         _sup!.Dispose();
     }
 

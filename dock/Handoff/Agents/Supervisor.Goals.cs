@@ -151,7 +151,7 @@ public sealed partial class Supervisor
             Save(); // write-ahead
             var outPath = _store.RunFile(repo, probe, attempt, "out");
             var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume: false, review: true, settings), wt, goal.Run.Job,
-                promptPath, outPath, _store.RunFile(repo, probe, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh")));
+                promptPath, outPath, _store.RunFile(repo, probe, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (goal.Run.Pid, goal.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
             WatchPlanner(repo, goal, proc);
@@ -195,11 +195,12 @@ public sealed partial class Supervisor
             if (goal.State != GoalState.Active || !Owns(repo, goal)) return; // ended meanwhile: that decides
             var events = StreamTail.ReadAll(_store.RunFile(repo, probe, run.Attempt, "out"));
             var started = events.OfType<InitEvent>().Any();
-            var result = events.OfType<ResultEvent>().LastOrDefault();
+            var result = FinalResult(events);
             var text = result?.Text ?? "";
             var err = TailOf(_store.RunFile(repo, probe, run.Attempt, "err"), 2000);
-            var plan = w.StopReason != "owner" ? ParsePlan(text) : null;
-            Measure(repo, goal == repo.Triage ? "triage" : "goal " + goal.Id, run, plan != null ? "plan" : w.StopReason ?? (started ? "no plan" : "did not start"), events, run.Settings?.Model);
+            var stop = w.StopReason is "finished" ? null : w.StopReason; // closed after its final answer: judged as finished
+            var plan = stop != "owner" ? ParsePlan(text) : null;
+            Measure(repo, goal == repo.Triage ? "triage" : "goal " + goal.Id, run, plan != null ? "plan" : stop ?? (started ? "no plan" : "did not start"), events, run.Settings?.Model, w);
             if (plan != null)
             {
                 List<PlanStep> steps = plan.Status == "working" && goal != repo.Triage ? [.. (plan.Items ?? []).Take(MaxSteps)] : [];
@@ -211,8 +212,8 @@ public sealed partial class Supervisor
                 Ingest(_state.Repos, repo, goal, plan, issues, prs.Select(p => p.Title).ToList(), DateTimeOffset.Now);
                 if (goal.State == GoalState.NeedsOwner) Notify?.Invoke("Agents need you", $"{repo.Leaf} · goal {goal.Id}: {goal.Note}");
             }
-            else if (w.StopReason == "stalled") GoalFailed(repo, goal, "planning", "it stopped making progress");
-            else if (w.StopReason != null) { } // paused, stopped, its account went, or the owner acted: nothing failed, Replan stays
+            else if (stop == "stalled") GoalFailed(repo, goal, "planning", "it stopped making progress");
+            else if (stop != null) { } // paused, stopped, its account went, or the owner acted: nothing failed, Replan stays
             else if (LimitHit(text) || LimitHit(err)) CoolAccount(run.Email + "|" + run.Org);
             else if (!started && err.Contains("active default login", StringComparison.OrdinalIgnoreCase))
                 _cooled[run.Email + "|" + run.Org] = DateTimeOffset.Now.AddMinutes(5); // the owner switched to it: another account, free
@@ -462,15 +463,18 @@ public sealed partial class Supervisor
             routed++;
             if (item is not { Goal: null, Issue: not null } || item.Rank >= OwnerRank) continue;
             item.Rank = DirectorRank - order++;
-            item.After = [];
-            var after = new List<string>();
+            // What it already waits on stays: a later triage may add a prerequisite, never quietly drop one.
+            WorkItem? unlanded = null;
             foreach (var p in (h.After ?? []).Select(Ref).OfType<string>().Select(x => Find(repo, x)).OfType<WorkItem>().Distinct())
             {
-                if (p == item || p.State == ItemState.Done) continue;
+                var pk = Key(repo, p);
+                if (p == item || item.After.Contains(pk) || p is { State: ItemState.Done } && (p.Merged || p.Pr == null)) continue; // itself, known, or landed
+                if (p.State == ItemState.Done) { unlanded ??= p; continue; } // closed without merging: it can never land
                 if (Reaches(repos, p, Key(repo, item), [])) { AddLog(goal, now, $"ignored \"{item.Label} after {p.Label}\": {p.Label} already waits on it"); continue; }
-                after.Add(Key(repo, p));
+                item.After.Add(pk);
             }
-            item.After = after;
+            // The owner decides; an answer runs it after the rest of its prerequisites, which stay.
+            if (unlanded != null) (item.State, item.Note) = (ItemState.NeedsOwner, $"{SkipHold}{unlanded.Label}, whose pull request was closed without merging; answer to run it anyway");
         }
         foreach (var i in shown.Where(i => i.Route == null && !(goal.Run is { } run && i.Created > run.Started))) i.Route = Routing.Default; // what came in meanwhile goes to the next triage
         return routed;
