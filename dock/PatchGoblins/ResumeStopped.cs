@@ -575,7 +575,7 @@ public static class ResumeStopped
         {
             var name = NameOf(parent);
             if (name is not ("cswap" or "cmd" or "powershell" or "pwsh")) break;
-            // Only the console the tray opened (`cmd /k <engine> run …`): a shell the user started holds their own script or state.
+            // Only the console the tray opened (`pwsh -Command & '<engine>' 'run' …`, or the cmd fallback): a shell the user started holds their own script or state.
             if (name != "cswap" && !TrayConsole(CommandLineOf(parent))) break;
             // A real parent started before its child: a pid the system has since given to a newer process is not one.
             if (StartOf(p) is not { } child || StartOf(parent) is not { } start || start > child) break;
@@ -592,10 +592,12 @@ public static class ResumeStopped
         _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
     }
 
-    /// Whether a shell's command line is one `Engine.LaunchConsole` started: `cmd /k <…\cswap[.exe]> run …` (Windows Terminal),
-    /// or `cmd /k "title … && <…\cswap[.exe]> run …"` (conhost).
+    /// Whether a shell's command line is one `Engine.LaunchConsole` started: `pwsh … -Command & '<…\cswap[.exe]>' 'run' …`
+    /// (or powershell; conhost adds a title first), or the cmd fallback, `cmd /k <…\cswap[.exe]> run …` (Windows Terminal)
+    /// and `cmd /k "title … && <…\cswap[.exe]> run …"` (conhost).
     internal static bool TrayConsole(string? commandLine) =>
-        commandLine != null && Regex.IsMatch(commandLine, @"^""?[^""]*\bcmd(\.exe)?""?\s+/k\s.*\bcswap(\.exe)?""?\s+run\b", RegexOptions.IgnoreCase);
+        commandLine != null && Regex.IsMatch(commandLine,
+            @"^""?[^""]*\b(cmd(\.exe)?""?\s+/k|(pwsh|powershell)(\.exe)?""?\s.*-Command)\s.*\bcswap(\.exe)?['""]?\s+'?run\b", RegexOptions.IgnoreCase);
 
     /// A process's command line, null when it cannot be read.
     static string? CommandLineOf(int pid)

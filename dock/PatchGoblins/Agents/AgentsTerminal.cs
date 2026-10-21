@@ -10,10 +10,11 @@ namespace PatchGoblins;
 ///   settings.json  the `Patch Goblins · agents` status line, Patch Goblins' theme, and permission for its read-only tools
 ///   mcp.json       the Patch Goblins MCP bridge for this repository
 ///   statusline.sh  the owner's own status line (if any), with the label on its last row
-///   theme/         a theme-only plugin: the Patch Goblins theme (green mascot and accent) on the owner's own built-in theme
+///   theme/         a theme-only plugin: the Patch Goblins theme (green accent) on the owner's own built-in theme
 public static class AgentsTerminal
 {
-    public const string Label = "Patch Goblins · agents";
+    /// The tab's title; the status line says `Status` alone.
+    public const string Label = "Patch Goblins · agents", Status = "Patch Goblins";
 
     /// Seconds between Claude's own status-line refreshes: each one moves the gradient a step.
     public const int RefreshSeconds = 5;
@@ -63,16 +64,42 @@ public static class AgentsTerminal
             },
         }.ToJsonString());
         var leaf = Path.GetFileName(repo.TrimEnd('\\', '/'));
-        engine.LaunchConsole($"{Label} · {leaf}", repo, Launch.Run(null, restoreRc,
+        engine.LaunchConsole($"{Label} · {leaf}", repo, Mascot(dir), Launch.Run(null, restoreRc,
             ["--settings", settings, "--mcp-config", mcp, "--plugin-dir", plugin]));
     }
+
+    /// The goblin in place of Claude Code's mascot, for this session alone: `mascot.js` (see it) written beside the
+    /// session's files and preloaded into Claude Code through BUN_OPTIONS, which its Bun runtime reads. Nothing is
+    /// installed and no file of Claude's changes. The path goes in its 8.3 form where it holds a space (BUN_OPTIONS
+    /// splits on spaces); where there is none, the goblin is skipped rather than risk a broken option.
+    internal static IReadOnlyDictionary<string, string> Mascot(string dir)
+    {
+        var script = Path.Combine(dir, "mascot.js");
+        using (var s = typeof(AgentsTerminal).Assembly.GetManifestResourceStream("mascot.js")!)
+        using (var f = File.Create(script)) s.CopyTo(f);
+        var path = script.Contains(' ') ? ShortPath(script) : script;
+        if (path == null || path.Contains(' ')) return new Dictionary<string, string>();
+        var had = Environment.GetEnvironmentVariable("BUN_OPTIONS");
+        // Forward slashes: BUN_OPTIONS reads a backslash as an escape and would drop it.
+        return new Dictionary<string, string> { ["BUN_OPTIONS"] = (string.IsNullOrWhiteSpace(had) ? "" : had + " ") + "--preload " + path.Replace('\\', '/') };
+    }
+
+    static string? ShortPath(string path)
+    {
+        var sb = new StringBuilder(260);
+        return GetShortPathName(path, sb, sb.Capacity) is > 0 and < 260 ? sb.ToString() : null;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    static extern int GetShortPathName(string longPath, StringBuilder shortPath, int size);
 
     const string ThemePlugin = "patch-goblins-agents", ThemeSlug = "patch-goblins";
 
     /// The Patch Goblins theme, a theme-only plugin loaded for this session alone with --plugin-dir and selected through the
-    /// session's --settings: the owner's own built-in theme with a green mascot and green brand accent (the spinner and the
-    /// assistant label), as if picked in /theme. Nothing goes into ~/.claude and the owner's theme setting is never touched,
-    /// so every other terminal keeps its look. The mascot's pixels are Claude Code's own: only its color is a theme token.
+    /// session's --settings: the owner's own built-in theme with a green brand accent (the spinner and the assistant
+    /// label) and a green mascot color, as if picked in /theme. Nothing goes into ~/.claude and the owner's theme setting
+    /// is never touched, so every other terminal keeps its look. The mascot's pixels are not a theme's to change (nor a
+    /// mod's: no hook draws the header); `Mascot` swaps them for the goblin's, which this color then paints.
     internal static string WriteTheme(string dir, string? ownerTheme)
     {
         var baseTheme = BuiltInThemes.Contains(ownerTheme) ? ownerTheme! : "dark";
@@ -84,7 +111,7 @@ public static class AgentsTerminal
         {
             ["name"] = ThemePlugin,
             ["version"] = "1.0.0",
-            ["description"] = "Patch Goblins agents terminal: a green mascot and accent",
+            ["description"] = "Patch Goblins agents terminal: a green accent",
         }.ToJsonString());
         File.WriteAllText(Path.Combine(plugin, "themes", ThemeSlug + ".json"), new JsonObject
         {
@@ -95,7 +122,7 @@ public static class AgentsTerminal
         return plugin;
     }
 
-    /// What the label says after its gradient: working, needs you, paused or off (idle says nothing).
+    /// The state behind the status line: needs you, paused or off are said; working and idle show the name alone.
     public static string StateOf(RepoAgents? repo) =>
         repo is not { Authorized: true } ? "off"
         : repo.Paused ? "paused"
@@ -187,15 +214,14 @@ public static class AgentsTerminal
         return sb.ToString();
     }
 
-    /// The line for each state; working, needs you, paused and off say so, idle shows the label alone
+    /// The line for each state; needs you, paused and off say so, working and idle show the name alone
     /// (also for a state file from an older Patch Goblins).
     internal static readonly (string State, string Text)[] Lines =
     [
-        ("working", Label + " · working"),
-        ("attention", Label + " · needs you"),
-        ("paused", Label + " · paused"),
-        ("off", Label + " · off"),
-        ("*", Label),
+        ("attention", Status + " · needs you"),
+        ("paused", Status + " · paused"),
+        ("off", Status + " · off"),
+        ("*", Status),
     ];
 
     /// The goblin greens as `r;g;b`, from lime to spring green and back so the loop has no seam: soft enough to read on dark

@@ -193,6 +193,54 @@ public class FormatTests
         Assert.Equal("run", Engine.QuoteArg("run"));
         Assert.Equal("\"C:\\Program Files\\x\\cswap.exe\"", Engine.QuoteArg(@"C:\Program Files\x\cswap.exe"));
         Assert.Equal("\"a&b\"", Engine.QuoteArg("a&b"));
+        Assert.Equal("'run'", Engine.PsQuote("run"));
+        Assert.Equal("'it''s $x `n %PATH% & more'", Engine.PsQuote("it's $x `n %PATH% & more"));
+        Assert.Equal("('say '+[char]34+'hi'+[char]34+'')", Engine.PsQuote("say \"hi\"")); // never a `"` in the script
+    }
+
+    [Fact]
+    public void TheConsoleShellIsPowerShellWithCmdAsTheFallback()
+    {
+        Assert.Equal(["-NoLogo", "-NoExit", "-Command", @"& 'C:\Program Files\x\cswap.exe' 'run' '3' '--' '--resume' 'sid' 'it''s'"],
+            Engine.ShellArgs(@"C:\Program Files\PowerShell\7\pwsh.exe", null, @"C:\Program Files\x\cswap.exe", ["run", "3", "--", "--resume", "sid", "it's"]));
+        Assert.Equal(["-NoLogo", "-NoExit", "-Command", @"$Host.UI.RawUI.WindowTitle = 'Claude · a'; & 'C:\x\cswap.exe' 'run'"],
+            Engine.ShellArgs(@"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "Claude · a", @"C:\x\cswap.exe", ["run"]));
+        Assert.Equal(["/k", @"C:\x\cswap.exe", "run", "a&b"], Engine.ShellArgs(Engine.Cmd, null, @"C:\x\cswap.exe", ["run", "a&b"]));
+        Assert.Equal(["/k", @"title Claude  a && C:\x\cswap.exe run ""a&b"""], Engine.ShellArgs(Engine.Cmd, "Claude & a", @"C:\x\cswap.exe", ["run", "a&b"]));
+        Assert.True(Engine.Shell.EndsWith("pwsh.exe", StringComparison.OrdinalIgnoreCase) || Engine.Shell.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// Every argument reaches the program as typed, through the shell's `-Command` script (the conhost form, with its title).
+    [Fact]
+    public void ThePowerShellConsoleHandsArgumentsOverVerbatim()
+    {
+        var python = Engine.FindOnPath("python.exe");
+        if (python == null) return; // the probe
+        string[] args = ["-I", "-c", "import sys,json;print(json.dumps(sys.argv[1:]))", "run", "--", "it's \"quoted\"", "50% & more; `x` $y", "a b", "Ünïcödé · dot"];
+        var shellArgs = Engine.ShellArgs(Engine.Shell, "Claude · test", python, args);
+        var psi = new System.Diagnostics.ProcessStartInfo(Engine.Shell) { UseShellExecute = false, RedirectStandardOutput = true, StandardOutputEncoding = System.Text.Encoding.UTF8 };
+        foreach (var a in shellArgs.Where(a => a != "-NoExit")) psi.ArgumentList.Add(a);
+        psi.Environment["PYTHONIOENCODING"] = "utf-8";
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        var line = p.StandardOutput.ReadToEnd().Trim();
+        p.WaitForExit();
+        Assert.Equal(args[3..], JsonSerializer.Deserialize<string[]>(line)!);
+    }
+
+    /// Opt in with PATCH_GOBLINS_LAUNCH_SMOKE=<folder>: a real console opens (Windows Terminal where installed) exactly as
+    /// the tray opens one, and the program inside writes what it received into that folder.
+    [Fact]
+    public void ARealConsoleLaunchCarriesEveryArgument()
+    {
+        var python = Engine.FindOnPath("python.exe");
+        if (Environment.GetEnvironmentVariable("PATCH_GOBLINS_LAUNCH_SMOKE") is not { Length: > 0 } dir || python == null) return;
+        var file = Path.Combine(dir, "launch-smoke.json");
+        File.Delete(file);
+        string[] args = ["run", "--", "it's \"quoted\"", "50% & more; `x` $y", "a b", "Ünïcödé · dot"];
+        Engine.LaunchConsoleWith(python, "Claude · smoke; test", dir,
+            ["-I", "-c", "import sys,json;open(sys.argv[1],'w',encoding='utf-8').write(json.dumps(sys.argv[2:]))", file, .. args]);
+        for (var i = 0; i < 100 && !File.Exists(file); i++) Thread.Sleep(100);
+        Assert.Equal(args, JsonSerializer.Deserialize<string[]>(File.ReadAllText(file))!);
     }
 }
 
