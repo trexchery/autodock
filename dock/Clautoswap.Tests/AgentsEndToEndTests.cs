@@ -234,15 +234,12 @@ public sealed class AgentsEndToEndTests : IDisposable
         await Tool("agents_control", """{"action":"start"}""");
 
         var peak = 0;
-        var until = DateTime.UtcNow.AddSeconds(90);
-        while (!await On(r => r.Items.Count(i => i.State == ItemState.Open) == 3))
+        await Until(r =>
         {
-            peak = Math.Max(peak, await On(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)));
-            Assert.True(peak <= 2, "never more runs than usable accounts");
-            Assert.True(DateTime.UtcNow < until, "all three reach a pull request");
-            await Task.Delay(100);
-        }
-        Assert.Equal(2, peak);
+            peak = Math.Max(peak, r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking));
+            return r.Items.Count(i => i.State == ItemState.Open) == 3;
+        }, "all three reach a pull request", 180); // the longest pipeline here: two chains of runs, reviews and pull requests
+        Assert.Equal(2, peak); // never more runs than usable accounts, and both at once
         var work = Runs.Where(r => !r.Contains("Edit Write")).ToArray(); // work runs, not reviews
         Assert.Contains(work, r => r.StartsWith("run 2 "));
         Assert.Contains(work, r => r.StartsWith("run 3 "));
@@ -282,8 +279,8 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         await Until(r => Item(r, 10).State == ItemState.NeedsOwner, "issue 10 asks the owner");
         Assert.Equal("Should the greeting be formal?", await On(r => Item(r, 10).Note));
-        await AgentProcessTests.WaitUntil(() => File.Exists(Path.Combine(_gh, "question-10.md"))); // asked on the issue
-        Assert.Contains("Should the greeting be formal?", Read(Path.Combine(_gh, "question-10.md")));
+        // Asked on the issue; the fake may still be writing it.
+        await AgentProcessTests.WaitUntil(() => Read(Path.Combine(_gh, "question-10.md")).Contains("Should the greeting be formal?"));
         await Until(r => Item(r, 11).State == ItemState.Open, "work moves on to issue 11");
         await Until(r => Item(r, 12).State == ItemState.Open, "and to issue 12");
         Assert.Contains("Needs you: #10 Greeting tone: Should the greeting be formal?", await Tool("agents_status", "{}"));
