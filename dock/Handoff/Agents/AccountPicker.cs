@@ -23,6 +23,10 @@ public static class AccountPicker
             ? Math.Max(Live(u.FiveHour, now ?? DateTimeOffset.Now), Live(u.SevenDay, now ?? DateTimeOffset.Now))
             : null;
 
+    /// Room in `model`'s own weekly window ("Opus"), when the account has one: a run on that model is refused once it is full.
+    static bool ModelRoom(Account a, string? model, double threshold, DateTimeOffset now) =>
+        model == null || (a.ShownUsage?.Scoped ?? []).All(w => w.Name?.Contains(model, StringComparison.OrdinalIgnoreCase) != true || Live(w, now) < threshold);
+
     static double Live(Window? w, DateTimeOffset now) => w is null || w.ResetsAt is { } t && t <= now ? 0 : w.Pct;
 
     /// The account for the next worker, or null with the reason nothing fits.
@@ -33,11 +37,11 @@ public static class AccountPicker
 
     public static (Account? Pick, string? Why) Pick(IReadOnlyList<Account> accounts, double threshold,
         IReadOnlyDictionary<string, int> busy, IReadOnlyDictionary<string, DateTimeOffset> cooled, DateTimeOffset now,
-        int perAccount = 2, string? prefer = null, bool consumeFirst = false, IReadOnlySet<int>? live = null)
+        int perAccount = 2, string? prefer = null, bool consumeFirst = false, IReadOnlySet<int>? live = null, string? model = null)
     {
         var usable = accounts.Where(Usable).ToList();
         if (usable.Count == 0) return (null, accounts.Any(a => a.Active) ? OnlyYours : NoneUsable);
-        var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now)).ToList();
+        var open = usable.Where(a => !(cooled.TryGetValue(Key(a), out var until) && until > now) && ModelRoom(a, model, threshold, now)).ToList();
         var headroom = open.Where(a => Peak(a, now) is not { } p || p < threshold).ToList();
         var free = headroom.Where(a => busy.GetValueOrDefault(Key(a)) < perAccount).ToList();
         // The default login near its line can only switch to an account no `cswap run` holds (`live`: the owner's pinned windows too): keep the roomiest one free of agents.

@@ -34,7 +34,7 @@ pausing or stopping also holds any push that was about to happen. closing an iss
 
 ## goals
 
-for an objective bigger than one change, set a goal in the terminal: *"goal: the app has a settings page; `npm test` must pass"*. a read-only director session reads the whole project (it changes nothing) and plans the next few steps, each one a pull request like any other; steps wait for the ones they build on to be merged. it plans again as steps land, and asks you when only you can decide. ask how goals stand, answer a goal's question, ask for a new plan, drop a goal, or say it's done, all in the terminal.
+for an objective bigger than one change, set a goal in the terminal: *"goal: the app has a settings page; `npm test` must pass"*. a read-only director session on Opus reads the whole project (it changes nothing; work and review runs keep your default model, and the director only goes to an account with Opus weekly room left) and plans the next few steps, each one a pull request like any other; steps wait for the ones they build on to be merged. it plans again as steps land, and asks you when only you can decide. ask how goals stand, answer a goal's question, ask for a new plan, drop a goal, or say it's done, all in the terminal.
 
 a goal counts as achieved only on evidence: once its steps are done, handoff runs the checks you gave it (you confirm the exact commands in a handoff dialog) and the verification command in a fresh checkout of the base branch. a claim without a check or merged work is put to you instead. three plans in a row that change nothing, or three failed plans, park the goal for you.
 

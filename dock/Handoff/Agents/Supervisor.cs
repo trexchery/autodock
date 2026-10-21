@@ -316,7 +316,7 @@ public sealed partial class Supervisor : IDisposable
             if (!_goalBusy.Any(b => b.Value == PlanningNow && repo.Goals.Contains(b.Key))
                 && repo.Goals.Where(g => WantsPlan(repo, g)).MinBy(g => g.LastPlan ?? DateTimeOffset.MinValue) is { } goal)
             {
-                var (planner, why) = PickAccount(repo, null);
+                var (planner, why) = PickAccount(repo, null, PlannerModel);
                 if (planner == null) waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why;
                 else if (_workers.Count == 0 || DateTimeOffset.Now - _lastLaunch >= Config.Ramp)
                 {
@@ -387,13 +387,13 @@ public sealed partial class Supervisor : IDisposable
     /// The folder's assigned account if it has one (work code stays on its account), otherwise the best
     /// of the rest, leaving other open folders' assigned accounts to them while another fits. Never the
     /// login in use at the keyboard: runs only happen in isolated profiles.
-    (Account?, string?) PickAccount(RepoAgents repo, WorkItem? item)
+    (Account?, string?) PickAccount(RepoAgents repo, WorkItem? item, string? model = null)
     {
         var accounts = _accounts ?? [];
         var busy = _workers.Values.GroupBy(w => w.Account).ToDictionary(g => g.Key, g => g.Count());
         var prefer = item is { ReviewNext: false, Session: { } s } ? s.Email + "|" + s.Org : null;
         (Account?, string?) From(IReadOnlyList<Account> pool) =>
-            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst, _live);
+            AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst, _live, model);
         // The folder's account as the default login: work code stays on it, so the folder waits for the login to move on (no problem for the owner).
         if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped)
             return mapped.Active ? (null, $"#{mapped.Number}, this folder's account, is your login right now") : From([mapped]);
@@ -489,7 +489,10 @@ public sealed partial class Supervisor : IDisposable
 
     /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login.
     /// Runs cannot push or call gh; reviewers cannot edit files either.
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review) =>
+    /// The director reads the whole project to plan, where the strongest model pays; work and review runs keep the owner's default model.
+    internal const string PlannerModel = "opus";
+
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, string? model = null) =>
     [
         "run", account.ToString(), "--require-session", "--",
         "-p", "--output-format", "stream-json", "--verbose",
@@ -497,6 +500,7 @@ public sealed partial class Supervisor : IDisposable
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
         "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [],
+        .. model != null ? (string[])["--model", model] : [],
     ];
 
     /// The tray's environment, minus anything that would point Claude elsewhere, plus a guard between

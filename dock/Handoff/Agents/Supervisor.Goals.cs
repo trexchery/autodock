@@ -124,7 +124,7 @@ public sealed partial class Supervisor
             goal.Progress = Signature(_state.Repos, Key(repo, goal)); // what this plan sees
             Save(); // write-ahead
             var outPath = _store.RunFile(repo, probe, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume: false, review: true), wt, goal.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume: false, review: true, model: PlannerModel), wt, goal.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, probe, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh")));
             (goal.Run.Pid, goal.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();

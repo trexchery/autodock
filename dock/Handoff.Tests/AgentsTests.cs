@@ -244,6 +244,17 @@ public class AccountPickerTests
     }
 
     [Fact]
+    public void AModelsOwnWeeklyWindowHoldsRunsOnThatModel()
+    {
+        var full = A(2, 10) with { Usage = new Usage(new Window(10, Now.AddHours(2)), new Window(0, Now.AddDays(3)), [new Window(95, Now.AddDays(3), "Opus")], null) };
+        Assert.Equal(2, AccountPicker.Pick([full, A(3, 40)], 90, None, NoneCooled, Now).Pick!.Number); // other models still run there
+        Assert.Equal(3, AccountPicker.Pick([full, A(3, 40)], 90, None, NoneCooled, Now, model: "opus").Pick!.Number);
+        Assert.Null(AccountPicker.Pick([full], 90, None, NoneCooled, Now, model: "opus").Pick);
+        var reset = full with { Usage = full.Usage! with { Scoped = [new Window(95, Now.AddMinutes(-1), "Opus")] } };
+        Assert.Equal(2, AccountPicker.Pick([reset], 90, None, NoneCooled, Now, model: "opus").Pick!.Number); // past its reset: empty
+    }
+
+    [Fact]
     public void TheDefaultLoginNearItsLimitKeepsTheRoomiestFreeAccount()
     {
         Account[] accounts = [A(3, 85, active: true), A(1, 10), A(2, 30)];
@@ -847,6 +858,9 @@ public class AgentWorkerPolicyTests
         Assert.Contains("--resume", review);
         Assert.Contains("Edit", review);
         Assert.Contains("Write", review);
+        Assert.DoesNotContain("--model", work); // work and review keep the owner's default model
+        var plan = Supervisor.WorkerArgs(3, "sid", resume: false, review: true, model: Supervisor.PlannerModel);
+        Assert.Equal("opus", plan[Array.IndexOf(plan, "--model") + 1]);
 
         using var tmp = new TempDir();
         var env = Supervisor.WorkerEnvironment(Path.Combine(tmp.Path, "no-gh"));
