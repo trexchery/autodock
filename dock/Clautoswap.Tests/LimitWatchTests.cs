@@ -130,6 +130,7 @@ public class LimitWatchTests
         public List<string> Log = [];
         public HashSet<int> Failing = [];
         public LimitSwitch Switch;
+        public double Line = ResumeStopped.Full, Hysteresis;
 
         public Rig(params Account[] accounts)
         {
@@ -142,7 +143,7 @@ public class LimitWatchTests
                     var from = Default;
                     (Default, Changed) = (m, DateTime.UtcNow);
                     return Task.FromResult(new SwitchResult(true, new AccountRef(from, $"{from}@example.com"), new AccountRef(m, $"{m}@example.com"), null));
-                }, new HashSet<string>(), Log.Add);
+                }, new HashSet<string>(), Log.Add, threshold: () => Line, hysteresis: () => Hysteresis);
         }
 
         public Task<LimitOutcome?> Hit(DateTimeOffset at, DateTimeOffset resets, string? dir = null, string file = @"C:\x\sid.jsonl") =>
@@ -181,6 +182,24 @@ public class LimitWatchTests
         var o = await rig.Hit(Now, Now.AddHours(1));
         Assert.True(o is { Held: true, NoRoom: false }); // the move pass frees #2 or says what holds it; not "all accounts near their limits"
         Assert.Empty(rig.Switched);
+    }
+
+    [Fact]
+    public async Task RoomOnlyOnAHeldAccountTooCloseToFreeIsNoRoom()
+    {
+        // #2 has room but a `cswap run 2` window holds it, and it is within the hysteresis: the move pass would never free it.
+        var rig = new Rig(A(1, 50, active: true), A(2, 92), A(3, 99)) { Live = [2], Line = 97, Hysteresis = 10 };
+        var o = await rig.Hit(Now, Now.AddHours(1));
+        Assert.True(o is { Held: false, NoRoom: true }); // told, not a silent stall
+        Assert.Empty(rig.Switched);
+    }
+
+    [Fact]
+    public void EveryFreeablePinnedAccountIsACandidate()
+    {
+        // #2 has the most room but a busy pinned window: #4, held by idle windows or agents, must still be tried.
+        Assert.Equal([2, 4], ResumeStopped.FreeTargets([A(1, 98, active: true), A(2, 20), A(4, 40)], new HashSet<int> { 2, 4 },
+            new Dictionary<int, DateTimeOffset>(), Now, 97, 10));
     }
 
     [Fact]
@@ -470,6 +489,46 @@ public class LimitWatchTests
                 $$"""{"pid":{{self.Id}},"sessionId":"sid","procStart":"{{self.StartTime.ToUniversalTime().ToFileTimeUtc()}}"}""");
             File.WriteAllText(Path.Combine(root, "sessions", "2.json"), """{"pid":2147483000,"sessionId":"old","procStart":"1"}""");
             Assert.Equal((1, 1), ResumeStopped.LiveCounts(root)); // its key and its record are one claude
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void AClaudeRunningTheAgentsBridgeIsNeverAWindowToMove()
+    {
+        var root = TempRoot();
+        try
+        {
+            Assert.DoesNotContain(Environment.ProcessId, ResumeStopped.BridgeHosts());
+            var bridge = Path.Combine(root, "clautoswap.exe"); // stands in for `clautoswap agents-mcp`, a child of this "claude"
+            File.Copy(Engine.Cmd, bridge);
+            using var child = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(bridge, "/k")
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true })!;
+            try { Assert.Contains(Environment.ProcessId, ResumeStopped.BridgeHosts()); }
+            finally { child.Kill(); child.WaitForExit(10_000); }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void AHeadlessAgentRunIsARunNotAWindowAndAStaleMarkerIsNotLive()
+    {
+        var root = TempRoot();
+        try
+        {
+            var self = System.Diagnostics.Process.GetCurrentProcess();
+            var stamp = self.StartTime.ToUniversalTime().ToFileTimeUtc();
+            Directory.CreateDirectory(Path.Combine(root, ".cswap-runs"));
+            File.WriteAllText(Path.Combine(root, ".cswap-runs", self.Id.ToString()), "12345"); // a recycled pid: another process's stamp
+            Assert.Equal((0, 0), ResumeStopped.LiveCounts(root));
+            File.WriteAllText(Path.Combine(root, ".cswap-runs", self.Id.ToString()), stamp.ToString());
+            Directory.CreateDirectory(Path.Combine(root, "sessions"));
+            File.WriteAllText(Path.Combine(root, "sessions", $"{self.Id}.abc.key"), "");
+            File.WriteAllText(Path.Combine(root, "sessions", $"{self.Id}.json"),
+                $$"""{"pid":{{self.Id}},"sessionId":"sid","status":"busy","kind":"interactive","entrypoint":"sdk-cli","procStart":"{{stamp}}"}""");
+            Assert.Equal((0, 1), ResumeStopped.LiveCounts(root)); // `cswap run N -- claude -p`: one run, no window
+            Assert.True(ResumeStopped.AgentsOnly([], records: 0, runs: 1, agentRuns: 1));
+            Assert.Empty(ResumeStopped.Scan([(root, 2)], DateTime.UtcNow, includeBusy: true));
         }
         finally { Directory.Delete(root, true); }
     }

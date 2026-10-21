@@ -1,6 +1,6 @@
 # clautoswap agents
 
-clautoswap agents work through a repository's actionable GitHub issues on their own: one issue at a time, each change reviewed and verified, each one a pull request for you to review. You talk to them in an ordinary Claude Code terminal.
+clautoswap agents work through a repository's actionable GitHub issues on their own: one issue at a time by default (more if you set it), each change reviewed and verified, each one a pull request for you to review. You talk to them in an ordinary Claude Code terminal.
 
 ## start
 
@@ -22,7 +22,9 @@ for each issue, in rank order (your order first, then urgent and bug labels, the
 4. clautoswap pushes the branch and opens a pull request (`For #36`).
 5. failing checks, merge conflicts and review comments on that pull request get another pass. a merged or closed pull request finishes the item.
 
-no new issue starts while ten pull requests wait for your review; follow-ups on those always may.
+no new issue starts while ten pull requests wait for your review (**Open pull requests** in settings, 1–50); follow-ups on those always may. **Draft pull requests** opens them as drafts.
+
+**Issues at once** in settings sets how many issues are worked at the same time (default 1). 0 is automatic: one per account with quota to spare, started a few minutes apart. each runs in its own worktree on its own account.
 
 when an issue needs your decision, its question is posted on the issue, clautoswap moves on to other work, and your reply there (or in the terminal) brings the issue back where it stopped.
 
@@ -47,7 +49,7 @@ agents share short notes: what you told them (answers, or *"remember: we never t
 - merge, close issues, deploy, publish, spend money, change settings or secrets, or make product decisions for you.
 - push or call GitHub themselves. their environment has no GitHub login, no git credential helper and no network git protocol, and pushing or `gh` is denied to them; clautoswap pushes and opens pull requests after verification and review. sessions run as your Windows user, so this stops mistakes, not a determined program: Claude's auto-mode safety checks, the rules below and the holds above do the rest.
 - take instructions from strangers. only issues you opened or that are assigned to you are picked up, and only comments from you or the repository's owners, members and collaborators count as answers or review feedback. anyone else's text is never passed on.
-- use, or switch, the account you're signed in with. they run only in other accounts' isolated profiles (`cswap run N --require-session`), skip excluded and API-key accounts, stop before a subscription with extra usage on reaches the auto-switch threshold (or when its usage can't be read), and wait or move on when an account is near its limit. a session on an account you switch to is stopped and continues on another.
+- use, or switch, the account you're signed in with. they run only in other accounts' isolated profiles (`cswap run N --require-session`), skip excluded and API-key accounts, stop before a subscription with extra usage on reaches the auto-switch threshold (or when its usage can't be read), and wait or move on when an account is near its limit. a session on an account you switch to is stopped and continues on another. when your own login reaches the auto-switch threshold and the only accounts with room are ones agents run on, the agents give one up for half an hour (their sessions stop and continue on another account) so your login can switch there.
 
 issues assigned to someone else, labelled as a question, discussion, blocked or on hold, waiting on another open issue (GitHub's dependencies, "blocked by #N", or the issues a `## Dependencies` section names), already covered by an open pull request, trackers (roadmaps, `[Phase N/M]` issues, checklists of issues) and decisions ("Decide …") are left alone. name one in the terminal to take it anyway.
 
@@ -58,6 +60,8 @@ the verification command runs the agents' code as you, with the same environment
 ## resilience
 
 state lives in `%LOCALAPPDATA%\clautoswap\agents` (private to your user). each session runs as a native process in its own job object with files for input and output, so a restart of clautoswap doesn't lose it: clautoswap re-attaches when it starts again and lets it carry on if its terminal is still open (otherwise it stops, as a pause). a session ended by a restart, sign-out or shutdown continues without counting as a failure. a verification run ends with clautoswap, or with the terminal, and runs again later. a session that writes nothing and uses no CPU for 15 minutes is stopped and resumed; one that keeps failing is parked with the reason.
+
+when every account is near its limit, nothing new starts: clautoswap says so once, with the earliest reset, and the agents continue by themselves when an account has usage again. with **Auto-Prime** on, fresh 5-hour windows are started early while agents run, so they also reset early. once a day, from 8:00, a notification sums up what the agents did since the last one.
 
 ## cost
 

@@ -50,7 +50,7 @@ public sealed partial class TrayApp : ApplicationContext
     {
         _engine = engine;
         _limits = new(() => _snap, ResumeStopped.DefaultLogin, () => LiveOrLaunching(),
-            _engine.ImportUsageAsync, _engine.SwitchNowAsync, _reported, Program.Log, threshold: () => Threshold);
+            _engine.ImportUsageAsync, _engine.SwitchNowAsync, _reported, Program.Log, threshold: () => Threshold, hysteresis: () => _engineHysteresis ?? 10);
         _limitWatch = new(hit => _ui.Post(_ => _ = OnLimitAsync(hit), null), Program.Log);
         _tray = new NotifyIcon { Icon = TrayIcons.App, Text = "clautoswap", Visible = true, ContextMenuStrip = _menu };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleDashboard(); };
@@ -473,11 +473,15 @@ public sealed partial class TrayApp : ApplicationContext
     async Task<bool> FreePinnedAsync(Snapshot snap)
     {
         var (threshold, hysteresis) = (Threshold, _engineHysteresis ?? 10);
-        if (ResumeStopped.FreeTarget(snap.Accounts, LiveOrLaunching(), _limits.RefusedUntil, DateTimeOffset.UtcNow, threshold, hysteresis) is not { } n)
-        {
-            _heldNotice.Clear(); // nothing due: a later stall is news again
-            return false;
-        }
+        var due = ResumeStopped.FreeTargets(snap.Accounts, LiveOrLaunching(), _limits.RefusedUntil, DateTimeOffset.UtcNow, threshold, hysteresis);
+        if (due.Count == 0) _heldNotice.Clear(); // nothing due: a later stall is news again
+        foreach (var n in due) // one a working window holds must not hide the next
+            if (await FreePinnedAsync(snap, n)) return true;
+        return false;
+    }
+
+    async Task<bool> FreePinnedAsync(Snapshot snap, int n)
+    {
         if (_freed.TryGetValue(n, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(30) // once per half hour per account: never a loop
             || ResumeStopped.ProfileDir(n) is not { } dir)
             return false;
@@ -500,7 +504,8 @@ public sealed partial class TrayApp : ApplicationContext
                 return false;
             }
             if (windows.Count > 0 && ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
-                || windows.Any(w => ResumeStopped.MovesInLastHour(_resumed, w.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour))
+                || windows.Any(w => ResumeStopped.MovesInLastHour(_resumed, w.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour
+                    || _resumed.TryGetValue($"{w.SessionId}#{n}", out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10))) // just moved here: not closed again so soon
                 return false;
             foreach (var w in windows) ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); // a failed copy closes nothing
         }
@@ -722,7 +727,7 @@ public sealed partial class TrayApp : ApplicationContext
         try
         {
             Directory.CreateDirectory(Launch.GeneralFolder);
-            _engine.LaunchConsole("Claude · general", Launch.GeneralFolder, Launch.Run(Launch.GeneralAccount(_snap?.Accounts ?? []), _settings.PreserveRemoteControl));
+            _engine.LaunchConsole("Claude · general", Launch.GeneralFolder, Launch.Run(null, _settings.PreserveRemoteControl));
         }
         catch (Exception e) { Error("Could not open terminal", e); }
     }

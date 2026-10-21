@@ -53,6 +53,24 @@ static class Program
                 "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
+        // The agents' state moves whole or not at all, before anything else: left behind, a new empty state would hide it for good.
+        var (oldAgents, agents) = (Path.Combine(old, "agents"), Path.Combine(DockSettings.Dir, "agents"));
+        if (Directory.Exists(oldAgents) && !(Directory.Exists(agents) && Directory.EnumerateFileSystemEntries(agents).Any()))
+        {
+            try
+            {
+                Directory.CreateDirectory(DockSettings.Dir);
+                if (Directory.Exists(agents)) Directory.Delete(agents);
+                Directory.Move(oldAgents, agents);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                Log(e);
+                MessageBox.Show("Something still has a file open in the old autodock agents folder (a worktree in an editor or a shell). Close it, then start clautoswap again: it carries over your settings and agents.",
+                    "clautoswap", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+        }
         try
         {
             if (Directory.Exists(old) && !Directory.Exists(DockSettings.Dir)) Directory.Move(old, DockSettings.Dir);

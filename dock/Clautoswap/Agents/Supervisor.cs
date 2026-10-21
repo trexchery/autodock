@@ -5,7 +5,8 @@ namespace Clautoswap;
 /// The engine's thresholds plus the timings tests shorten.
 public sealed class AgentsConfig
 {
-    /// The engine's autoswitch.threshold: accounts at or above it get no new runs.
+    /// The engine's autoswitch.threshold: accounts at or above it get no new runs. The tray sets it from its own `Threshold`
+    /// (the engine's, else the tray's one fallback) before the first dispatch, so runs and window moves agree.
     public double Threshold { get; set; } = 90;
     public bool ConsumeFirst { get; set; }
     public TimeSpan Stall { get; set; } = TimeSpan.FromMinutes(15);

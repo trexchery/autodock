@@ -92,6 +92,7 @@ public static class ResumeStopped
     {
         var found = new List<StoppedSession>();
         var defaultSince = defaultLoginChanged ?? DefaultLogin().ChangedAt;
+        var bridged = BridgeHosts();
         foreach (var (dir, account) in dirs)
         {
             string[] records;
@@ -105,9 +106,10 @@ public static class ResumeStopped
                     var r = doc.RootElement;
                     // Only idle: "shell" (idle with a background command running) would orphan that command if moved.
                     var status = Str(r, "status") ?? "";
-                    if (status != "idle" && !includeBusy || Str(r, "kind") is { } k && k != "interactive") continue;
+                    if (status != "idle" && !includeBusy || Str(r, "kind") is { } k && k != "interactive" || Headless(r)) continue;
                     if (Str(r, "sessionId") is not { } id || Str(r, "cwd") is not { } cwd || !r.TryGetProperty("pid", out var pidEl)) continue;
                     var pid = pidEl.GetInt32();
+                    if (bridged.Contains(pid)) continue; // an agents terminal: reopened without its --mcp-config, the agents would stop
                     var stamp = Str(r, "procStart");
                     if (!IsLiveClaude(pid, stamp)) continue;
                     var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue; // unstamped record: the process's own start
@@ -285,15 +287,20 @@ public static class ResumeStopped
     /// closing the profile's idle windows and reopening them on the default login once it switched there: one copy at a time.
     /// Only an account `hysteresis` below the threshold, so the engine stays there and nothing trades back.
     public static int? FreeTarget(IReadOnlyList<Account> accounts, ISet<int> liveProfiles, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil,
+        DateTimeOffset now, double threshold, double hysteresis) =>
+        FreeTargets(accounts, liveProfiles, refusedUntil, now, threshold, hysteresis).Select(n => (int?)n).FirstOrDefault();
+
+    /// Every account `FreeTarget` could free, most room first: one a working window holds must not hide the next.
+    public static List<int> FreeTargets(IReadOnlyList<Account> accounts, ISet<int> liveProfiles, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil,
         DateTimeOffset now, double threshold, double hysteresis)
     {
-        if (accounts.FirstOrDefault(a => a.Active) is not { } d) return null;
+        if (accounts.FirstOrDefault(a => a.Active) is not { } d) return [];
         var refused = refusedUntil.TryGetValue(d.Number, out var until) && until > now;
-        if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Format.Peak(d) >= threshold)) return null;
+        if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Format.Peak(d) >= threshold)) return [];
         bool Below(int n, double line) => Format.Peak(accounts.First(a => a.Number == n)) < line;
-        if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold).Any(n => Below(n, threshold))) return null; // the engine has somewhere to go
-        return SwitchTargets(accounts, d.Number, new HashSet<int>(), refusedUntil, now, threshold)
-            .Where(n => liveProfiles.Contains(n) && Below(n, threshold - hysteresis)).Select(n => (int?)n).FirstOrDefault();
+        if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold).Any(n => Below(n, threshold))) return []; // the engine has somewhere to go
+        return [.. SwitchTargets(accounts, d.Number, new HashSet<int>(), refusedUntil, now, threshold)
+            .Where(n => liveProfiles.Contains(n) && Below(n, threshold - hysteresis))];
     }
 
     /// Whether every window on a profile can be closed now: each live claude in it (`records`) was seen idle (`windows`, from
@@ -328,13 +335,26 @@ public static class ResumeStopped
     {
         var runs = Path.Combine(dir, ".cswap-runs");
         var records = Path.Combine(dir, "sessions");
-        var live = Directory.Exists(records) ? Directory.EnumerateFiles(records, "*.json").Select(LivePid).OfType<int>().ToHashSet() : [];
-        var count = live.Count;
+        var found = Directory.Exists(records) ? Directory.EnumerateFiles(records, "*.json").Select(LivePid).OfType<(int Pid, bool Headless)>().ToList() : [];
+        var live = found.Select(r => r.Pid).ToHashSet(); // a headless run's key is its own too, never a window's
+        var count = found.Count(r => !r.Headless); // a `claude -p` run (an agent's) is a run, counted by its wrapper's marker
         if (Directory.Exists(records))
             count += Directory.EnumerateFiles(records, "*.key").Count(f => int.TryParse(Path.GetFileName(f).Split('.')[0], out var pid) && live.Add(pid)
                 && IsRunning(pid) && !(StartOf(pid)?.ToUniversalTime() > File.GetLastWriteTimeUtc(f).AddSeconds(2)));
-        return (count, Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid)) : 0);
+        return (count, Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(MarkerLive) : 0);
     }
+
+    /// A wrapper's run marker names a live process: its pid runs and, when the marker holds the wrapper's creation stamp (a
+    /// FILETIME), it is that process and not a recycled pid, as the engine's `_marker_is_live` checks.
+    static bool MarkerLive(string marker)
+    {
+        if (!int.TryParse(Path.GetFileName(marker), out var pid) || !IsRunning(pid)) return false;
+        try { if (!long.TryParse(File.ReadAllText(marker).Trim(), out var ft)) return true; return StartOf(pid) is not { } t || Math.Abs(t.ToUniversalTime().ToFileTimeUtc() - ft) < TimeSpan.TicksPerSecond * 2; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return true; }
+    }
+
+    /// A record of a headless claude (`claude -p`, the SDK): never a window to close, move or wait on.
+    static bool Headless(JsonElement r) => Str(r, "entrypoint") is "sdk-cli" or "sdk-ts" or "sdk-py";
 
     /// Accounts with a `cswap run` window right now: a live claude in the profile, or its wrapper's run marker (a headless
     /// run writes no record). Not knowing (unlistable dir) counts as in use.
@@ -359,12 +379,12 @@ public static class ResumeStopped
         catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }
     }
 
-    static int? LivePid(string rec)
+    static (int, bool)? LivePid(string rec)
     {
         try
         {
             using var doc = JsonDocument.Parse(File.ReadAllText(rec));
-            return doc.RootElement.TryGetProperty("pid", out var pid) && pid.TryGetInt32(out var id) && IsLiveClaude(id, Str(doc.RootElement, "procStart")) ? id : null;
+            return doc.RootElement.TryGetProperty("pid", out var pid) && pid.TryGetInt32(out var id) && IsLiveClaude(id, Str(doc.RootElement, "procStart")) ? (id, Headless(doc.RootElement)) : null;
         }
         catch (JsonException) { return null; } // half-written: the next look sees it
     }
@@ -615,6 +635,30 @@ public static class ResumeStopped
     {
         try { using var p = Process.GetProcessById(pid); return p.ProcessName.Split('.')[0].ToLowerInvariant(); }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { return null; }
+    }
+
+    /// The processes running an agents terminal's `clautoswap agents-mcp` bridge: each `clautoswap` process's parent and
+    /// grandparent (a shell between them). Never closed or moved, as the bridge and its flags would not come back.
+    internal static HashSet<int> BridgeHosts()
+    {
+        var all = new List<(int Pid, int Parent, string Exe)>();
+        var snap = CreateToolhelp32Snapshot(0x2, 0);
+        if (snap == -1) return [];
+        try
+        {
+            var e = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32>() };
+            for (var ok = Process32First(snap, ref e); ok; ok = Process32Next(snap, ref e))
+                all.Add(((int)e.th32ProcessID, (int)e.th32ParentProcessID, e.szExeFile));
+        }
+        finally { CloseHandle(snap); }
+        var parent = all.GroupBy(p => p.Pid).ToDictionary(g => g.Key, g => g.First().Parent);
+        var hosts = new HashSet<int>();
+        foreach (var b in all.Where(p => p.Exe.Equals("clautoswap.exe", StringComparison.OrdinalIgnoreCase) && p.Pid != Environment.ProcessId))
+        {
+            hosts.Add(b.Parent);
+            if (parent.TryGetValue(b.Parent, out var up)) hosts.Add(up);
+        }
+        return hosts;
     }
 
     static int? ParentOf(int pid)

@@ -127,6 +127,19 @@ public sealed class AgentsEndToEndTests : IDisposable
         }
     }
 
+    /// Waits for a stopped run's process to be gone: the state can flip while the job's process is still exiting.
+    static async Task Gone(int pid, int seconds = 30)
+    {
+        var until = DateTime.UtcNow.AddSeconds(seconds);
+        while (true)
+        {
+            try { using var p = Process.GetProcessById(pid); if (p.HasExited) return; }
+            catch (ArgumentException) { return; }
+            Assert.True(DateTime.UtcNow < until, $"process {pid} still runs");
+            await Task.Delay(100);
+        }
+    }
+
     /// Shared with the fakes, which may be appending to a log right now.
     static string Read(string path)
     {
@@ -459,7 +472,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var pid = await On(r => Item(r, 60).Run!.Pid);
         Assert.StartsWith("Paused.", await Tool("agents_control", """{"action":"pause"}"""));
         await Until(r => Item(r, 60).State == ItemState.Queued && Item(r, 60).Run is { Live: false }, "the run stops");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        await Gone(pid);
         Assert.Equal(0, await On(r => Item(r, 60).Failures));
         Assert.Contains("agents paused", await Tool("agents_status", "{}"));
         Assert.Equal("Resumed.", await Tool("agents_control", """{"action":"resume"}"""));
@@ -480,7 +493,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var runs = Runs.Length;
         Assert.Equal(1, await _loop.Run(() => _sup!.RunsOn(held)));
         Assert.Equal(1, await _loop.Run(() => _sup!.YieldAsync(held, TimeSpan.FromMinutes(30))));
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid)); // gone before the tray switches the default login there
+        await Gone(pid, seconds: 0); // gone before the tray switches the default login there: no wait
         await Until(r => Item(r, 64).State == ItemState.Open, "the work continues on another account");
         Assert.DoesNotContain(Runs.Skip(runs), r => r.StartsWith($"run {held.Number} ")); // it rests: nothing starts on it again
         Assert.NotEmpty(Runs.Skip(runs));
@@ -500,7 +513,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         var pid = await On(r => Item(r, 61).Run!.Pid);
         await Terminal(open: false);
         await Until(r => Item(r, 61).State == ItemState.Queued && Item(r, 61).Run is { Live: false }, "the run stops with its terminal");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        await Gone(pid);
         Assert.Equal(0, await On(r => Item(r, 61).Failures));
         var runs = Runs.Length;
         await Task.Delay(3000);
@@ -533,6 +546,22 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task AnOfflineIssueScanIsNoProblemAndTheNextScanReadsThem()
+    {
+        Issues("""[{"number":66,"title":"Later","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        File.WriteAllText(Path.Combine(_gh, "offline"), "");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => r.LastScan != null, "the scan runs offline");
+        Assert.Null(await On(r => r.Note)); // not "gh is not signed in"
+        Assert.False(await _loop.Run(() => _sup!.HasProblem));
+        File.Delete(Path.Combine(_gh, "offline"));
+        await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.UpdateAccounts(Accounts, []); return 0; });
+        await Until(r => r.Items.Any(i => i.Issue == 66), "back online, the issue is read");
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task ARestartWithoutItsTerminalStopsTheRunUntilItOpens()
     {
         Issues("""[{"number":62,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
@@ -543,7 +572,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         await _loop.Run(() => { _sup!.Dispose(); return 0; }); // the tray exits; the terminal is closed meanwhile
         await StartAsync(terminal: false);
         await Until(r => Item(r, 62).State == ItemState.Queued && Item(r, 62).Run is { Live: false }, "the re-attached run stops");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        await Gone(pid);
         Assert.Equal(0, await On(r => Item(r, 62).Failures));
         await Terminal(open: true);
         await Until(r => Item(r, 62).State == ItemState.Open, "the work continues once the terminal opens");
@@ -563,13 +592,13 @@ public sealed class AgentsEndToEndTests : IDisposable
         var first = await On(r => Item(r, 70).Run!.Pid);
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"#70"}"""));
         await Until(r => r.Items.All(i => i.Issue != 70) && Item(r, 71).Run is { Pid: > 0 } && Runs.Length == 2, "work moves on to the next issue");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(first));
+        await Gone(first);
 
         var second = await On(r => Item(r, 71).Run!.Pid);
         Issues("[]"); // the owner closes #71 on GitHub
         await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.UpdateAccounts(Accounts, []); return 0; });
         await Until(r => r.Items.Count == 0, "the closed issue's work ends");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(second));
+        await Gone(second);
         await Task.Delay(1500);
         Assert.Equal(2, Runs.Length); // one each, and neither came back
         Assert.Empty(Git(_repo, "branch", "--list", "clautoswap/*"));
@@ -972,7 +1001,7 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         await Terminal(open: false);
         await Until(r => G(r).Run is { Live: false } && !Directory.Exists(PlanCheckout(r)), "the planner stops with its terminal and its checkout goes");
-        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+        await Gone(pid);
         Assert.Equal((0, true, 0), await On(r => (G(r).Failures, G(r).Replan, G(r).Plans))); // nothing failed: it plans again
 
         await Terminal(open: true);

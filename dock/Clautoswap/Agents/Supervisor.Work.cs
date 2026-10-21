@@ -29,7 +29,7 @@ public sealed partial class Supervisor
     async Task<bool> HasOriginAsync(RepoAgents repo) => (await GitAsync(repo.Path, "remote", "get-url", "origin")).Ok;
 
     /// A fetch that failed for want of a network; a deleted base or revoked credentials are the owner's to fix.
-    internal static readonly Regex Offline = new(@"resolve host|timed out|timeout|refused|unreachable|connection reset|failed to connect|no route", RegexOptions.IgnoreCase);
+    internal static readonly Regex Offline = new(@"resolve host|timed out|timeout|refused|unreachable|connection reset|failed to connect|error connecting|no such host|no route", RegexOptions.IgnoreCase);
 
     async Task<string> StartPointAsync(RepoAgents repo, bool strict = false)
     {
@@ -386,10 +386,17 @@ public sealed partial class Supervisor
     async Task ScanAsync(RepoAgents repo)
     {
         repo.LastScan = DateTimeOffset.Now;
-        if (await MeAsync(repo) is not { } me) { repo.Note = "could not read issues: gh is not signed in (run `gh auth login`)"; Save(); return; }
+        // Offline is no problem to fix: the next scan reads them, and the dot stays dark meanwhile.
+        if (_me == null && await _cli.GhAsync(repo.Path, "api", "user", "--jq", ".login") is var who)
+        {
+            if (who.Ok) _me = who.Out.Trim();
+            else if (!Offline.IsMatch(who.Err + who.Out))
+                repo.Note = "could not read issues: " + (Regex.IsMatch(who.Err + who.Out, "gh auth login|not logged", RegexOptions.IgnoreCase) ? "gh is not signed in (run `gh auth login`)" : who.Why);
+        }
+        if (_me is not { } me) { Save(); return; }
         var r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author,blockedBy");
-        if (!r.Ok) r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author");
-        if (!r.Ok) { repo.Note = "could not read issues: " + r.Why; Save(); return; }
+        if (!r.Ok && !Offline.IsMatch(r.Err + r.Out)) r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author");
+        if (!r.Ok) { if (!Offline.IsMatch(r.Err + r.Out)) repo.Note = "could not read issues: " + r.Why; Save(); return; }
         if (repo.Note?.StartsWith("could not") == true) repo.Note = null; // issues read, or a one-off baseline hiccup
         if (IssueInfo.ParseList(r.Out) is not { } issues) { repo.Note = "could not read issues: gh printed something unexpected"; Save(); return; }
         var open = issues.Select(i => i.Number).ToHashSet();

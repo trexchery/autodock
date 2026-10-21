@@ -132,7 +132,7 @@ public sealed record LimitOutcome(SwitchResult? Switched = null, bool NoRoom = f
 /// next refusal arrives here and the next account is tried.
 public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, DateTime ChangedAt)> login, Func<ISet<int>> liveProfiles,
     Func<string, Task> report, Func<int, Task<SwitchResult>> switchTo, ISet<string> reported, Action<string> log, Func<DateTimeOffset>? clock = null,
-    Func<double>? threshold = null)
+    Func<double>? threshold = null, Func<double>? hysteresis = null)
 {
     /// Accounts the API refused, until their reset: no reading, however fresh it looks, puts one back before then.
     public Dictionary<int, DateTimeOffset> RefusedUntil { get; } = [];
@@ -165,8 +165,10 @@ public sealed class LimitSwitch(Func<Snapshot?> snapshot, Func<(int? Account, Da
             // Only the default login moves here, and only while it is still the refuser: the engine's own check may have moved it already.
             if ((login().Account ?? snap.ActiveAccountNumber) != n) return new LimitOutcome();
             var line = threshold?.Invoke() ?? ResumeStopped.Full;
-            var targets = ResumeStopped.SwitchTargets(snap.Accounts, n, liveProfiles(), RefusedUntil, now, line);
-            if (targets.Count == 0 && ResumeStopped.SwitchTargets(snap.Accounts, n, new HashSet<int>(), RefusedUntil, now, line).Count > 0) return new LimitOutcome(Held: true);
+            var live = liveProfiles();
+            var targets = ResumeStopped.SwitchTargets(snap.Accounts, n, live, RefusedUntil, now, line);
+            // Held only when the move pass would free a held account; else nothing frees one, and that is said like no room.
+            if (targets.Count == 0 && ResumeStopped.FreeTarget(snap.Accounts, live, RefusedUntil, now, line, hysteresis?.Invoke() ?? 0) != null) return new LimitOutcome(Held: true);
             if (targets.Count == 0) return new LimitOutcome(NoRoom: true, Earliest: ResumeStopped.EarliestReset(snap.Accounts, RefusedUntil, now));
             var clockMs = Stopwatch.StartNew();
             foreach (var m in targets.Take(3)) // ponytail: three tries, then the engine's own check takes over

@@ -19,6 +19,8 @@ function Read-Text($name, $default) {
 function Arg($name) { $i = [array]::IndexOf($a, $name); if ($i -ge 0) { $a[$i + 1] } }
 function Prs() { @(Read-Text 'prs.json' '[]' | ConvertFrom-Json) }
 
+# No network: every call fails the way gh does offline.
+if (Test-Path -LiteralPath (Join-Path $dir 'offline')) { [Console]::Error.WriteLine('error connecting to api.github.com'); exit 1 }
 switch ("$($a[0]) $($a[1])") {
     'api user' { 'owner'; exit 0 }
     'issue list' { Read-Text 'issues.json' '[]'; exit 0 }
