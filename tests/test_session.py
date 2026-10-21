@@ -2147,6 +2147,22 @@ class TestGuards:
         data = seeded_switcher._get_sequence_data()
         assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
 
+    def test_exclusive_switch_refuses_live_target(
+        self, seeded_switcher, monkeypatch
+    ):
+        """The tray's switch: nobody reads a warning, so a live profile of the
+        target refuses, and nothing moves."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="in use by a session profile"):
+            seeded_switcher.switch_to(ACCOUNT_NUM, json_output=True, exclusive=True)
+
+        assert seeded_switcher._get_sequence_data()["activeAccountNumber"] == 1
+
     def test_switch_refuses_live_target_whose_profile_is_ahead(
         self, seeded_switcher, monkeypatch
     ):

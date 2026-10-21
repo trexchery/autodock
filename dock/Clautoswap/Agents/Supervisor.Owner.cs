@@ -24,7 +24,7 @@ public sealed partial class Supervisor
                 switch (action)
                 {
                     case "pause":
-                        var n = _workers.Keys.Count(repo.Items.Contains);
+                        var n = _workers.Keys.OfType<WorkItem>().Count(repo.Items.Contains);
                         await PauseAsync(repo);
                         return n > 0 ? "Paused. The item in progress stopped where it was and continues from there on resume." : "Paused.";
                     case "resume":
@@ -40,9 +40,38 @@ public sealed partial class Supervisor
                 if (repo == null) return "Agents were never started for this repository.";
                 return await QueueCommandAsync(repo, Str("action"), args, Str("item"), Str("text"), Str("title"));
 
+            case "agents_memory":
+                var shared = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("global", out var g) && g.ValueKind == JsonValueKind.True;
+                var notes = shared ? _state.Memory : repo?.Memory;
+                var what = Str("text");
+                switch (Str("action"))
+                {
+                    case "list" or "":
+                        return Memory.List(_state.Memory, repo?.Memory ?? []);
+                    case "add" or "forget" when notes == null:
+                        return "Agents were never started for this repository; use global to note something for every repository.";
+                    case "add":
+                        if (what.Length == 0) return "Say what to remember.";
+                        Memory.Add(notes!, what, "owner", true, DateTimeOffset.Now);
+                        Save();
+                        return shared ? "Noted for every repository." : "Noted for this repository.";
+                    case "forget":
+                        // List prints shared notes as g1, g2 …
+                        what = what.Trim();
+                        if (System.Text.RegularExpressions.Regex.IsMatch(what, @"^g\d+\.?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) (notes, what) = (_state.Memory, what[1..].TrimEnd('.'));
+                        var gone = Memory.Forget(notes!, what);
+                        Save();
+                        return gone == 0 ? "No such note; the numbers are those agents_memory list prints." : $"Forgot {gone} note{(gone == 1 ? "" : "s")}.";
+                }
+                return "Unknown action; use list, add or forget.";
+
             case "agents_details":
                 if (repo == null) return "Agents were never started for this repository.";
                 return Find(repo, Str("item")) is { } item ? Details(repo, item) : NoItem;
+
+            case "agents_goal":
+                if (repo == null) return "Agents were never started for this repository; start them first (agents_control start).";
+                return await GoalCommandAsync(repo, Str("action"), args, Str("goal"), Str("title"), Str("text"));
         }
         return "Unknown tool.";
     }
@@ -100,7 +129,7 @@ public sealed partial class Supervisor
                     repo.Skipped.Remove(numbers[k]);
                     var item = repo.Items.FirstOrDefault(i => i.Issue == numbers[k]) ?? await AddIssueAsync(repo, numbers[k]);
                     if (item == null) { missing.Add(numbers[k]); continue; }
-                    item.Rank = top + (numbers.Count - k) * 10;
+                    (item.Rank, item.OwnRank) = (top + (numbers.Count - k) * 10, null);
                 }
                 Save();
                 Pump();
@@ -111,7 +140,15 @@ public sealed partial class Supervisor
                 if (skip.Issue is { } si && !repo.Skipped.Contains(si)) repo.Skipped.Add(si);
                 await StopWorkerAsync(skip, "skipped");
                 await FinishAsync(repo, skip, "skipped by the owner");
+                if (GoalOf(skip.Goal) is { } sg)
+                {
+                    AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
+                    // A goal waiting on this step got its answer: plan again without it, now (the owner acted). A question
+                    // or problem about anything else stays for the owner.
+                    if (sg.State == GoalState.NeedsOwner && sg.Note?.StartsWith(skip.Label) == true) (sg.State, sg.Note, sg.Claim, sg.Replan, sg.LastPlan) = (GoalState.Active, null, null, true, null);
+                }
                 if (skip.Pr == null) repo.Items.Remove(skip);
+                HoldDependents(_state.Repos, repo, skip);
                 Save();
                 Pump();
                 return $"{skip.Label} is skipped" + (skip.Pr is { } p ? $"; pull request #{p} is left as it is." : ".");
@@ -148,7 +185,11 @@ public sealed partial class Supervisor
                     Fire(() => CheckAsync(repo, it));
                     return $"{it.Label}: pushing it as it is.";
                 }
-                if (text.Length > 0) it.Guidance = text;
+                if (text.Length > 0)
+                {
+                    it.Guidance = text;
+                    Memory.Add(repo.Memory, $"{it.Label}: {text}", "answer", true, DateTimeOffset.Now);
+                }
                 (it.State, it.Failures, it.Note, it.AskedAt, it.HoldFor, it.Reviews) = (ItemState.Queued, 0, null, null, null, 0);
                 if (it.Followups > MaxFollowups) it.Followups = 0;
                 Save();
@@ -157,6 +198,29 @@ public sealed partial class Supervisor
         }
         return "Unknown action; use prioritize, skip, restore, add, answer or retry.";
     }
+
+    /// What was planned on a skipped item leaves the goal: removed, it counts as landed and they would start on its absence;
+    /// kept with its pull request unmerged, they would wait for it forever. An adopted issue is the owner's: it waits for them.
+    internal static void HoldDependents(IReadOnlyList<RepoAgents> repos, RepoAgents repo, WorkItem skip)
+    {
+        // In any repository: a goal's steps can build on each other across them.
+        for (var q = new Queue<(RepoAgents R, WorkItem I)>([(repo, skip)]); q.TryDequeue(out var s);)
+            foreach (var r in repos)
+                foreach (var d in r.Items.Where(d => d.Goal != null && d.After.Contains(Key(s.R, s.I))).ToList())
+                    if (d is { Issue: not null, State: ItemState.Queued, Worktree: null, Pr: null })
+                    {
+                        (d.State, d.Note) = (ItemState.NeedsOwner, $"{SkipHold}{skip.Label}, which you skipped; answer to run it anyway");
+                        d.After.Remove(Key(s.R, s.I)); // answered, it must not wait for what the owner skipped
+                        if (repos.SelectMany(x => x.Goals.Where(g => Key(x, g) == d.Goal)).FirstOrDefault() is { } dg) dg.Replan = true;
+                    }
+                    else if (Held(d)) d.After.Remove(Key(s.R, s.I)); // already the owner's question: skipping another step does not answer it
+                    else if (Unplan(r, d.Goal!, [d]) > 0) q.Enqueue((r, d));
+    }
+
+    /// An adopted issue held because a step it was planned after was skipped: a question for the owner, no problem.
+    const string SkipHold = "it was planned after ";
+
+    static bool Held(WorkItem i) => i is { State: ItemState.NeedsOwner, Worktree: null, Pr: null } && i.Note?.StartsWith(SkipHold) == true;
 
     const string NoItem = "No such item; name it as #12 (issue) or w3 (request).";
 
@@ -172,11 +236,13 @@ public sealed partial class Supervisor
     public string? Summary(DateTimeOffset since)
     {
         var items = Repos.SelectMany(r => r.Items).ToList();
-        var opened = items.Where(i => i.Pr != null && i.PrSeen >= since).ToList();
+        var opened = items.Where(i => i.Pr != null && i.PrOpened >= since).ToList();
         var asks = items.Count(i => i.State == ItemState.NeedsOwner && !Problem(i));
         var stuck = items.Count(Problem);
-        if (opened.Count + asks + stuck == 0) return null;
+        var achieved = Repos.SelectMany(r => r.Goals).Count(g => g.State == GoalState.Achieved && g.AchievedAt >= since);
+        if (achieved + opened.Count + asks + stuck == 0) return null;
         var parts = new List<string>();
+        if (achieved > 0) parts.Add($"{achieved} goal{(achieved == 1 ? "" : "s")} achieved");
         if (opened.Count > 0) parts.Add($"{opened.Count} pull request{(opened.Count == 1 ? "" : "s")} opened ({string.Join(", ", opened.Take(5).Select(i => "#" + i.Pr))}{(opened.Count > 5 ? ", …" : "")})");
         if (asks > 0) parts.Add($"{asks} waiting on you");
         if (stuck > 0) parts.Add($"{stuck} stuck");
@@ -186,7 +252,7 @@ public sealed partial class Supervisor
     /// Outcomes first. `detail` adds the machinery: accounts, attempts, sessions, worktrees.
     public string Status(RepoAgents? repo, string path, bool detail)
     {
-        if (repo == null || (!repo.Authorized && repo.Items.Count == 0))
+        if (repo == null || (!repo.Authorized && repo.Items.Count == 0 && repo.Goals.Count == 0))
             return $"Agents are not running for {Path.GetFileName(path.TrimEnd('\\', '/'))}. Ask to start them if they should: clautoswap asks the owner to confirm in a native dialog first.";
         var sb = new StringBuilder();
         var actives = repo.Items.Where(i => i.State is ItemState.Working or ItemState.Checking).ToList();
@@ -196,21 +262,24 @@ public sealed partial class Supervisor
         var mode = !repo.Authorized ? "stopped" : repo.Paused ? "paused" : _baseline.Contains(repo) ? "checking the verification command" : "running";
         sb.AppendLine($"{repo.Leaf}: agents {mode}.");
         if (repo.Note != null) sb.AppendLine(repo.Note);
-        foreach (var active in actives) sb.AppendLine($"Working on {active.Label} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
-        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
-        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var g in repo.Goals.Where(g => detail || g.State != GoalState.Dropped))
+            sb.AppendLine(GoalLine(repo, g) + (detail && g.Log.Count > 0 ? "\n  " + string.Join("\n  ", g.Log.TakeLast(5)) : ""));
+        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(repo, active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
+        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(repo, i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(repo, i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
         if (queued.Count > 0)
-            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label)) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
+            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(repo, i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
         if (repo.Running && actives.Count == 0 && queued.Count > 0)
-            sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs) == null
+            sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs, i => !Ready(i)) == null
                 ? $"Holding new work: {prs.Count} pull requests are waiting for review."
                 : Waiting != null ? $"Waiting: {Waiting}." : "");
-        if (repo.Running && actives.Count == 0 && queued.Count == 0)
+        if (repo.Running && actives.Count == 0 && queued.Count == 0 && !repo.Goals.Any(g => g.State == GoalState.Active))
             sb.AppendLine($"Nothing else is eligible right now; clautoswap checks the issues again every {Config.ScanEvery.TotalMinutes:0} minutes.");
         if (detail)
         {
             sb.AppendLine($"Base {repo.Base}; verification {(repo.Verify is { } v ? $"`{v}`" : "none")}; permission mode {PermissionMode}.");
             foreach (var (k, until) in _cooled.Where(c => c.Value > DateTimeOffset.Now)) sb.AppendLine($"Resting {k.Split('|')[0]} until {until.ToLocalTime():HH:mm}.");
+            if (repo.Memory.Count + _state.Memory.Count > 0) sb.AppendLine($"Memory: {repo.Memory.Count} notes here, {_state.Memory.Count} shared across repositories.");
             if (repo.Skipped.Count > 0) sb.AppendLine("Skipped: " + string.Join(", ", repo.Skipped.Select(s => "#" + s)));
             var done = repo.Items.Where(i => i.State == ItemState.Done).ToList();
             if (done.Count > 0) sb.AppendLine("Done: " + string.Join("; ", done.Select(i => $"{i.Label} ({i.Note})")));
@@ -264,12 +333,15 @@ public sealed partial class Supervisor
         var sb = new StringBuilder();
         sb.AppendLine(item.Issue is { } n
             ? $"You are an clautoswap agent. Resolve GitHub issue #{n} of this repository: {item.Title}"
-            : $"You are an clautoswap agent. The repository owner asked for: {item.Title}");
+            : item.Goal != null
+                ? $"You are an clautoswap agent. clautoswap's director planned this step toward one of the owner's goals: {item.Title}"
+                : $"You are an clautoswap agent. The repository owner asked for: {item.Title}");
         if (item.Body.Trim().Length > 0) sb.AppendLine().AppendLine(Clip(item.Body, 8000));
         if (discussion != null) sb.AppendLine().AppendLine("Discussion on the issue, oldest first (decisions the owner documented here stand):").AppendLine(discussion);
         if (item.Guidance != null) sb.AppendLine().AppendLine("The owner's answer to your earlier question:").AppendLine(item.Guidance);
         if (item.Followup != null) sb.AppendLine().AppendLine("This pass must address:").AppendLine(item.Followup);
         if (notes != null) sb.AppendLine().AppendLine($"An earlier session worked on this and stopped. Read its hand-off notes in {notes} first, check the current state of this worktree, and continue from there; do not redo finished work.");
+        if (Memory.Prompt(_state.Memory, repo.Memory) is { } memory) sb.AppendLine().AppendLine(memory);
         sb.AppendLine().AppendLine(Rules(repo, item));
         return sb.ToString();
     }
@@ -279,6 +351,7 @@ public sealed partial class Supervisor
         var sb = new StringBuilder("Continue this task where you left off; your session was interrupted, and the worktree is as you left it.");
         if (item.Guidance != null) sb.AppendLine().AppendLine().AppendLine("The owner's answer to your question:").AppendLine(item.Guidance);
         if (item.Followup != null) sb.AppendLine().AppendLine().AppendLine("Before finishing, address:").AppendLine(item.Followup);
+        if (Memory.Prompt(_state.Memory, repo.Memory) is { } memory) sb.AppendLine().AppendLine().AppendLine(memory);
         sb.AppendLine().AppendLine().Append(Rules(repo, item));
         return sb.ToString();
     }
@@ -291,6 +364,7 @@ public sealed partial class Supervisor
         - Run the relevant tests.{(repo.Verify is { } v ? $" clautoswap runs `{v}` before the pull request opens; make sure it passes." : "")}
         - Commit your work with clear messages. Do not push, open pull requests or use gh: clautoswap does that once the work checks out.
         - Never merge, close issues, deploy, publish packages or releases, spend money, or change billing, secrets or repository settings.
+        - Optionally, before your final line, print up to 3 lines `CLAUTOSWAP: LEARNED <durable fact about this repository>`: only what would save the next agent real time (a build quirk, a convention, where something lives); never secrets.
         - If this needs a decision only the owner can make (product direction, trade-offs the issue leaves open, anything irreversible), is unclear, or cannot be done in code, do not guess. End with one line:
           CLAUTOSWAP: BLOCKED <your question for the owner, self-contained>
         - Otherwise end with one line:
@@ -304,7 +378,7 @@ public sealed partial class Supervisor
         {Clip(item.Body, 6000)}
 
         The change is `git diff origin/{repo.Base}...HEAD` (branch {item.Branch}). Read it and the code around it, and run tests if that helps. Do not modify any file and do not commit.
-        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.
+        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.{(Memory.Prompt(_state.Memory, repo.Memory.Where(n => n.Owner || n.Source != Memory.NormalizeSource(item.Label)).ToList()) is { } memory ? "\n\n" + memory + "\n" : "")}
         End with one line:
         CLAUTOSWAP: APPROVED <one-line verdict>
         or, if something must change:
@@ -315,7 +389,7 @@ public sealed partial class Supervisor
         $"""
         {summary}
 
-        {(item.Issue is { } n ? $"For #{n}." : "Requested in the clautoswap agents terminal.")}
+        {(item.Issue is { } n ? $"For #{n}." : item.Goal != null ? "Planned by clautoswap's director toward a goal the owner set in the agents terminal." : "Requested in the clautoswap agents terminal.")}
         {(item.ReviewNotes is { } notes ? $"\nThe agent review still raised, for you to weigh:\n{notes}\n" : "")}
         ---
         Prepared by clautoswap agents: reviewed{(repo.Verify is { } v ? $" and `{v}` passed" : "")} before it opened. It is not merged automatically, and merging it does not close the issue.

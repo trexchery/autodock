@@ -66,6 +66,10 @@ public static class Launch
         return [.. a];
     }
 
+    /// The general agent: not tied to any repo, one fixed folder, run with no account (`cswap run` in an unmapped
+    /// folder is the default login, whichever it is at launch), so auto-switch keeps it on one with room.
+    public static string GeneralFolder => Path.Combine(StoreSecurity.UserProfile, "clautoswap-general");
+
     /// Continue-in Claude: through `cswap run` when an account is known, else null (launch claude directly).
     /// A folder-mapped account is left to the engine (no NUM); otherwise the active account is named.
     public static string[]? Continue(Account? mapped, Account? active, bool restoreRc, string prompt) =>

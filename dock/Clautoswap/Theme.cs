@@ -8,7 +8,10 @@ public sealed record Palette(
     bool IsDark, Color Back, Color Card, Color Text, Color Muted, Color Faint, Color Track,
     Color Live, Color Border, Color Hover, Color Pressed)
 {
-    public static Palette Current => IsLight() ? Light : Dark;
+    public static Palette Current => (ForceDark is { } d ? !d : IsLight()) ? Light : Dark;
+
+    /// Tests and screenshots pin a theme instead of reading Windows'.
+    internal static bool? ForceDark;
 
     // Neutral greys only. Colour is reserved for state: the active dot and
     // meters that are close to a limit.
@@ -72,7 +75,7 @@ public static class Ui
     public static Font Icons(float pt) => new(IconFamily, pt);
 
     public const string Refresh = "\uE72C", Settings = "\uE713", More = "\uE712", Terminal = "\uE756",
-        Add = "\uE710", Check = "\uE73E", Pin = "\uE718", Unpin = "\uE77A", Close = "\uE711", Agents = "\uE99A";
+        Add = "\uE710", Check = "\uE73E", Pin = "\uE718", Unpin = "\uE77A", Close = "\uE711", Agents = "\uE99A", Chat = "\uE8BD";
 
     public static GraphicsPath Round(RectangleF r, float radius)
     {
@@ -144,6 +147,8 @@ public sealed class Pill : Control, IButtonControl
     public string Glyph { get; set; } = "";
     /// A small state dot on an icon pill (null: none).
     public Color? Badge { get; set; }
+    /// A highlight sweeping across the icon, 0 to 1 left to right (below 0: none).
+    public float Shine { get; set; } = -1;
     public DialogResult DialogResult { get; set; }
     bool _hover, _down;
 
@@ -189,6 +194,28 @@ public sealed class Pill : Control, IButtonControl
         base.OnKeyUp(e);
     }
 
+    /// White band over the glyph itself (drawn as a path so the gradient can fade), same spot as the text.
+    void PaintShine(Graphics g, Palette pal)
+    {
+        using var icon = Ui.Icons(9f);
+        using var path = new GraphicsPath();
+        using var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        path.AddString(Glyph, icon.FontFamily, (int)icon.Style, icon.SizeInPoints * g.DpiY / 72f, new RectangleF(0, 0, Width, Height), fmt);
+        float w = Width * 0.7f, x = -w + Shine * (Width + w);
+        using var br = new LinearGradientBrush(new RectangleF(x, 0, w, Height), Color.Transparent, Color.Transparent, 20f)
+        {
+            InterpolationColors = new ColorBlend
+            {
+                // Light: white alone vanishes on the pale card, so the glint is flanked by the text colour.
+                Positions = [0f, 0.3f, 0.5f, 0.7f, 1f],
+                Colors = pal.IsDark
+                    ? [Color.Transparent, Color.FromArgb(120, 255, 255, 255), Color.White, Color.FromArgb(120, 255, 255, 255), Color.Transparent]
+                    : [Color.Transparent, Color.FromArgb(200, pal.Text), Color.White, Color.FromArgb(200, pal.Text), Color.Transparent],
+            },
+        };
+        g.FillPath(br, path);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         var pal = Palette.Current;
@@ -231,6 +258,7 @@ public sealed class Pill : Control, IButtonControl
         {
             using var icon = Ui.Icons(9f);
             TextRenderer.DrawText(g, Glyph, icon, ClientRectangle, _hover ? pal.Text : pal.Muted, flags | TextFormatFlags.HorizontalCenter);
+            if (Shine >= 0) PaintShine(g, pal);
             if (Badge is { } dot)
             {
                 using var b = new SolidBrush(dot);

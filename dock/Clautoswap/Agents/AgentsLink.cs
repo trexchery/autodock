@@ -133,7 +133,9 @@ public static class AgentsLink
         - Use agents_status to answer any question about progress.
         - Use agents_control only when the owner asks to start, pause, resume or stop. Starting shows the owner a native clautoswap confirmation dialog the first time; tell them to look for it. When starting, pass the command that must pass before a pull request opens as `verify` if the repository has a clear one (from its CI config, README or CLAUDE.md); ask the owner if unsure.
         - Use agents_queue when the owner reorders, skips or restores issues, adds a request ("add": title and text), or answers a question an item is waiting on ("answer": item and text). An item held before its push (review concerns, or a change to .github/) is pushed as is by "answer" with no text, only when the owner says so; with text it goes back for that change.
-        - Items are named #<issue> for issues and w<n> for the owner's own requests.
+        - Use agents_memory to list, add or forget shared notes when the owner asks you to remember or forget something: their notes bind every agent, here or (with global) in every repository.
+        - Use agents_goal when the owner states an objective bigger than one change (set), and to list goals, answer a goal's question, ask for a new plan, drop one, or confirm one done. Goals come first when you report progress. Checks the owner gives (`checks`) are confirmed in a native clautoswap dialog; tell them to look for it. The director may plan steps in the owner's other repositories that agents work on; those run there while that repository's agents terminal is open.
+        - Items are named #<issue> for issues and w<n> for the owner's own requests; goals g<n>.
         You can still do ordinary work in this repository yourself when the owner asks for it directly.
         """;
 
@@ -161,6 +163,23 @@ public static class AgentsLink
             }, "action"),
         Tool("agents_details", "Recent activity and run facts for one item (only when the owner asks for details).",
             new JsonObject { ["item"] = new JsonObject { ["type"] = "string", ["description"] = "#12 or w3" } }, "item"),
+        Tool("agents_memory", "The agents' shared memory: notes that go into every agent's prompt. List them, add one (the owner's decision, binding), or forget one by its number or text.",
+            new JsonObject
+            {
+                ["action"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("list", "add", "forget") },
+                ["text"] = new JsonObject { ["type"] = "string", ["description"] = "add: the note; forget: its number (g1 for shared) or text it contains." },
+                ["global"] = new JsonObject { ["type"] = "boolean", ["description"] = "Note or forget for every repository instead of this one." },
+            }, "action"),
+        Tool("agents_goal", "The owner's goals: objectives bigger than one change. clautoswap's director plans each into steps that agents turn into pull requests, plans again as they land, and calls a goal achieved only on evidence: the owner's checks passing on the base branch, or merged work. Set one when the owner states such an objective, list them, answer a goal's question, ask for a new plan, drop one, or confirm one done.",
+            new JsonObject
+            {
+                ["action"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("set", "list", "answer", "replan", "drop", "done") },
+                ["goal"] = new JsonObject { ["type"] = "string", ["description"] = "answer/replan/drop/done: g1." },
+                ["title"] = new JsonObject { ["type"] = "string", ["description"] = "set: short title." },
+                ["text"] = new JsonObject { ["type"] = "string", ["description"] = "set: the objective and what done looks like; answer: the owner's answer or guidance." },
+                ["checks"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "set/answer/replan: commands that must pass on the base branch for the goal to count as achieved; they replace the goal's checks, and the owner confirms them in a clautoswap dialog." },
+                ["issue"] = new JsonObject { ["type"] = "integer", ["description"] = "set: an issue of this repository to adopt as the goal (its title and body)." },
+            }, "action"),
     ];
 
     static JsonObject Tool(string name, string description, JsonObject properties, params string[] required) => new()

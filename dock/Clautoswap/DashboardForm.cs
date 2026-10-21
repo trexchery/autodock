@@ -10,6 +10,8 @@ public sealed class DashboardForm : Form
     readonly Toggle _auto;
     readonly Panel _header, _footer;
     readonly Pill _pin, _close, _agents;
+    readonly System.Windows.Forms.Timer _shine = new() { Interval = 40 };
+    long _shineT0;
     readonly ToolTip _tips = new();
     bool _syncing;
     string? _expandedEmail;
@@ -19,6 +21,7 @@ public sealed class DashboardForm : Form
     public event Action<Account>? SwitchRequested;
     public event Action<Account>? TerminalRequested;
     public event Action<Account, string>? AccountAction;
+    public event Action? GeneralRequested;
     public event Action? RefreshRequested, SettingsRequested, AddRequested, Moved;
     public event Action<bool>? AutoToggled, PinToggled;
     /// The agents launcher: (anchor, menu) where menu is a right-click.
@@ -77,7 +80,19 @@ public sealed class DashboardForm : Form
         _agents.Location = new Point(refresh.Left - Ui.S(2) - _agents.Width, Ui.S(7));
         _agents.MouseUp += (_, e) => { if (e.Button is MouseButtons.Left or MouseButtons.Right) AgentsRequested?.Invoke(_agents, e.Button == MouseButtons.Right); };
         _tips.SetToolTip(_agents, "Agents terminal");
-        _footer.Controls.AddRange([_auto, _agents, refresh]);
+        var general = new Pill("", PillStyle.Icon, Ui.Chat) { TabStop = false };
+        general.Location = new Point(_agents.Left - Ui.S(2) - general.Width, Ui.S(7));
+        general.Click += (_, _) => GeneralRequested?.Invoke();
+        _tips.SetToolTip(general, "General agent");
+        _footer.Controls.AddRange([_auto, general, _agents, refresh]);
+        // The agents pill glints every few seconds, whatever Windows' animation setting says. One timer, only while shown.
+        _shine.Tick += (_, _) => Shimmer((Environment.TickCount64 - _shineT0) % ShinePeriodMs / (float)ShineSweepMs);
+        VisibleChanged += (_, _) =>
+        {
+            _shineT0 = Environment.TickCount64;
+            _shine.Enabled = Visible;
+            if (!Visible) Shimmer(-1);
+        };
 
         Controls.Add(_list);
         Controls.Add(_header);
@@ -130,6 +145,23 @@ public sealed class DashboardForm : Form
         _status.Text = text;
         _status.MaximumSize = new Size(Math.Max(0, Width - Ui.S(14) - 4 * Ui.S(30) - _title.Right - Ui.S(8)), 0);
         _status.Location = new Point(_title.Right + Ui.S(4), _title.Top + (_title.Height - _status.Height) / 2 + Ui.S(1));
+    }
+
+    const int ShinePeriodMs = 4500, ShineSweepMs = 800;
+
+    /// Phase of the agents pill's sweep: 0 to 1 while sweeping, anything else is at rest. Repaints only the pill, and only on change.
+    internal void Shimmer(float phase)
+    {
+        var p = phase is >= 0 and <= 1 ? phase : -1;
+        if (p < 0 && _agents.Shine < 0) return;
+        _agents.Shine = p;
+        _agents.Invalidate();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { _shine.Dispose(); _tips.Dispose(); }
+        base.Dispose(disposing);
     }
 
     /// The agents button's dot (null: nothing to show) and tooltip.

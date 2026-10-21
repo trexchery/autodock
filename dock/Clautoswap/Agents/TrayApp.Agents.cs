@@ -20,16 +20,26 @@ public sealed partial class TrayApp
             return null;
         }
         _agents = new Supervisor(_engine, cli, new AgentStore(AgentStore.DefaultRoot),
-            new AgentsConfig { MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs });
+            new AgentsConfig { Threshold = Threshold, MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs });
         _agents.Authorize = AuthorizeAgents;
+        _agents.ConfirmChecks = ConfirmAgentChecks;
         _agents.Notify = (title, text) => Notify(title, text);
         _agents.Changed += OnAgentsChanged;
         _agents.RefreshWanted += () => _ = TickAsync(runAuto: false, refresh: true);
         _link = new AgentsLink.Server(_agents.HandleAsync, presence: (repo, open) => { if (open) _agents.Attach(repo); else _agents.Detach(repo); });
         _agents.Start();
-        _ = ReadEngineThresholdAsync();
-        if (_snap != null) _agents.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
+        _agentsThreshold = ReadEngineThresholdAsync();
+        _ = UpdateAgentAccountsAsync();
         return _agents;
+    }
+
+    Task _agentsThreshold = Task.CompletedTask;
+
+    /// Agents get accounts only once the engine's threshold is read, so the first dispatch judges headroom at its line, not 97.
+    async Task UpdateAgentAccountsAsync()
+    {
+        await _agentsThreshold;
+        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
     }
 
     void ApplyAgentSettings()
@@ -54,6 +64,8 @@ public sealed partial class TrayApp
             }
             if (double.TryParse(cfg.GetValueOrDefault("autoswitch.hysteresisPct"), NumberStyles.Float, CultureInfo.InvariantCulture, out var h))
                 _engineHysteresis = h;
+            ResumeStopped.Models = (cfg.GetValueOrDefault("autoswitch.model") ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (_agents != null) _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";
         }
         catch (Exception e) when (e is EngineException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException) { }
@@ -66,6 +78,8 @@ public sealed partial class TrayApp
     void AutoPrimeForAgents()
     {
         if (!_settings.AutoPrime || _snap == null || _agents is not { IsRunning: true } || _priming || DateTimeOffset.Now - _lastAutoPrime < TimeSpan.FromMinutes(30)) return;
+        // The default login near its line: a prime would make the account it switches to (a fresh one) a live profile meanwhile.
+        if (_snap.Accounts.FirstOrDefault(a => a.Active) is { } login && ResumeStopped.Peak(login) >= Threshold - (_engineHysteresis ?? 10)) return;
         if (Prime.Ready(_snap.Accounts, DateTimeOffset.Now) is not { Count: > 0 } ready) return;
         _lastAutoPrime = DateTimeOffset.Now;
         _ = PrimeAsync(ready);
@@ -149,8 +163,9 @@ public sealed partial class TrayApp
         if (repo.Paused) return "paused";
         if (!open) return "waits for its terminal";
         var parts = new List<string>();
-        if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking)) parts.Add("working");
-        if (repo.Items.Count(i => i.State == ItemState.NeedsOwner) is > 0 and var needs) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
+        if (repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking) || repo.Goals.Any(g => g.Run is { Live: true })) parts.Add("working");
+        if (repo.Goals.Count(g => g.State == GoalState.Active) is > 0 and var goals) parts.Add($"{goals} goal{(goals == 1 ? "" : "s")}");
+        if (repo.Items.Count(i => i.State == ItemState.NeedsOwner) + repo.Goals.Count(g => g.State == GoalState.NeedsOwner) is > 0 and var needs) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
         if (repo.Items.Count(i => i.Pr != null && i.State != ItemState.Done) is > 0 and var prs) parts.Add($"{prs} PR{(prs == 1 ? "" : "s")} open");
         return parts.Count > 0 ? string.Join(", ", parts) : "idle";
     }
@@ -200,6 +215,17 @@ public sealed partial class TrayApp
             $"{(repo.Authorized ? "Apply these settings to" : "Start agents for")} {repo.Path}?",
             "clautoswap — agents", MessageBoxButtons.YesNo, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
         return Task.FromResult(ok);
+    }
+
+    /// The owner's confirmation of the exact commands a goal's checks will run, asked by clautoswap itself.
+    Task<bool> ConfirmAgentChecks(RepoAgents repo, IReadOnlyList<string> checks)
+    {
+        using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
+        owner.Show();
+        return Task.FromResult(MessageBox.Show(owner,
+            $"Let clautoswap run these commands in a fresh checkout of {repo.Base} to decide whether a goal in {repo.Leaf} is achieved?\n\n" +
+            string.Join("\n", checks.Select(c => "    " + c)) + "\n\nNothing else asks them to run.",
+            "clautoswap — goal checks", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
     }
 
     async Task ExitAsync()

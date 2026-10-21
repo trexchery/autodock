@@ -28,12 +28,16 @@ public sealed partial class Supervisor
 
     async Task<bool> HasOriginAsync(RepoAgents repo) => (await GitAsync(repo.Path, "remote", "get-url", "origin")).Ok;
 
-    async Task<string> StartPointAsync(RepoAgents repo)
+    /// A fetch that failed for want of a network; a deleted base or revoked credentials are the owner's to fix.
+    internal static readonly Regex Offline = new(@"resolve host|timed out|timeout|refused|unreachable|connection reset|failed to connect|error connecting|no such host|no route", RegexOptions.IgnoreCase);
+
+    async Task<string> StartPointAsync(RepoAgents repo, bool strict = false)
     {
         if (!await HasOriginAsync(repo)) return repo.Base;
         if (Due(_fetched.GetValueOrDefault(repo), TimeSpan.FromMinutes(2)))
         {
-            await GitAsync(repo.Path, "fetch", "--quiet", "origin", repo.Base);
+            var fetch = await GitAsync(repo.Path, "fetch", "--quiet", "origin", repo.Base);
+            if (strict && !fetch.Ok) throw new AgentsException($"could not fetch origin/{repo.Base}: {fetch.Why}", transient: Offline.IsMatch(fetch.Err + fetch.Out)); // a stale base proves nothing
             _fetched[repo] = DateTimeOffset.Now;
         }
         return "origin/" + repo.Base;
@@ -208,7 +212,7 @@ public sealed partial class Supervisor
             await proc.StopAsync(TimeSpan.Zero);
             return $"(timed out after {Config.VerifyTimeout.TotalMinutes:0} minutes)\n" + TailOf(log, 3000);
         }
-        proc.Reap();
+        await proc.ReapAsync();
         return proc.ExitCode == 0 ? null : TailOf(log, 3000);
     }
 
@@ -219,6 +223,7 @@ public sealed partial class Supervisor
         {
             (item.Pr, item.PrUrl) = found;
             item.PrSeen ??= DateTimeOffset.Now;
+            item.PrOpened ??= DateTimeOffset.Now;
             return;
         }
         var body = Path.Combine(_store.RunDir(repo, item), "pr-body.md");
@@ -229,7 +234,7 @@ public sealed partial class Supervisor
             throw new AgentsException("could not open a pull request: " + r.Why);
         item.Pr = int.Parse(m.Groups[1].Value);
         item.PrUrl = m.Value;
-        item.PrSeen = DateTimeOffset.Now;
+        item.PrSeen = item.PrOpened = DateTimeOffset.Now;
         Notify?.Invoke("Pull request ready", $"{repo.Leaf} #{item.Pr} · {item.Title}");
     }
 
@@ -263,7 +268,7 @@ public sealed partial class Supervisor
         Notify?.Invoke("Agents need you", $"{repo.Leaf} · {item.Label}: {item.Note}");
     }
 
-    const string QuestionMark = "<!-- clautoswap-agents -->";
+    const string QuestionMark = "<!-- clautoswap-agents -->", OldQuestionMark = "<!-- autodock-agents -->"; // asked before the rename
 
     /// A decision only the owner can make: park the item, ask where the owner already works (the issue),
     /// and move on. An answer there, or in the agents terminal, brings it back.
@@ -306,6 +311,13 @@ public sealed partial class Supervisor
             if (!r.Ok || PullRequestState.Parse(r.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me) is not { } pr) continue;
             if (pr.State is "MERGED" or "CLOSED")
             {
+                var merged = pr.State == "MERGED";
+                item.Merged = merged;
+                if (!merged && GoalOf(item.Goal) is { } g) g.Claim = null; // the claim may have counted on this change
+                Memory.Add(repo.Memory, merged
+                    ? $"Merged #{item.Pr} ({item.Label}){(item.Summary is { } s ? ": " + s : "")}"
+                    : $"Closed without merging: #{item.Pr} ({item.Label}). The owner did not want this change as made{(item.Summary is { } c ? ": " + c : "")}",
+                    "pull request", false, DateTimeOffset.Now);
                 await FinishAsync(repo, item, pr.State == "MERGED" ? $"pull request #{item.Pr} merged" : $"pull request #{item.Pr} closed without merging");
                 continue;
             }
@@ -314,8 +326,11 @@ public sealed partial class Supervisor
             if (pr.FailedChecks.Count > 0)
             {
                 var logs = "";
-                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is { Ok: true } l)
-                    logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                if (pr.FailedRunId is { } run && await _cli.GhAsync(repo.Path, "run", "view", run, "--log-failed") is var l)
+                {
+                    if (l.Ok) logs = "\n" + Engine.Redact(Tail(l.Out, 4000));
+                    else Program.Log($"gh run view {run} --log-failed: exit {l.Code}: {l.Why}"); // the follow-up goes without the log
+                }
                 asks.Add($"These checks failed: {string.Join(", ", pr.FailedChecks)}.{logs}");
             }
             if (pr.Conflicting) asks.Add($"The pull request conflicts with {repo.Base}. clautoswap fetched it: merge origin/{repo.Base} into this branch and resolve the conflicts.");
@@ -342,6 +357,8 @@ public sealed partial class Supervisor
         item.State = ItemState.Done;
         item.Note = how;
         item.Followup = null;
+        // A verification still running there would keep the worktree from going, and run on for nothing.
+        if (_verifying.Remove(item, out var v)) await v.Proc.StopAsync(TimeSpan.FromSeconds(5));
         if (item.Worktree is { } wt)
         {
             await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
@@ -359,16 +376,28 @@ public sealed partial class Supervisor
 
     string? _me;
 
+    /// Whether agents may take the issue: actionable, no open pull request has it, not skipped or routed elsewhere, not a goal.
+    static bool WantedBy(RepoAgents repo, IssueInfo i, string? me, HashSet<int> open, HashSet<int> covered, HashSet<int> skip, HashSet<int>? only) =>
+        i.Actionable(me, open) && !covered.Contains(i.Number) && !repo.Skipped.Contains(i.Number)
+        && !skip.Contains(i.Number) && (only == null || only.Contains(i.Number))
+        && repo.Goals.All(g => g.Issue != i.Number || g.State == GoalState.Dropped); // a goal is planned, not worked
+
     /// Picks up new actionable issues, drops queued ones that closed, and brings back items whose
     /// question was answered on the issue.
     async Task ScanAsync(RepoAgents repo)
     {
         repo.LastScan = DateTimeOffset.Now;
-        if (_me == null && await _cli.GhAsync(repo.Path, "api", "user", "--jq", ".login") is { Ok: true } me) _me = me.Out.Trim();
-        if (_me == null) { repo.Note = "could not read issues: gh is not signed in (run `gh auth login`)"; Save(); return; }
+        // Offline is no problem to fix: the next scan reads them, and the dot stays dark meanwhile.
+        if (_me == null && await _cli.GhAsync(repo.Path, "api", "user", "--jq", ".login") is var who)
+        {
+            if (who.Ok) _me = who.Out.Trim();
+            else if (!Offline.IsMatch(who.Err + who.Out))
+                repo.Note = "could not read issues: " + (Regex.IsMatch(who.Err + who.Out, "gh auth login|not logged", RegexOptions.IgnoreCase) ? "gh is not signed in (run `gh auth login`)" : who.Why);
+        }
+        if (_me is not { } me) { Save(); return; }
         var r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author,blockedBy");
-        if (!r.Ok) r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author");
-        if (!r.Ok) { repo.Note = "could not read issues: " + r.Why; Save(); return; }
+        if (!r.Ok && !Offline.IsMatch(r.Err + r.Out)) r = await _cli.GhAsync(repo.Path, "issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,labels,assignees,author");
+        if (!r.Ok) { if (!Offline.IsMatch(r.Err + r.Out)) repo.Note = "could not read issues: " + r.Why; Save(); return; }
         if (repo.Note?.StartsWith("could not") == true) repo.Note = null; // issues read, or a one-off baseline hiccup
         if (IssueInfo.ParseList(r.Out) is not { } issues) { repo.Note = "could not read issues: gh printed something unexpected"; Save(); return; }
         var open = issues.Select(i => i.Number).ToHashSet();
@@ -377,21 +406,24 @@ public sealed partial class Supervisor
         if (await _cli.GhAsync(repo.Path, "pr", "list", "--state", "open", "--limit", "100", "--json", "number,closingIssuesReferences") is { Ok: true } prs)
             covered = IssueInfo.ClosedByOpenPullRequests(prs.Out);
         // The owner's own routing (an "clautoswap" section in an issue they wrote) narrows it further.
-        var (skip, only) = IssueInfo.Routing(issues, _me);
-        bool Wanted(IssueInfo i) => i.Actionable(_me, open) && !covered.Contains(i.Number) && !repo.Skipped.Contains(i.Number)
-                                    && !skip.Contains(i.Number) && (only == null || only.Contains(i.Number));
+        var (skip, only) = IssueInfo.Routing(issues, me);
+        bool Wanted(IssueInfo i) => WantedBy(repo, i, _me, open, covered, skip, only);
         // Unstarted work found by scanning that is no longer wanted (now blocked, a tracker, routed elsewhere,
         // or someone else's pull request covers it) leaves the queue; work the owner named stays.
         var byNumber = issues.ToDictionary(i => i.Number);
-        repo.Items.RemoveAll(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null } && i.Rank < OwnerRank
+        repo.Items.RemoveAll(i => i is { State: ItemState.Queued, Worktree: null, Pr: null, Guidance: null } && i.Rank < OwnerRank && i.Goal == null
                                   && i.Issue is { } n && byNumber.TryGetValue(n, out var issue) && !Wanted(issue));
 
         // Closed issues: unstarted and parked work goes, and so does work under way that has no pull
         // request yet. A full page may not list every open issue, so only a complete list counts.
+        bool Gone(WorkItem i) => i.Issue is { } n && !open.Contains(n) && i.State != ItemState.Checking
+                                 && (i.State == ItemState.Done ? i.Worktree == null : i.Pr == null)
+                                 && !(i.State == ItemState.Done && i.Goal != null); // a goal's finished work is its evidence
         if (issues.Count < 100)
-            foreach (var gone in repo.Items.Where(i => i.Issue is { } n && !open.Contains(n) && i.State != ItemState.Checking
-                         && (i.State == ItemState.Done ? i.Worktree == null : i.Pr == null)).ToList())
+        {
+            foreach (var gone in repo.Items.Where(Gone).ToList())
             {
+                if (!Gone(gone)) continue; // its run ended while an earlier one was stopping, and its check took over
                 if (gone.State != ItemState.Done)
                 {
                     await StopWorkerAsync(gone, "skipped");
@@ -399,6 +431,9 @@ public sealed partial class Supervisor
                 }
                 repo.Items.Remove(gone);
             }
+            foreach (var g in repo.Goals.Where(g => g is { State: GoalState.Active or GoalState.NeedsOwner, Issue: { } n } && !open.Contains(n)).ToList())
+                await EndGoalAsync(repo, g, GoalState.Dropped, $"its issue #{g.Issue} was closed");
+        }
         foreach (var issue in issues)
         {
             var dependents = issues.Count(o => o.BlockedBy(open).Contains(issue.Number));
@@ -417,9 +452,11 @@ public sealed partial class Supervisor
         {
             var v = await _cli.GhAsync(repo.Path, "issue", "view", item.Issue!.Value.ToString(), "--json", "comments");
             if (!v.Ok) continue;
-            var answers = IssueInfo.Comments(v.Out, item.AskedAt!.Value, _me).Where(c => !c.Contains(QuestionMark)).ToList();
+            if (item.State != ItemState.NeedsOwner || item.AskedAt is not { } asked || Dropped(repo, item)) continue; // changed during the await
+            var answers = IssueInfo.Comments(v.Out, asked, _me).Where(c => !c.Contains(QuestionMark) && !c.Contains(OldQuestionMark)).ToList();
             if (answers.Count == 0) continue;
             item.Guidance = Engine.Redact(string.Join("\n\n", answers));
+            Memory.Add(repo.Memory, $"#{item.Issue}: {item.Guidance}", "issue", true, DateTimeOffset.Now);
             (item.State, item.AskedAt, item.Failures, item.Note) = (ItemState.Queued, null, 0, null);
         }
         Save();
@@ -436,6 +473,26 @@ public sealed partial class Supervisor
         return item;
     }
 
+    /// The owner's GitHub login, read once (a restart need not wait for the next scan).
+    async Task<string?> MeAsync(RepoAgents repo) =>
+        _me ??= (await _cli.GhAsync(repo.Path, "api", "user", "--jq", ".login")) is { Ok: true } me ? me.Out.Trim() : null;
+
+    /// A clean detached checkout of the base as it is now (fetched), for a plan or a completion check, whatever a crash left there.
+    async Task<string> ProbeWorktreeAsync(RepoAgents repo, WorkItem probe, bool strict = false)
+    {
+        if (!Directory.Exists(repo.Path)) throw new AgentsException($"{repo.Path} no longer exists");
+        _fetched.Remove(repo);
+        var start = await StartPointAsync(repo, strict);
+        var wt = _store.Worktree(repo, probe);
+        await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
+        try { if (Directory.Exists(wt)) Directory.Delete(wt, recursive: true); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        await GitAsync(repo.Path, "worktree", "prune");
+        var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
+        return add.Ok ? wt : throw new AgentsException($"could not check out {start}: {add.Why}");
+    }
+
+    Task RemoveProbeAsync(RepoAgents repo, WorkItem probe) => GitAsync(repo.Path, "worktree", "remove", "--force", _store.Worktree(repo, probe));
+
     /// Before the first run of a newly started repository: the gate must pass on the base branch, or
     /// every item would fail it for reasons that are not its own.
     async Task VerifyBaselineAsync(RepoAgents repo)
@@ -445,15 +502,16 @@ public sealed partial class Supervisor
         _baseline.Add(repo);
         var probe = new WorkItem { Id = "baseline", Title = "baseline" };
         var wt = _store.Worktree(repo, probe);
+        var again = false; // its terminal closed: on the next open, once this one has cleaned up after itself
         try
         {
             var start = await StartPointAsync(repo);
             await GitAsync(repo.Path, "worktree", "prune");
             var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
             if (!add.Ok) { repo.Note = "could not check the verification command: " + add.Why; return; }
-            if (!Active(repo)) { _rebaseline.Add(repo); return; } // closed meanwhile
+            if (!Active(repo)) { again = true; return; } // closed meanwhile
             var result = await VerifyAsync(repo, probe, wt, verify);
-            if (_interrupted.Remove(probe)) _rebaseline.Add(repo); // its terminal closed: on the next open
+            if (_interrupted.Remove(probe)) again = true;
             else if (result is { } failure)
             {
                 repo.Paused = true;
@@ -466,6 +524,7 @@ public sealed partial class Supervisor
             await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
             try { Directory.Delete(_store.RunDir(repo, probe), recursive: true); } catch (IOException) { }
             _baseline.Remove(repo);
+            if (again) _rebaseline.Add(repo);
             Save();
             Pump();
         }
@@ -490,8 +549,8 @@ public sealed record IssueInfo(int Number, string Title, string Body, List<strin
     static readonly Regex NotPrerequisite = new(@"\b(coordinat\w*|related|see also)\b", RegexOptions.IgnoreCase);
     // An issue reference or range ("#12", "#22–#27"), not a pull request's ("PR #12").
     static readonly Regex IssueRef = new(@"(?<!\b(?:PRs?|pull requests?)\s?)(?<![\w&])#(\d+)\b(?:\s*[–—-]\s*#?(\d+)\b)?", RegexOptions.IgnoreCase);
-    // The owner's routing for clautoswap: a section whose heading names clautoswap, with Skip: and Eligible: lines.
-    static readonly Regex RoutingSection = new(@"^#{1,6}[^\n]*clautoswap.*(?:\n(?!#{1,6}\s).*)*", RegexOptions.Multiline | RegexOptions.IgnoreCase);
+    // The owner's routing for clautoswap: a section whose heading names clautoswap (or autodock, its old name), with Skip: and Eligible: lines.
+    static readonly Regex RoutingSection = new(@"^#{1,6}[^\n]*(?:clautoswap|autodock).*(?:\n(?!#{1,6}\s).*)*", RegexOptions.Multiline | RegexOptions.IgnoreCase);
     static readonly Regex RoutingLine = new(@"^[\s>*_-]*(skip|eligible)\b[^:\n]*:", RegexOptions.IgnoreCase);
 
     public bool Tracker => TrackerTitle.IsMatch(Title) || TrackerBody.IsMatch(Body) || Checklist.Matches(Body).Count >= 3;

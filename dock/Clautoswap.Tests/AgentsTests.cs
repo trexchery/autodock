@@ -48,7 +48,20 @@ public class AgentOutcomeTests
     [InlineData("hmm\nCLAUTOSWAP: BLOCKED Should it be\nformal or casual?", "BLOCKED", "Should it be\nformal or casual?")]
     [InlineData("CLAUTOSWAP: CHANGES", "CHANGES", "changes")]
     [InlineData("all good", "DONE", null)]
+    [InlineData("CLAUTOSWAP: DONE ok\nCLAUTOSWAP: LEARNED a fact\nmore", "DONE", "ok")]
+    [InlineData("CLAUTOSWAP: BLOCKED why?\nstill the question\nCLAUTOSWAP: LEARNED x", "BLOCKED", "why?\nstill the question")]
+    [InlineData("CLAUTOSWAP: DONE\nCLAUTOSWAP: LEARNED x", "DONE", "done")]
     public void ReadsTheLastMarker(string text, string kind, string? expected) => Assert.Equal(expected, Supervisor.Marker(text, kind));
+
+    [Fact]
+    public void ALearnedLineMentioningAMarkerIsNotTheVerdictOrTheSummary()
+    {
+        var text = "work\nCLAUTOSWAP: LEARNED never print CLAUTOSWAP: BLOCKED yourself\r\nCLAUTOSWAP: DONE added it";
+        var judged = Supervisor.StripLearned(text);
+        Assert.Equal("work\nCLAUTOSWAP: DONE added it", judged);
+        Assert.Null(Supervisor.Marker(judged, "BLOCKED"));
+        Assert.Equal("added it", Supervisor.Marker(judged, "DONE"));
+    }
 
     [Theory]
     [InlineData("You've hit your session limit · resets 3:45pm", true)]
@@ -140,6 +153,54 @@ public class AgentScheduleTests
         repo.Items[2].Guidance = "yes, formal";
         Assert.Equal("3", Supervisor.Next(repo)!.Id);
     }
+
+    [Fact]
+    public void AnItemRestingAfterAFailedStartHoldsNoneOfTheRest()
+    {
+        var repo = new RepoAgents { Items = [Item("1", wt: @"C:\wt\1"), Item("2", rank: 100), Item("3"), Item("4", ItemState.Queued, pr: 9)] };
+        Assert.Equal("1", Supervisor.Next(repo)!.Id); // under way
+        Assert.Equal("4", Supervisor.Next(repo, resting: i => i.Id == "1")!.Id); // then follow-ups
+        Assert.Equal("2", Supervisor.Next(repo, resting: i => i.Id is "1" or "4")!.Id); // then rank
+        Assert.Equal("3", Supervisor.Next(repo, resting: i => i.Id is "1" or "2" or "4")!.Id);
+        Assert.Null(Supervisor.Next(repo, resting: _ => true));
+    }
+
+    [Fact]
+    public void ChangesUnderWayCountTowardThePullRequestLimit()
+    {
+        var repo = new RepoAgents { Items = [Item("1", ItemState.Open, pr: 8), Item("2", ItemState.Working, wt: @"C:\wt\2"), Item("3")] };
+        Assert.Null(Supervisor.Next(repo, 2)); // one waiting for review and one on its way: two pull requests
+        Assert.Equal("3", Supervisor.Next(repo, 3)!.Id);
+        repo.Items[1].State = ItemState.Queued; // its review is next: still under way, and it goes on
+        Assert.Equal("2", Supervisor.Next(repo, 2)!.Id);
+        Assert.Null(Supervisor.Next(repo, 2, i => i.Id == "2")); // resting, it keeps its place
+        Assert.Equal("3", Supervisor.Next(repo, 3, i => i.Id == "2")!.Id);
+    }
+
+    [Fact]
+    public void PlannedWorkWaitsForWhatItBuildsOn()
+    {
+        var w1 = Item("w1", rank: 9);
+        var repo = new RepoAgents { Path = @"C:\r", Items = [w1] };
+        var w2 = Item("w2", rank: 10);
+        w2.After = [Supervisor.Key(repo, w1)];
+        repo.Items.Add(w2);
+        WorkItem? Next() => Supervisor.Next(repo, resting: i => !Supervisor.Ready([repo], i));
+        Assert.Equal("w1", Next()!.Id);
+        (w1.State, w1.Pr) = (ItemState.Open, 7);
+        Assert.Null(Next());
+        w1.State = ItemState.Done; // closed without merging
+        Assert.Null(Next());
+        w1.Merged = true;
+        Assert.Equal("w2", Next()!.Id);
+        (w1.Merged, w1.Pr) = (false, null); // finished without a pull request
+        Assert.Equal("w2", Next()!.Id);
+        repo.Items.Remove(w1);
+        Assert.Equal("w2", Next()!.Id);
+        (w1.State, w1.Pr, w2.Worktree) = (ItemState.Open, 7, @"C:\wt\w2");
+        repo.Items.Add(w1);
+        Assert.Equal("w2", Next()!.Id); // started work never waits
+    }
 }
 
 public class AccountPickerTests
@@ -152,6 +213,18 @@ public class AccountPickerTests
 
     static readonly Dictionary<string, int> None = [];
     static readonly Dictionary<string, DateTimeOffset> NoneCooled = [];
+
+    [Fact]
+    public void AFiveHourLimitBenchesTheAccountUntilTheFiveHourResetNotTheWeekly()
+    {
+        var a = A(2, 100, 40); // 5h resets in 2 h, weekly in 3 days
+        Assert.Equal(Now.AddHours(2), AccountPicker.NextReset(a, null, Now, 90));
+        Assert.Equal(Now.AddHours(2), AccountPicker.EarliestReturn([a], NoneCooled, Now, 90));
+        Assert.Equal(Now.AddDays(3), AccountPicker.NextReset(A(2, 100, 95), null, Now, 90)); // both out: the later one
+        Assert.Equal(Now.AddHours(2), AccountPicker.NextReset(A(2, 50, 40), null, Now, 90)); // a stale reading: the soonest reset
+        var cooled = new Dictionary<string, DateTimeOffset> { [AccountPicker.Key(a)] = Now.AddHours(3) };
+        Assert.Equal(Now.AddHours(3), AccountPicker.NextReset(A(2, 50, 40), cooled, Now, 90)); // cooled, nothing out: the cooling
+    }
 
     [Fact]
     public void NeverTheSignedInAccountExcludedOrBrokenOnes()
@@ -168,6 +241,17 @@ public class AccountPickerTests
         var (pick, why) = AccountPicker.Pick([A(2, 95), A(3, 40, 91)], 90, None, NoneCooled, Now);
         Assert.Null(pick);
         Assert.Contains("near their limits", why);
+    }
+
+    [Fact]
+    public void TheDefaultLoginNearItsLimitKeepsTheRoomiestFreeAccount()
+    {
+        Account[] accounts = [A(3, 85, active: true), A(1, 10), A(2, 30)];
+        Assert.Equal(2, AccountPicker.Pick(accounts, 90, None, NoneCooled, Now).Pick!.Number); // #1 waits for the default login
+        var (none, why) = AccountPicker.Pick(accounts, 90, new Dictionary<string, int> { [AccountPicker.Key(accounts[2])] = 1 }, NoneCooled, Now, perAccount: 1);
+        Assert.Null(none);
+        Assert.Contains("#1 is kept free", why);
+        Assert.Equal(1, AccountPicker.Pick([A(3, 50, active: true), A(1, 10), A(2, 30)], 90, None, NoneCooled, Now).Pick!.Number); // room left: no reserve
     }
 
     [Fact]
@@ -277,6 +361,11 @@ public class IssueTriageTests
         Assert.Equal([1, 6, 12, 13, 22, 23, 24, 25, 26, 27], skip.Order());
         Assert.Equal([21, 36], only!.Order()); // pull requests are not issues; a stranger's note counts for nothing
         Assert.Null(IssueInfo.Routing(IssueInfo.ParseList(Roadmap)!, "owner").Only); // no note: no restriction
+
+        const string old = """[{"number":2,"title":"Plan","author":{"login":"owner"},"body":"## autodock routing\nSkip: #12\nEligible: #20-#21"}]""";
+        var (oldSkip, oldOnly) = IssueInfo.Routing(IssueInfo.ParseList(old)!, "owner");
+        Assert.Equal([12], oldSkip); // written before the rename
+        Assert.Equal([20, 21], oldOnly!.Order());
     }
 
     [Fact]
@@ -448,6 +537,11 @@ public class AgentProcessTests
         await p.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(20));
         Assert.Equal(7, p.ExitCode);
         Assert.True(p.CpuTime >= TimeSpan.Zero);
+        // Our handle on the exited root does not keep it listed: reaping an emptied job returns at once.
+        var reap = Stopwatch.StartNew();
+        await p.ReapAsync();
+        Assert.True(reap.Elapsed < TimeSpan.FromSeconds(2), $"reap took {reap.Elapsed}");
+        Assert.Empty(p.ProcessIds());
     }
 
     /// A file a live process is still writing (a plain File.ReadAllText would be refused).
@@ -457,7 +551,8 @@ public class AgentProcessTests
         return new StreamReader(fs).ReadToEnd();
     }
 
-    internal static async Task WaitUntil(Func<bool> condition, int seconds = 20)
+    /// Generous by default: a below-normal child process on a loaded machine (a full test run) can take seconds to start.
+    internal static async Task WaitUntil(Func<bool> condition, int seconds = 60)
     {
         var until = DateTime.UtcNow.AddSeconds(seconds);
         while (true)
@@ -470,8 +565,162 @@ public class AgentProcessTests
     }
 }
 
+public class MemoryTests
+{
+    static readonly DateTimeOffset T = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void AddRedactsClipsAndIgnoresEmpty()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "  ", "owner", true, T);
+        Memory.Add(notes, "use  key sk-" + new string('a', 20) + "\nplease", "owner", true, T);
+        Memory.Add(notes, new string('x', 900), "run", false, T);
+        Assert.Equal("use key [redacted] please", notes[0].Text);
+        Assert.Equal(Memory.NoteChars, notes[1].Text.Length);
+        Assert.EndsWith("…", notes[1].Text);
+    }
+
+    [Fact]
+    public void AddReplacesTheSameTextAndKeepsOwner()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "Tests run with dotnet test", "owner", true, T);
+        Memory.Add(notes, "other", "run", false, T);
+        Memory.Add(notes, "tests  RUN with dotnet test", "run", false, T.AddHours(1));
+        Assert.Equal(2, notes.Count);
+        Assert.Equal(new Note("tests RUN with dotnet test", "run", T.AddHours(1), true), notes[1]);
+    }
+
+    [Fact]
+    public void OverTheCapTheOldestAgentNoteGoesAndOwnerNotesStay()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "owner first", "owner", true, T);
+        for (var i = 0; i < Memory.Cap; i++) Memory.Add(notes, $"agent {i}", "run", false, T.AddMinutes(i));
+        Assert.Equal(Memory.Cap, notes.Count);
+        Assert.Contains(notes, n => n.Text == "owner first");
+        Assert.DoesNotContain(notes, n => n.Text == "agent 0");
+        Assert.Contains(notes, n => n.Text == "agent 1");
+
+        var owners = new List<Note>();
+        for (var i = 0; i <= Memory.Cap; i++) Memory.Add(owners, $"decision {i}", "owner", true, T.AddMinutes(i));
+        Assert.Equal(Memory.Cap, owners.Count);
+        Assert.DoesNotContain(owners, n => n.Text == "decision 0");
+    }
+
+    [Fact]
+    public void ForgetTakesANumberOrText()
+    {
+        var notes = new List<Note>();
+        foreach (var t in new[] { "alpha one", "beta", "alpha two" }) Memory.Add(notes, t, "owner", true, T);
+        Assert.Equal(1, Memory.Forget(notes, "2"));
+        Assert.Equal(["alpha one", "alpha two"], notes.Select(n => n.Text));
+        Assert.Equal(2, Memory.Forget(notes, "ALPHA"));
+        Assert.Empty(notes);
+        Assert.Equal(0, Memory.Forget(notes, "9"));
+        Assert.Equal(0, Memory.Forget(notes, " "));
+    }
+
+    [Fact]
+    public void ForgetTreatsAnyNumberAsAnIndexAndAcceptsATrailingDot()
+    {
+        var notes = new List<Note>();
+        foreach (var t in new[] { "see #12", "beta", "gamma" }) Memory.Add(notes, t, "owner", true, T);
+        Assert.Equal(0, Memory.Forget(notes, "12")); // out of range is not a text search
+        Assert.Equal(0, Memory.Forget(notes, "0"));
+        Assert.Equal(3, notes.Count);
+        Assert.Equal(1, Memory.Forget(notes, "#12"));
+        Assert.Equal(1, Memory.Forget(notes, "1."));
+        Assert.Equal(["gamma"], notes.Select(n => n.Text));
+    }
+
+    [Fact]
+    public void OwnerNotesAddedOnPurposeOutrankAnswersAndSurviveTheCut()
+    {
+        var repo = Enumerable.Range(0, 6).Select(i => new Note(new string('a', Memory.NoteChars), "answer", T.AddMinutes(i), true)).ToList();
+        var prompt = Memory.Prompt([new Note("global decision", "owner", T, true)], repo)!;
+        Assert.True(prompt.Length <= Memory.PromptChars);
+        Assert.Contains("- [owner] global decision", prompt);
+        Assert.True(prompt.IndexOf("global decision") < prompt.IndexOf("aaaa"));
+        // a line too long for what is left does not hide a short one after it
+        var skipped = Memory.Prompt([], [new Note("tiny agent", "#1", T, false), .. repo])!;
+        Assert.Contains("tiny agent", skipped);
+    }
+
+    [Fact]
+    public void NormalizeSourceMatchesWhatAddStores()
+    {
+        var notes = new List<Note>();
+        Memory.Add(notes, "x", "  #4   Some\ttitle ", false, T);
+        Assert.Equal(notes[0].Source, Memory.NormalizeSource("  #4   Some\ttitle "));
+    }
+
+    [Fact]
+    public void PromptListsOwnerNotesFirstNewestFirstAndStopsAtItsLimit()
+    {
+        Assert.Null(Memory.Prompt([], []));
+        var repo = new List<Note> { new("old agent", "#1", T, false), new("repo decision", "owner", T, true), new("new agent", "#2", T.AddHours(1), false) };
+        var global = new List<Note> { new("global rule", "owner", T, true) };
+        Assert.Equal(
+            "Shared memory of clautoswap agents (the owner's decisions bind you; agent notes are hints to verify):\n" +
+            "- [owner] repo decision\n- [owner] global rule\n- [agent · #2] new agent\n- [agent · #1] old agent",
+            Memory.Prompt(global, repo));
+
+        var many = Enumerable.Range(0, Memory.Cap).Select(i => new Note(new string((char)('a' + i % 26), 400), "run", T.AddMinutes(i), i == 0)).ToList();
+        var prompt = Memory.Prompt([], many)!;
+        Assert.True(prompt.Length <= Memory.PromptChars);
+        Assert.Contains("[owner]", prompt); // the owner's note is first, so it survives the cut
+    }
+
+    [Fact]
+    public void ListNumbersRepositoryNotesThenSharedOnes()
+    {
+        Assert.Equal("No shared notes yet.", Memory.List([], []));
+        Assert.Equal("1. [owner] a\n2. [agent · #3] b\ng1. [owner] c",
+            Memory.List([new("c", "owner", T, true)], [new("a", "owner", T, true), new("b", "#3", T, false)]));
+    }
+}
+
 public class AgentStoreTests
 {
+    [Fact]
+    public void MemoryRoundTripsAndKeepsWhatThisBuildDoesNotKnow()
+    {
+        using var tmp = new TempDir();
+        var store = new AgentStore(tmp.Path);
+        var at = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+        store.Save(new AgentsState
+        {
+            Memory = [new Note("shared", "owner", at, true)],
+            Repos = [new RepoAgents { Path = @"C:\r", Memory = [new Note("here", "#1 x", at)], Items = [new WorkItem { Id = "1", Merged = true }] }],
+        });
+        var back = store.Load();
+        Assert.Equal(new Note("shared", "owner", at, true), back.Memory[0]);
+        Assert.Equal(new Note("here", "#1 x", at), back.Repos[0].Memory[0]);
+        Assert.True(back.Repos[0].Items[0].Merged);
+
+        var json = File.ReadAllText(Path.Combine(tmp.Path, "state.json")).Replace("\"text\": \"here\"", "\"text\": \"here\", \"later\": 5");
+        File.WriteAllText(Path.Combine(tmp.Path, "state.json"), json);
+        store.Save(store.Load());
+        Assert.Contains("\"later\": 5", File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
+        Assert.Empty(new AgentStore(Path.Combine(tmp.Path, "none")).Load().Memory);
+    }
+
+    [Fact]
+    public void RunningSeesOnlyAWorkerThatIsStillAlive()
+    {
+        using var tmp = new TempDir();
+        var self = System.Diagnostics.Process.GetCurrentProcess();
+        Run R(int pid, long created) => new() { Job = "clautoswap-test-" + Guid.NewGuid().ToString("N"), Pid = pid, Created = created, Live = true };
+        var dead = new WorkItem { Id = "1", Run = R(2147483000, 1) };
+        new AgentStore(tmp.Path).Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", Items = [dead] }] });
+        Assert.False(AgentStore.Running(tmp.Path));
+        Assert.False(AgentStore.Running(Path.Combine(tmp.Path, "none")));
+        new AgentStore(tmp.Path).Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", Items = [dead], Goals = [new Goal { Id = "g1", Run = R(self.Id, self.StartTime.ToFileTime()) }] }] });
+        Assert.True(AgentStore.Running(tmp.Path)); // a planner the old tray left running
+    }
+
     [Fact]
     public void RoundTripsAndKeepsAnUnreadableFile()
     {
@@ -490,6 +739,91 @@ public class AgentStoreTests
         File.WriteAllText(Path.Combine(tmp.Path, "state.json"), "{ torn");
         Assert.Empty(store.Load().Repos);
         Assert.Equal("{ torn", File.ReadAllText(Path.Combine(tmp.Path, "state.json.corrupt")));
+    }
+
+    [Fact]
+    public void AnEarlierStateLoadsAndKeepsWhatThisBuildDoesNotKnow()
+    {
+        using var tmp = new TempDir();
+        // 0.5.x's shape, plus fields from another build at every level.
+        const string json = """
+            {
+              "repos": [{
+                "path": "C:\\r", "base": "main", "verify": "dotnet test", "authorized": true, "authorizedAt": "2026-10-01T09:00:00+02:00",
+                "paused": false, "note": null, "lastScan": "2026-10-19T08:00:00+02:00", "skipped": [4], "nextLocal": 2,
+                "items": [
+                  {"id":"1","issue":1,"title":"Queued","body":"b","rank":100,"state":"Queued","created":"2026-10-18T10:00:00+02:00","failures":1,"note":"`npm test` failed","evidence":{"checks":["unit"],"passed":true}},
+                  {"id":"2","issue":2,"title":"Working","state":"Working","branch":"clautoswap/2-working","worktree":"C:\\wt\\2","session":{"id":"s2","email":"a2@example.com","org":""},
+                   "run":{"attempt":2,"kind":"work","job":"Local\\clautoswap-agent-k-2-2-abcdef","pid":1234,"created":5678,"sessionId":"s2","email":"a2@example.com","org":"","head":"abc","started":"2026-10-19T09:00:00+02:00","live":true,"tokens":42}},
+                  {"id":"3","issue":3,"title":"Checking","state":"Checking","summary":"did it","reviewedHead":"def","worktree":"C:\\wt\\3"},
+                  {"id":"4","issue":4,"title":"Open","state":"Open","pr":7,"prUrl":"https://github.com/o/r/pull/7","prSeen":"2026-10-19T10:00:00+02:00","followups":1},
+                  {"id":"5","issue":5,"title":"Held","state":"NeedsOwner","holdFor":"workflow","note":"the change touches .github/x.yml","reviewNotes":"n"},
+                  {"id":"w1","title":"Asked","state":"NeedsOwner","askedAt":"2026-10-19T11:00:00+02:00","reviewNext":true,"reviews":1},
+                  {"id":"w2","title":"Merged","state":"Done","note":"pull request #8 merged"}
+                ],
+                "milestones": [{"text":"ship the tray","done":false}]
+              }],
+              "journal": {"facts": ["prefers small pull requests"]}
+            }
+            """;
+        File.WriteAllText(Path.Combine(tmp.Path, "state.json"), json);
+        var store = new AgentStore(tmp.Path);
+        var repo = Assert.Single(store.Load().Repos);
+        Assert.Equal((@"C:\r", "dotnet test", true, 2, 4), (repo.Path, repo.Verify, repo.Authorized, repo.NextLocal, Assert.Single(repo.Skipped)));
+        Assert.Equal([ItemState.Queued, ItemState.Working, ItemState.Checking, ItemState.Open, ItemState.NeedsOwner, ItemState.NeedsOwner, ItemState.Done], repo.Items.Select(i => i.State));
+        Assert.Equal((1, "`npm test` failed"), (repo.Items[0].Failures, repo.Items[0].Note));
+        Assert.Equal(new Session("s2", "a2@example.com", ""), repo.Items[1].Session);
+        Assert.Equal((2, 1234, 5678L, true, "abc"), (repo.Items[1].Run!.Attempt, repo.Items[1].Run!.Pid, repo.Items[1].Run!.Created, repo.Items[1].Run!.Live, repo.Items[1].Run!.Head));
+        Assert.Equal(("did it", "def"), (repo.Items[2].Summary, repo.Items[2].ReviewedHead));
+        Assert.Equal((7, "https://github.com/o/r/pull/7", 1), (repo.Items[3].Pr, repo.Items[3].PrUrl, repo.Items[3].Followups));
+        Assert.Equal(("workflow", "n"), (repo.Items[4].HoldFor, repo.Items[4].ReviewNotes));
+        Assert.True(repo.Items[5] is { ReviewNext: true, Reviews: 1, AskedAt: not null, Issue: null });
+        Assert.Equal("pull request #8 merged", repo.Items[6].Note);
+
+        store.Save(store.Load());
+        using var before = JsonDocument.Parse(json);
+        using var after = JsonDocument.Parse(File.ReadAllText(Path.Combine(tmp.Path, "state.json")));
+        foreach (var at in new Func<JsonElement, JsonElement>[]
+                 {
+                     s => s.GetProperty("journal"),
+                     s => s.GetProperty("repos")[0].GetProperty("milestones"),
+                     s => s.GetProperty("repos")[0].GetProperty("items")[0].GetProperty("evidence"),
+                     s => s.GetProperty("repos")[0].GetProperty("items")[1].GetProperty("run").GetProperty("tokens"),
+                 })
+            Assert.Equal(JsonSerializer.Serialize(at(before.RootElement)), JsonSerializer.Serialize(at(after.RootElement)));
+        Assert.Equal(ItemState.Done, store.Load().Repos[0].Items[6].State); // and the known fields still read back
+    }
+
+    [Fact]
+    public void GoalsRoundTripAndKeepWhatThisBuildDoesNotKnow()
+    {
+        using var tmp = new TempDir();
+        var store = new AgentStore(tmp.Path);
+        var at = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+        var goal = new Goal
+        {
+            Id = "g1", Title = "Ship", Objective = "o", Issue = 4, Checks = ["a"], State = GoalState.NeedsOwner, Created = at, Note = "n", Guidance = "gd",
+            Replan = false, LastPlan = at, Plans = 2, Idle = 1, Failures = 3, Progress = "p", Claim = "c", Refuted = "r", Evidence = "e", AchievedAt = at,
+            Log = ["l"], Run = new Run { Kind = "plan", Live = true, Job = "j" },
+        };
+        store.Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", NextGoal = 2, Goals = [goal], Items = [new WorkItem { Id = "w2", Goal = "k/g1", After = ["k/w1"] }] }] });
+        var back = store.Load().Repos[0];
+        Assert.Equal(2, back.NextGoal);
+        var g = Assert.Single(back.Goals);
+        Assert.Equal(("g1", "Ship", "o", 4, "a", GoalState.NeedsOwner, at, "n", "gd"), (g.Id, g.Title, g.Objective, g.Issue, Assert.Single(g.Checks), g.State, g.Created, g.Note, g.Guidance));
+        Assert.Equal((false, (DateTimeOffset?)at, 2, 1, 3, "p", "c", "r", "e", (DateTimeOffset?)at), (g.Replan, g.LastPlan, g.Plans, g.Idle, g.Failures, g.Progress, g.Claim, g.Refuted, g.Evidence, g.AchievedAt));
+        Assert.Equal(("l", "plan", true, "j"), (Assert.Single(g.Log), g.Run!.Kind, g.Run.Live, g.Run.Job));
+        Assert.Equal(("k/g1", "k/w1"), (back.Items[0].Goal, Assert.Single(back.Items[0].After)));
+
+        var path = Path.Combine(tmp.Path, "state.json");
+        Assert.Contains("\"state\": \"NeedsOwner\"", File.ReadAllText(path));
+        File.WriteAllText(path, File.ReadAllText(path).Replace("\"id\": \"g1\"", "\"id\": \"g1\", \"later\": 5"));
+        store.Save(store.Load());
+        Assert.Contains("\"later\": 5", File.ReadAllText(path));
+
+        // A planner left running is work even where agents were stopped: the tray starts agents to stop it.
+        store.Save(new AgentsState { Repos = [new RepoAgents { Path = @"C:\r", Goals = [new Goal { Id = "g1", Run = new Run { Kind = "plan", Live = true } }] }] });
+        Assert.True(AgentStore.HasWork(tmp.Path));
     }
 
     [Fact]
@@ -618,6 +952,17 @@ public class AgentsTerminalTests
     }
 
     [Fact]
+    public void LabelStateFollowsGoals()
+    {
+        var repo = new RepoAgents { Path = @"C:\r", Authorized = true, Goals = [new Goal { Id = "g1", State = GoalState.NeedsOwner }] };
+        Assert.Equal("attention", AgentsTerminal.StateOf(repo));
+        repo.Goals = [new Goal { Id = "g1", Run = new Run { Kind = "plan", Live = true } }];
+        Assert.Equal("working", AgentsTerminal.StateOf(repo)); // planning, before any item exists
+        repo.Paused = true;
+        Assert.Equal("paused", AgentsTerminal.StateOf(repo));
+    }
+
+    [Fact]
     public void ThePaletteStaysPastel()
     {
         var palette = AgentsTerminal.Palette().ToList();
@@ -660,7 +1005,7 @@ public class AgentsLinkTests
         Assert.Null(AgentsLink.Respond("""{"jsonrpc":"2.0","method":"notifications/initialized"}""", "x"));
         Assert.Null(AgentsLink.Respond("not json", "x"));
         var tools = Reply("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").GetProperty("result").GetProperty("tools");
-        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
+        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details", "agents_memory", "agents_goal"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
         Assert.Equal(-32601, Reply("""{"jsonrpc":"2.0","id":3,"method":"resources/list"}""").GetProperty("error").GetProperty("code").GetInt32());
     }
 
@@ -725,5 +1070,448 @@ public class AgentProblemTests
         Assert.True(Supervisor.Problem(repo));
         repo.Authorized = false; // stopped: nothing to show
         Assert.False(Supervisor.Problem(repo));
+    }
+
+    [Fact]
+    public void OnlyAGoalWhosePlanningKeepsFailingLightsTheDot()
+    {
+        var goal = new Goal { Id = "g1", State = GoalState.NeedsOwner }; // a question for the owner
+        var repo = new RepoAgents { Path = @"C:\repo", Authorized = true, Goals = [goal] };
+        Assert.False(Supervisor.Problem(repo));
+        goal.Failures = 3;
+        Assert.True(Supervisor.Problem(repo));
+        repo.Authorized = false;
+        Assert.False(Supervisor.Problem(repo));
+    }
+}
+
+/// The director's plans: parsing what a planner answered, and what a plan changes. Pure: no processes, no GitHub.
+public class AgentGoalTests
+{
+    static readonly DateTimeOffset Now = new(2026, 10, 20, 9, 30, 0, TimeSpan.Zero);
+
+    static RepoAgents Repo(params WorkItem[] items) => new() { Path = @"C:\r", Authorized = true, Items = [.. items] };
+
+    static Goal G() => new() { Id = "g1", Title = "Ship the API" };
+
+    static WorkItem I(string id, ItemState state = ItemState.Queued, string title = "", int? pr = null) =>
+        new() { Id = id, Issue = int.TryParse(id, out var n) ? n : null, Title = title.Length > 0 ? title : id, State = state, Pr = pr };
+
+    static PlanOutput Plan(string json) => Supervisor.ParsePlan("CLAUTOSWAP: PLAN\n" + json)!;
+
+    static void Ingest(RepoAgents r, Goal g, string json, Dictionary<int, IssueInfo>? issues = null, string[]? prs = null) =>
+        Supervisor.Ingest([r], r, g, Plan(json), issues ?? [], prs ?? [], Now);
+
+    [Fact]
+    public void ReadsThePlanAfterTheLastMarker()
+    {
+        var plan = Supervisor.ParsePlan("""
+            CLAUTOSWAP: PLAN {"status":"blocked"}
+            Thinking.
+            CLAUTOSWAP: PLAN
+            ```json
+            {"status":"Working","summary":"s","items":[{"key":1,"title":"A","issue":"#12","after":[1,"#3"]}],"drop":["w5",7],}
+            ```
+            Done; see {notes}.
+            """)!;
+        Assert.Equal(("working", "s"), (plan.Status, plan.Summary));
+        var step = Assert.Single(plan.Items!);
+        Assert.Equal(("1", "A", "#12"), (step.Key.ToString(), step.Title, step.Issue.ToString()));
+        Assert.Equal(["1", "#3"], step.After!.Select(e => e.ToString()));
+        Assert.Equal(["w5", "7"], plan.Drop!.Select(e => e.ToString()));
+        var nulls = Supervisor.ParsePlan("""CLAUTOSWAP: PLAN {"status":"working","items":[null,{"title":"B"}],"memory":[null]}""")!;
+        Assert.Equal("B", Assert.Single(nulls.Items!).Title);
+        Assert.Empty(nulls.Memory!);
+    }
+
+    [Theory]
+    [InlineData("{\"status\":\"working\"}")]
+    [InlineData("CLAUTOSWAP: PLAN\nno json")]
+    [InlineData("CLAUTOSWAP: PLAN\n{\"status\":\"done\"}")]
+    [InlineData("CLAUTOSWAP: PLAN\n{\"summary\":\"no status\"}")]
+    [InlineData("CLAUTOSWAP: PLAN\n{\"status\":\"working\",\"items\":[")]
+    public void AnUnreadablePlanIsNoPlan(string text) => Assert.Null(Supervisor.ParsePlan(text));
+
+    [Fact]
+    public void IngestAddsRankedStepsTowardTheGoal()
+    {
+        var repo = Repo();
+        repo.NextLocal = 3;
+        var goal = G();
+        Ingest(repo, goal, $$"""
+            {"status":"working","summary":"s","items":[
+              {"key":"a","title":"Add the API","body":"Do X"},{"key":"b","title":"Use the API","after":["a"]},
+              {"key":"c","title":"Three"},{"key":"d","title":"Four"},{"key":"e","title":"{{new string('e', 200)}}"},{"key":"f","title":"Six"}]}
+            """);
+        var key = Supervisor.Key(repo, goal);
+        Assert.Equal(["w3", "w4", "w5", "w6", "w7"], repo.Items.Select(i => i.Id)); // at most five steps
+        var (w3, w4) = (repo.Items[0], repo.Items[1]);
+        Assert.Equal((key, 10100, 10099), (w3.Goal, w3.Rank, w4.Rank));
+        Assert.Equal([Supervisor.Key(repo, w3)], w4.After);
+        Assert.Equal("Do X\n\nPart of goal g1: Ship the API", w3.Body);
+        Assert.Equal(120, repo.Items[4].Title.Length);
+        Assert.EndsWith("…", repo.Items[4].Title);
+        Assert.Equal("10-20 09:30 plan 1: s (+5, -0)", goal.Log[^1]);
+        Assert.Equal((false, (DateTimeOffset?)Now, 1, 0, (string?)null, (string?)null, (string?)null, 0),
+            (goal.Replan, goal.LastPlan, goal.Plans, goal.Failures, goal.Guidance, goal.Refuted, goal.Claim, goal.Idle));
+    }
+
+    [Fact]
+    public void AfterNamesOnlyEarlierStepsAndListedItems()
+    {
+        var (i12, w1) = (I("12"), I("w1", ItemState.Open, pr: 9));
+        var repo = Repo(i12, w1);
+        repo.NextLocal = 2;
+        Ingest(repo, G(), """
+            {"status":"working","items":[{"key":"a","title":"One","after":["b"]},{"key":"b","title":"Two","after":["w1","#12","12"]},{"key":"c","title":"Three","after":["nope"]}]}
+            """);
+        string K(string id) => Supervisor.Key(repo, repo.Items.Single(i => i.Id == id));
+        Assert.Equal([K("w1"), K("12")], repo.Items.Single(i => i.Id == "w2").After);
+        Assert.Equal(new[] { "12", "w1", "w2" }, repo.Items.Select(i => i.Id).Order()); // a later step or an unknown item is no predecessor: its dependent is not started without it
+        Assert.Empty(i12.After); // only the plan's new steps wait
+    }
+
+    [Fact]
+    public void DroppingAdoptedWorkReturnsItsRankToTheScan()
+    {
+        var i12 = I("12");
+        var repo = Repo(i12);
+        var goal = G();
+        Ingest(repo, goal, """{"status":"working","items":[{"key":"a","issue":12}]}""");
+        Assert.Equal((Supervisor.Key(repo, goal), 10100), (i12.Goal, i12.Rank));
+        Ingest(repo, goal, """{"status":"working","drop":["12"]}""");
+        Assert.Equal((null, 0), (i12.Goal, i12.Rank)); // below the owner's rank, so the scan may prune it again
+    }
+
+    [Fact]
+    public void DroppingAdoptedWorkKeepsTheOwnersPick()
+    {
+        var picked = I("12");
+        picked.Rank = 10_150; // the owner prioritized it above any plan rank
+        var repo = Repo(picked);
+        var goal = G();
+        Ingest(repo, goal, """{"status":"working","items":[{"key":"a","issue":12}]}""");
+        Ingest(repo, goal, """{"status":"working","drop":["12"]}""");
+        Assert.Equal((null, 10_150), (picked.Goal, picked.Rank));
+    }
+
+    [Fact]
+    public void AGitHubBlockerBetweenPlannedIssuesBecomesAfter()
+    {
+        var (i5, i6) = (I("5"), I("6"));
+        var repo = Repo(i5, i6);
+        Ingest(repo, G(), """{"status":"working","items":[{"key":"b","issue":6},{"key":"a","issue":5}]}""",
+            new() { [5] = new IssueInfo(5, "Five", "", [], [], [], "owner"), [6] = new IssueInfo(6, "Six", "Blocked by #5.", [], [], [], "owner") });
+        Assert.Equal([Supervisor.Key(repo, i5)], i6.After); // even though the blocker comes later in the plan
+        Assert.Empty(i5.After);
+    }
+
+    [Fact]
+    public void AnAfterNamingASkippedStepsKeyBindsToNothingElse()
+    {
+        var repo = Repo(I("w1"));
+        var goal = G();
+        Ingest(repo, goal, """
+            {"status":"working","items":[{"key":"w1","title":"Other repo","repo":"elsewhere"},{"key":"b","title":"Builds on it","after":["w1"]}]}
+            """);
+        Assert.DoesNotContain(repo.Items, i => i.Title == "Builds on it"); // not started on the unrelated w1
+        Assert.Contains(goal.Log, l => l.Contains("builds on w1"));
+    }
+
+    [Fact]
+    public void SkippingAStepHoldsAdoptedDependentsAndUnplansTheRest()
+    {
+        var (step, adopted, request) = (I("w1"), I("7"), I("w2"));
+        var repo = Repo(adopted, request);
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (adopted.Goal, request.Goal) = (key, key);
+        adopted.After = request.After = [Supervisor.Key(repo, step)]; // the skipped step is already gone
+        Supervisor.HoldDependents([repo], repo, step);
+        Assert.Equal(ItemState.NeedsOwner, adopted.State);
+        Assert.Null(Supervisor.Next(repo)); // it does not start
+        Assert.True(goal.Replan);
+        Assert.DoesNotContain(request, repo.Items);
+        Assert.False(Supervisor.Problem(adopted)); // a question, not a failure
+        Assert.Empty(adopted.After); // answered, it runs
+        Supervisor.Unplan(repo, key, [adopted]); // a replan that drops it releases it
+        Assert.Equal((ItemState.Queued, null), (adopted.State, adopted.Goal));
+    }
+
+    [Fact]
+    public void AGitHubBlockerThatIsAnExistingItemOrWouldLoopIsHandled()
+    {
+        var i5 = I("5");
+        var repo = Repo(i5);
+        Ingest(repo, G(), """{"status":"working","items":[{"key":"a","issue":6},{"key":"b","issue":7,"after":["a"]},{"key":"c","issue":8,"after":["b"]}]}""",
+            new() { [6] = new IssueInfo(6, "Six", "Blocked by #5. Blocked by #8.", [], [], [], "owner"), [7] = new IssueInfo(7, "Seven", "", [], [], [], "owner"), [8] = new IssueInfo(8, "Eight", "", [], [], [], "owner") });
+        var (i6, i8) = (repo.Items.Single(i => i.Issue == 6), repo.Items.Single(i => i.Issue == 8));
+        Assert.Equal([Supervisor.Key(repo, i5)], i6.After); // #5 is no plan step, but an item: still waited for
+        Assert.DoesNotContain(Supervisor.Key(repo, i8), i6.After); // #8 waits on #7 on #6: no loop
+    }
+
+    [Fact]
+    public void SkippingASecondStepDoesNotAnswerAHeldIssue()
+    {
+        var (w1, w2, adopted) = (I("w1"), I("w2"), I("7"));
+        var repo = Repo(adopted);
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        repo.Goals = [goal];
+        (adopted.Goal, adopted.After) = (key, [Supervisor.Key(repo, w1), Supervisor.Key(repo, w2)]);
+        Supervisor.HoldDependents([repo], repo, w1);
+        Supervisor.HoldDependents([repo], repo, w2);
+        Assert.Equal((ItemState.NeedsOwner, key), (adopted.State, adopted.Goal));
+        Assert.Empty(adopted.After);
+    }
+
+    [Fact]
+    public void OnlyANetworkFailureOfAFetchIsOffline()
+    {
+        Assert.Matches(Supervisor.Offline, "ssh: Could not resolve hostname github.com\nfatal: Could not read from remote repository.\nand the repository exists."); // the last line alone says nothing
+        Assert.Matches(Supervisor.Offline, "fatal: unable to access 'x': Could not resolve host: github.com");
+        Assert.DoesNotMatch(Supervisor.Offline, "fatal: couldn't find remote ref main");
+    }
+
+    [Fact]
+    public void IngestNeverDuplicatesWorkOrPullRequests()
+    {
+        var w1 = I("w1", title: "Add the API!");
+        var repo = Repo(w1, I("w2", ItemState.Done, "Old work"));
+        repo.NextLocal = 3;
+        var goal = G();
+        Ingest(repo, goal, """
+            {"status":"working","items":[{"key":"a","title":"add the api"},{"key":"b","title":"Use it","after":["a"]},{"key":"c","title":"old WORK"},{"key":"d","title":"Fix  login"},{"key":"e","title":"Use it"}]}
+            """, prs: ["fix LOGIN"]);
+        Assert.Null(w1.Goal); // its key maps to it; the owner's own request is not taken over
+        Assert.Equal([Supervisor.Key(repo, w1)], repo.Items.Single(i => i.Title == "Use it").After);
+        Assert.Contains(repo.Items, i => i.Title == "old WORK" && i.State == ItemState.Queued); // finished work is no duplicate
+        Assert.DoesNotContain(repo.Items, i => i.Title.Contains("login"));
+        Assert.Contains(goal.Log, l => l.Contains("an open pull request has it"));
+        Assert.EndsWith("(+2, -0)", goal.Log[^1]);
+    }
+
+    [Fact]
+    public void StepsGoToOtherAuthorizedRepositoriesAndWaitAcrossThem()
+    {
+        var repo = Repo();
+        var web = new RepoAgents { Path = @"C:\web", Authorized = true, Items = [I("w1", ItemState.Open, "Old API", 4)], NextLocal = 2 };
+        var off = new RepoAgents { Path = @"C:\off" }; // not authorized: never a target
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        Supervisor.Ingest([repo, web, off], repo, goal, Plan("""
+            {"status":"working","items":[
+              {"key":"a","title":"Serve the API","repo":"WEB","after":["web:w1"]},{"key":"b","title":"Call it","after":["a"]},
+              {"key":"c","title":"Off","repo":"off"},{"key":"d","issue":3,"repo":"web"},{"key":"e","title":"Old","after":["off:w1","nope:w1"]}]}
+            """), new Dictionary<int, IssueInfo>(), ["Serve the API"], Now); // another repository's step is not this one's pull request
+        var served = web.Items.Single(i => i.Id == "w2");
+        Assert.Equal((key, "Serve the API", 10100), (served.Goal, served.Title, served.Rank));
+        Assert.Equal([Supervisor.Key(web, web.Items[0])], served.After);
+        Assert.EndsWith("Part of goal g1 of r: Ship the API", served.Body);
+        var call = Assert.Single(repo.Items);
+        Assert.Equal([Supervisor.Key(web, served)], call.After);
+        Assert.Equal("Call it", call.Title);
+        Assert.Empty(off.Items);
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Off\": off is not a repository agents are authorized for"));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #3 in web: its agents take up that repository's issues themselves"));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"Old\": it builds on off:w1, which is not a step or item that exists"));
+
+        // Its own steps elsewhere count toward it and wait for what they build on there; dropping one there works too.
+        Assert.False(Supervisor.Ready([repo, web], served));
+        web.Items[0].State = ItemState.Done;
+        web.Items[0].Merged = true;
+        Assert.True(Supervisor.Ready([repo, web], served));
+        Supervisor.Ingest([repo, web], repo, goal, Plan("""{"status":"working","drop":["web:w2"]}"""), new Dictionary<int, IssueInfo>(), [], Now);
+        Assert.DoesNotContain(web.Items, i => i.Id == "w2");
+    }
+
+    [Fact]
+    public void AFolderNameTwoRepositoriesShareNamesNeitherEvenTheGoalsOwn()
+    {
+        var goal = G();
+        var repo = new RepoAgents { Path = @"C:\work\app", Authorized = true, NextLocal = 2 };
+        var fork = new RepoAgents { Path = @"C:\fork\app", Authorized = true, Items = [I("w1")], NextLocal = 2 };
+        repo.Items.Add(new WorkItem { Id = "w1", Title = "Mine", Goal = Supervisor.Key(repo, goal) });
+        Supervisor.Ingest([repo, fork], repo, goal, Plan("""
+            {"status":"working","drop":["app:w1"],"items":[{"key":"a","title":"There","repo":"app"},{"key":"b","title":"Here","after":["app:w1"]},{"key":"c","title":"Plain"}]}
+            """), new Dictionary<int, IssueInfo>(), [], Now);
+        Assert.Equal(["w1", "w2"], repo.Items.Select(i => i.Id)); // nothing dropped; only the step that names no folder lands
+        Assert.Equal("Plain", repo.Items[1].Title);
+        Assert.Equal(["w1"], fork.Items.Select(i => i.Id));
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped \"There\": app is not a repository agents are authorized for"));
+    }
+
+    [Fact]
+    public void IngestAdoptsOnlyIssuesAgentsMayTake()
+    {
+        var i7 = I("7");
+        i7.Rank = 50;
+        var i8 = I("8", ItemState.Done);
+        i8.Merged = true;
+        var repo = Repo(i7, i8);
+        var goal = G();
+        goal.Issue = 4;
+        var key = Supervisor.Key(repo, goal);
+        Ingest(repo, goal, """
+            {"status":"working","items":[{"issue":7},{"issue":8},{"issue":"#4"},{"issue":10,"after":["#7"]},{"issue":11}]}
+            """, new() { [10] = new IssueInfo(10, "Ten", "b", [], [], [], "owner") });
+        Assert.Equal((key, 10100), (i7.Goal, i7.Rank));
+        Assert.Null(i8.Goal); // done work is not adopted: it would count as this goal's evidence
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #4: it is the goal itself"));
+        var i10 = repo.Items.Single(i => i.Issue == 10);
+        Assert.Equal((key, 10097, "Ten"), (i10.Goal, i10.Rank, i10.Title));
+        Assert.Equal([Supervisor.Key(repo, i7)], i10.After);
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #11: not an open issue of the owner's that agents may take"));
+        Assert.Contains(goal.Log, l => l.EndsWith("(+2, -0)"));
+
+        repo.Skipped = [9];
+        Ingest(repo, goal, """{"status":"working","items":[{"issue":9}]}""", new() { [9] = new IssueInfo(9, "Nine", "", [], [], [], "owner") });
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #9: the owner skipped it"));
+        Assert.DoesNotContain(repo.Items, i => i.Issue == 9);
+
+        // Another goal's own issue is planned by that goal's director, never worked whole as a step of this one.
+        var i12 = I("12");
+        repo.Items.Add(i12);
+        repo.Goals = [goal, new Goal { Id = "g2", Title = "Twelve", Issue = 12 }];
+        Ingest(repo, goal, """{"status":"working","items":[{"issue":12}]}""");
+        Assert.Contains(goal.Log, l => l.EndsWith("skipped #12: it is another goal"));
+        Assert.Null(i12.Goal);
+    }
+
+    [Fact]
+    public void DropTakesOnlyThisGoalsWorkThatHasNotStarted()
+    {
+        var repo = Repo();
+        var goal = G();
+        var key = Supervisor.Key(repo, goal);
+        WorkItem Add(string id, ItemState state = ItemState.Queued, string? of = null, int? pr = null, string? wt = null)
+        {
+            var i = I(id, state, pr: pr);
+            (i.Goal, i.Worktree) = (of, wt);
+            repo.Items.Add(i);
+            return i;
+        }
+        Add("w1", of: key);
+        var i5 = Add("5", of: key);
+        i5.After = ["x"];
+        var kept = new[] { Add("w2", of: key, wt: @"C:\wt\w2"), Add("w3", ItemState.Open, key, 7), Add("w4", of: repo.Key + "/g2"), Add("w6") };
+        Ingest(repo, goal, """{"status":"working","drop":["w1","#5","w2","w3","w4","w6","nope"]}""");
+        Assert.DoesNotContain(repo.Items, i => i.Id == "w1");
+        Assert.True(i5 is { Goal: null, After: [] }); // the owner's issue stays, as ordinary work
+        Assert.Equal([i5, .. kept], repo.Items);
+        Assert.Equal([key, key, repo.Key + "/g2", null], kept.Select(i => i.Goal));
+        Assert.EndsWith("(+0, -2)", goal.Log[^1]);
+    }
+
+    [Fact]
+    public void ABlockedPlanAsksTheOwnerAndAddsNothing()
+    {
+        var repo = Repo();
+        var goal = G();
+        Ingest(repo, goal, """{"status":"blocked","summary":"s","question":"Formal or casual?","items":[{"key":"a","title":"A"}],"memory":["x"]}""");
+        Assert.Equal((GoalState.NeedsOwner, "Formal or casual?", (string?)null), (goal.State, goal.Note, goal.Claim));
+        Assert.Empty(repo.Items);
+        Assert.Contains(repo.Memory, n => n is { Text: "x", Source: "plan g1", Owner: false });
+
+        var other = G();
+        Ingest(repo, other, """{"status":"blocked","summary":"s","question":""}""");
+        Assert.Equal("s", other.Note);
+    }
+
+    [Fact]
+    public void AnAchievedPlanIsOnlyAClaim()
+    {
+        var repo = Repo();
+        var goal = G();
+        var w1 = I("w1");
+        w1.Goal = Supervisor.Key(repo, goal);
+        repo.Items.Add(w1);
+        Ingest(repo, goal, """{"status":"achieved","summary":"it works","evidence":"","items":[{"key":"a","title":"A"}],"drop":["w1"]}""");
+        Assert.Equal(("it works", GoalState.Active), (goal.Claim, goal.State));
+        Assert.Equal([w1], repo.Items);
+        Ingest(repo, goal, """{"status":"working"}""");
+        Assert.Null(goal.Claim);
+    }
+
+    [Fact]
+    public void PlansThatChangeNothingParkTheGoalOnTheThird()
+    {
+        var repo = Repo();
+        var goal = G();
+        for (var n = 1; n <= 3; n++)
+        {
+            Assert.Equal(GoalState.Active, goal.State);
+            Ingest(repo, goal, """{"status":"working","items":[]}""");
+            Assert.Equal(n, goal.Idle);
+        }
+        Assert.Equal((GoalState.NeedsOwner, (string?)null), (goal.State, goal.Claim));
+        Assert.Equal("the director found nothing more to do toward this goal but cannot show it is achieved; say how to proceed, or drop it", goal.Note);
+
+        var waiting = new Goal { Id = "g2", Title = "Wait" }; // its own work is still queued: waiting is not idling
+        var queued = I("w1");
+        queued.Goal = Supervisor.Key(repo, waiting);
+        repo.Items.Add(queued);
+        for (var n = 0; n < 3; n++) Ingest(repo, waiting, """{"status":"working"}""");
+        Assert.Equal((0, GoalState.Active), (waiting.Idle, waiting.State));
+
+        var refuted = new Goal { Id = "g3", Title = "Claimed", Refuted = "x" }; // claiming again after a failed check, with nothing new
+        Ingest(repo, refuted, """{"status":"achieved","evidence":"same"}""");
+        Assert.Equal((1, (string?)null), (refuted.Idle, refuted.Refuted));
+        Ingest(repo, refuted, """{"status":"achieved","evidence":"same"}""");
+        Assert.Equal(1, refuted.Idle); // a claim that changes nothing neither counts nor resets
+
+        var cycling = new Goal { Id = "g4", Title = "Cycles" }; // claim, clautoswap's check refutes it, a plan that changes nothing, claim again
+        for (var n = 0; n < 3; n++)
+        {
+            Ingest(repo, cycling, """{"status":"achieved","evidence":"same"}""");
+            (cycling.Claim, cycling.Refuted) = (null, "`check` failed on main");
+            Ingest(repo, cycling, """{"status":"working","items":[]}""");
+        }
+        Assert.Equal((3, GoalState.NeedsOwner), (cycling.Idle, cycling.State));
+    }
+
+    [Fact]
+    public void WorkThatMovedWhilePlanningStillTriggersTheNextPlan()
+    {
+        var repo = Repo();
+        var stale = G();
+        stale.Progress = "stale";
+        Ingest(repo, stale, """{"status":"working","items":[{"key":"a","title":"A"}]}""");
+        Assert.Equal("stale", stale.Progress);
+
+        var goal = new Goal { Id = "g2", Title = "Fresh" };
+        var key = Supervisor.Key(repo, goal);
+        goal.Progress = Supervisor.Signature([repo], key);
+        Assert.Equal("", goal.Progress);
+        Ingest(repo, goal, """{"status":"working","items":[{"key":"a","title":"B"}]}""");
+        Assert.Equal(Supervisor.Signature([repo], key), goal.Progress);
+        Assert.Contains(":q", goal.Progress);
+    }
+
+    [Fact]
+    public void TheSignatureSeesLandingNotFeedbackRounds()
+    {
+        var repo = Repo();
+        var key = repo.Key + "/g1";
+        var item = I("w1");
+        item.Goal = key;
+        repo.Items.Add(item);
+        string Sig(ItemState state, int? pr = null, bool merged = false)
+        {
+            (item.State, item.Pr, item.Merged) = (state, pr, merged);
+            return Supervisor.Signature([repo], key);
+        }
+        var queued = Sig(ItemState.Queued);
+        Assert.Equal(queued, Sig(ItemState.Working));
+        Assert.Equal(queued, Sig(ItemState.Checking));
+        var open = Sig(ItemState.Open, 7);
+        Assert.Equal(open, Sig(ItemState.Queued, 7)); // feedback on the pull request
+        Assert.NotEqual(queued, open);
+        Assert.NotEqual(queued, Sig(ItemState.NeedsOwner));
+        Assert.NotEqual(Sig(ItemState.Done, 7, merged: true), Sig(ItemState.Done, 7));
+        var before = Sig(ItemState.Queued);
+        repo.Items.Add(I("w2"));
+        Assert.Equal(before, Supervisor.Signature([repo], key)); // work that serves no goal is not this goal's
     }
 }

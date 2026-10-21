@@ -232,16 +232,22 @@ def pid_matches_record(pid: int, proc_start: str | None) -> bool:
     whole sleep), so a live session can read as younger than its own record;
     a claude at the pid is kept either way, and a pid genuinely recycled by
     another claude lingers only for that process's lifetime, which is what
-    happened before this check. Everything unknowable (Windows, whose stamp
-    is a FILETIME with no ``/proc`` to check it against, ``ps`` unavailable,
-    an unstamped or unparseable record) passes, because "cannot tell" must
+    happened before this check. On Windows the stamp is a FILETIME, checked
+    against the process's creation time. Everything unknowable (no ``/proc``
+    and no creation time, ``ps`` unavailable, an unstamped or unparseable
+    record) passes, because "cannot tell" must
     never turn a live session into "nobody there".
     """
     if not proc_start:
         return True
     if proc_start.isdigit():
         ticks = process_start_ticks(pid)
-        return ticks is None or ticks == proc_start
+        if ticks is not None:
+            return ticks == proc_start
+        # Windows: the stamp is the process's creation FILETIME, compared as
+        # the tray and _marker_is_live do (claude's own reading, within 2 s).
+        created = process_created(pid)
+        return created is None or abs(created - int(proc_start)) < 2 * 10_000_000
     try:
         recorded = _lstart_seconds(proc_start)
     except ValueError:
@@ -324,8 +330,9 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
 def _keyed_sessions(sessions_dir: Path, known: set[int]) -> list[ClaudeSession]:
     """Live claudes with a ``{pid}.<hash>.key`` but no ``{pid}.json``.
 
-    Some sessions (seen on Windows with ``claude --resume``) run without their
-    record, leaving only the key file. They are still on this login, so a scan
+    Claude Code writes the key seconds before the record at start, and no
+    record at all for a session that is not persisted, an agent-team member,
+    a parked spare, or when registering fails. They are still on this login, so a scan
     or a guard must see them. Folder and status are unknown. A process that
     started after the key was written holds a recycled pid and is skipped.
     """

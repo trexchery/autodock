@@ -1,6 +1,7 @@
 # Fake claude-swap engine for the clautoswap agents tests. Synthetic only: no credentials anywhere.
 # `run N --require-session -- <claude args>` plays a headless Claude Code worker; prompt markers pick
-# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:break].
+# its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:hold] [fake:break] [fake:learn]; a prompt with
+# `CLAUTOSWAP: PLAN` plays the director: it answers with the oldest $FAKE_LOG.plan-*.json (used once), else a plan that changes nothing.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $a = $args
@@ -86,10 +87,24 @@ if ($prompt -match '\[fake:slow\]') {
         Start-Sleep -Milliseconds 600
     }
 }
+if ($prompt -match '\[fake:hold\]') {
+    # Busy (no stall) until the test creates $FAKE_LOG.release, at most a minute: it outlives whatever the test does meanwhile.
+    for ($k = 0; $k -lt 200 -and -not (Test-Path -LiteralPath "$log.release"); $k++) {
+        Emit @{ type = 'assistant'; message = @{ id = "h$k"; content = @(@{ type = 'text'; text = "hold $k" }) } }
+        Start-Sleep -Milliseconds 300
+    }
+}
+if ($prompt -match 'CLAUTOSWAP: PLAN') {
+    $plan = '{"status":"working","summary":"nothing new","items":[]}'
+    $next = Get-ChildItem -LiteralPath (Split-Path -Parent $log) -Filter ((Split-Path -Leaf $log) + '.plan-*.json') -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
+    if ($next) { $plan = Get-Content -Raw -LiteralPath $next.FullName; Remove-Item -LiteralPath $next.FullName }
+    Finish "Read the project.`nCLAUTOSWAP: PLAN`n$plan"
+}
 Emit @{ type = 'assistant'; message = @{ id = 'w1'; content = @(@{ type = 'tool_use'; name = 'Write'; input = @{ file_path = "issue-$n.txt" } }); usage = @{ output_tokens = 42 } } }
 if ($prompt -match '\[fake:break\]' -and $prompt -notmatch 'failed') { Set-Content -LiteralPath broken.txt -Value 'x' }
 elseif (Test-Path broken.txt) { git rm -q broken.txt | Out-Null }
 Add-Content -LiteralPath "issue-$n.txt" -Value "work by account $account"
 git add -A | Out-Null
 git commit -q -m "fake work for $n" | Out-Null
-Finish "Did it.`nCLAUTOSWAP: DONE added issue-$n.txt"
+$learned = if ($prompt -match '\[fake:learn\]') { "CLAUTOSWAP: LEARNED the build needs the fake toolchain`nCLAUTOSWAP: LEARNED tests live next to the code`n" } else { '' }
+Finish "Did it.`n${learned}CLAUTOSWAP: DONE added issue-$n.txt"

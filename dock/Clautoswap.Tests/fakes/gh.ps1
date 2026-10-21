@@ -19,13 +19,16 @@ function Read-Text($name, $default) {
 function Arg($name) { $i = [array]::IndexOf($a, $name); if ($i -ge 0) { $a[$i + 1] } }
 function Prs() { @(Read-Text 'prs.json' '[]' | ConvertFrom-Json) }
 
+# No network: every call fails the way gh does offline.
+if (Test-Path -LiteralPath (Join-Path $dir 'offline')) { [Console]::Error.WriteLine('error connecting to api.github.com'); exit 1 }
 switch ("$($a[0]) $($a[1])") {
     'api user' { 'owner'; exit 0 }
     'issue list' { Read-Text 'issues.json' '[]'; exit 0 }
     'issue comment' { Copy-Item -LiteralPath (Arg '--body-file') -Destination (Join-Path $dir "question-$($a[2]).md"); exit 0 }
     'issue view' {
         if ((Arg '--json') -eq 'comments') { Read-Text "comments-$($a[2]).json" '{"comments":[]}'; exit 0 }
-        $i = @(Read-Text 'issues.json' '[]' | ConvertFrom-Json) | Where-Object { $_.number -eq [int]$a[2] }
+        # Parenthesized: Windows PowerShell emits a JSON array as one object, which Where-Object would pass whole.
+        $i = (Read-Text 'issues.json' '[]' | ConvertFrom-Json) | Where-Object { $_.number -eq [int]$a[2] }
         if ($i) { $i | ConvertTo-Json -Compress -Depth 10; exit 0 }
         [Console]::Error.WriteLine('issue not found'); exit 1
     }

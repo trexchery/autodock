@@ -282,8 +282,21 @@ class TestPidMatchesRecord:
     def test_unreadable_ticks_pass(self):
         """A FILETIME on Windows, or /proc hidden: no comparison is possible."""
         with patch("claude_swap.process_detection.process_start_ticks",
+                   return_value=None),              patch("claude_swap.process_detection.process_created",
                    return_value=None):
             assert pid_matches_record(1234, "134332352612628209") is True
+
+    def test_windows_filetime_is_compared_with_the_creation_time(self):
+        """A record left by a killed claude must not revive when Windows
+        hands its pid to another process."""
+        with patch("claude_swap.process_detection.process_start_ticks",
+                   return_value=None),              patch("claude_swap.process_detection.process_created",
+                   return_value=134332352612628209 + 5_000_000):
+            assert pid_matches_record(1234, "134332352612628209") is True
+        with patch("claude_swap.process_detection.process_start_ticks",
+                   return_value=None),              patch("claude_swap.process_detection.process_created",
+                   return_value=134332352612628209 + 3600 * 10_000_000):
+            assert pid_matches_record(1234, "134332352612628209") is False
 
     @pytest.mark.parametrize(
         "started", [LSTART_S, LSTART_S - 3600, LSTART_S + PID_REUSE_SLACK_S // 2]

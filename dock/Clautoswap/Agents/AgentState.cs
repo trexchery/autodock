@@ -34,8 +34,18 @@ public sealed class WorkItem
     public string? Worktree { get; set; }
     public int? Pr { get; set; }
     public string? PrUrl { get; set; }
+    /// Its pull request was merged (a closed one was not).
+    public bool Merged { get; set; }
+    /// The goal it serves: "{repo.Key}/{goal.Id}" (always the key, even in its own repository).
+    public string? Goal { get; set; }
+    /// Items ("{repo.Key}/{item.Id}") that must land first: merged, finished without a pull request, or gone.
+    public List<string> After { get; set; } = [];
+    /// The rank it had before a plan raised it; null when the plan did not (or the owner ranked it since).
+    public int? OwnRank { get; set; }
     /// PR feedback after this moment is new.
     public DateTimeOffset? PrSeen { get; set; }
+    /// When the pull request was opened (or first found open), for the morning summary.
+    public DateTimeOffset? PrOpened { get; set; }
     public int Failures { get; set; }
     public int Followups { get; set; }
     /// The next run reviews the change instead of working on it.
@@ -53,19 +63,30 @@ public sealed class WorkItem
     public Session? Session { get; set; }
     /// The latest process (work or review).
     public Run? Run { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Label => Issue is { } n ? $"#{n} {Title}" : $"{Id} {Title}";
     /// Started and not yet handed to review or parked: the repository's one active item.
     [JsonIgnore] public bool InFlight => State is ItemState.Working or ItemState.Checking || (State == ItemState.Queued && Worktree != null && Pr == null);
 }
 
-public sealed record Session(string Id, string Email, string Org);
+public sealed record Session(string Id, string Email, string Org)
+{
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
+
+/// A note in the agents' shared memory. Owner notes are the owner's own words or decisions and bind every
+/// agent; agent notes are what runs learned: hints to verify.
+public sealed record Note(string Text, string Source, DateTimeOffset At, bool Owner = false)
+{
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
 
 /// A worker process: enough to re-attach after a restart.
 public sealed class Run
 {
     public int Attempt { get; set; }
-    /// "work" or "review".
+    /// "work", "review" or "plan".
     public string Kind { get; set; } = "work";
     public string Job { get; set; } = "";
     public int Pid { get; set; }
@@ -78,6 +99,50 @@ public sealed class Run
     public DateTimeOffset Started { get; set; }
     /// The process may still be running (cleared once its outcome is handled).
     public bool Live { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
+
+public enum GoalState { Active, Achieved, NeedsOwner, Dropped }
+
+/// An objective the owner set in the agents terminal. The director plans work toward it, replans as that
+/// work lands, and calls it achieved only on evidence.
+public sealed class Goal
+{
+    /// g1, g2 … per repository.
+    public string Id { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string Objective { get; set; } = "";
+    /// An issue of the owner's adopted as this goal.
+    public int? Issue { get; set; }
+    /// Owner-confirmed commands that must pass on the base branch.
+    public List<string> Checks { get; set; } = [];
+    public GoalState State { get; set; }
+    public DateTimeOffset Created { get; set; } = DateTimeOffset.Now;
+    /// The question, why it stopped, or the evidence.
+    public string? Note { get; set; }
+    /// The owner's answer, for the next plan once.
+    public string? Guidance { get; set; }
+    public bool Replan { get; set; } = true;
+    public DateTimeOffset? LastPlan { get; set; }
+    public int Plans { get; set; }
+    /// Plans in a row that changed nothing.
+    public int Idle { get; set; }
+    public int Failures { get; set; }
+    /// The goal items' states as the last plan saw them: a change means plan again.
+    public string? Progress { get; set; }
+    /// The director says it is achieved: its evidence, to be checked.
+    public string? Claim { get; set; }
+    /// Why the last completion check failed, for the next plan.
+    public string? Refuted { get; set; }
+    /// What proved it achieved.
+    public string? Evidence { get; set; }
+    /// When it was achieved (the morning summary counts these).
+    public DateTimeOffset? AchievedAt { get; set; }
+    /// Newest last, at most 12 lines.
+    public List<string> Log { get; set; } = [];
+    /// The planner run.
+    public Run? Run { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 /// A repository the owner authorized for continuous operation.
@@ -96,6 +161,11 @@ public sealed class RepoAgents
     public List<int> Skipped { get; set; } = [];
     public List<WorkItem> Items { get; set; } = [];
     public int NextLocal { get; set; } = 1;
+    public List<Goal> Goals { get; set; } = [];
+    public int NextGoal { get; set; } = 1;
+    /// What the owner and runs noted about this repository.
+    public List<Note> Memory { get; set; } = [];
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 
     [JsonIgnore] public string Leaf => System.IO.Path.GetFileName(Path.TrimEnd('\\', '/')) is { Length: > 0 } n ? n : Path;
 
@@ -108,6 +178,11 @@ public sealed class RepoAgents
 public sealed class AgentsState
 {
     public List<RepoAgents> Repos { get; set; } = [];
+    /// Notes that hold in every repository.
+    public List<Note> Memory { get; set; } = [];
+    /// Fields an older or newer build wrote, here and on every level below: saved back as they were,
+    /// so neither build erases the other's.
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 /// state.json plus each run's files, under the tray's private folder. The tray is the only writer
@@ -143,7 +218,14 @@ public sealed class AgentStore(string root)
     /// A repository was left running, or a worker may still be: the tray starts agents, so open terminals link up
     /// and runs without one stop.
     public static bool HasWork(string root) =>
-        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }));
+        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }) || r.Goals.Any(g => g.Run is { Live: true }));
+
+    /// A worker of `root`'s state still runs: workers outlive the tray that started them.
+    public static bool Running(string root) =>
+        new AgentStore(root).Load().Repos.SelectMany(r => r.Items.Select(i => i.Run).Concat(r.Goals.Select(g => g.Run)))
+            .Any(r => r is { Live: true, Pid: > 0 } && AgentProcess.Attach(r.Job, r.Pid, r.Created) is { } p && Close(p));
+
+    static bool Close(AgentProcess p) { p.Dispose(); return true; }
 
     public string RunDir(RepoAgents repo, WorkItem item) => System.IO.Path.Combine(Root, "runs", $"{repo.Key}-{item.Id}");
 
