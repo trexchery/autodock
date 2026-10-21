@@ -1,4 +1,4 @@
-> This is the upstream claude-swap v0.27.2 documentation for the engine bundled in handoff (`engine\cswap.exe`). handoff adds `cswap enroll DIR` and DPAPI-sealed backups on Windows.
+> This is the upstream claude-swap v0.27.2 documentation for the engine bundled in Patch Goblins (`engine\cswap.exe`). Patch Goblins adds `cswap enroll DIR` and DPAPI-sealed backups on Windows.
 
 # claude-swap
 

@@ -1,4 +1,4 @@
-"""Codex (OpenAI Codex CLI) provider for handoff: ``cswap codex <cmd> --json``.
+"""Codex (OpenAI Codex CLI) provider for Patch Goblins: ``cswap codex <cmd> --json``.
 
 Store (``<backup root>/providers/codex/``):
   accounts.json        roster, no secrets: number, email, accountId, alias
@@ -8,7 +8,7 @@ Store (``<backup root>/providers/codex/``):
 
 Codex caches auth in memory and never watches auth.json, so ``switch`` is an
 atomic rewrite of ``$CODEX_HOME/auth.json``: running sessions keep their
-account until restarted. handoff never refreshes tokens (Codex refresh
+account until restarted. Patch Goblins never refreshes tokens (Codex refresh
 tokens are single-use; refreshing behind a running codex logs it out); an
 expired dormant token is reported and Codex renews it after a switch.
 """

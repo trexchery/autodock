@@ -1,4 +1,4 @@
-"""handoff engine additions: DPAPI sealing and isolated enrollment.
+"""Patch Goblins engine additions: DPAPI sealing and isolated enrollment.
 
 All credentials here are synthetic.
 """
@@ -130,7 +130,7 @@ class TestEnroll:
 
 
 class TestForcedRefresh:
-    """`list --refresh` (handoff opening its dashboard) must re-read stale
+    """`list --refresh` (Patch Goblins opening its dashboard) must re-read stale
     idle accounts the back-off plan would otherwise skip, but never beat the
     serve TTL."""
 
