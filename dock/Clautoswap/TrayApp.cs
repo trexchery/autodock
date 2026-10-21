@@ -24,6 +24,7 @@ public sealed partial class TrayApp : ApplicationContext
     readonly LimitWatch _limitWatch;
     readonly LimitSwitch _limits;
     readonly SynchronizationContext _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+    int _engineSwitches; // the engine's own auto check or a menu switch is running: a window move must not race it
     readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
@@ -303,7 +304,16 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task AutoTickAsync()
     {
-        var (_, events) = await _engine.AutoOnceAsync();
+        // Counted before it waits: a move not yet at its check drops itself, one past it finishes its launch before the engine may pick that account.
+        Interlocked.Increment(ref _engineSwitches);
+        List<AutoEvent> events;
+        try
+        {
+            await _movePass.WaitAsync();
+            _movePass.Release();
+            (_, events) = await _engine.AutoOnceAsync();
+        }
+        finally { Interlocked.Decrement(ref _engineSwitches); }
         foreach (var e in events)
         {
             switch (e.Event)
@@ -357,7 +367,6 @@ public sealed partial class TrayApp : ApplicationContext
         var load = new Dictionary<int, int>();
         var plan = new List<(StoppedSession S, Account To, string Dir)>();
         var left = new List<string>();
-        var carried = new List<string>();
         var login = ResumeStopped.DefaultLogin().Account;
         var retry = false;
         foreach (var s in stopped)
@@ -371,12 +380,13 @@ public sealed partial class TrayApp : ApplicationContext
             switch (step)
             {
                 case ResumeStopped.Step.Left: // never closed while working; reopened once it is idle at the limit (the poll looks again)
-                    // Per reset, not per error: every agent of a busy window is refused on its own. A window still marked busy just after
-                    // writing its error is about to go idle: told about only if it stays busy past the grace.
+                    // The grace is per error (a window refused again gets its own), the balloon per reset: every agent of a busy window is refused
+                    // on its own. A window still marked busy just after writing its error is about to go idle: told about only if it stays busy past the grace.
                     var told = $"{s.SessionId}@{s.Limit?.ResetsAt}";
-                    if (!_told.Contains(told) && ResumeStopped.BusyPast(_busySince, told, DateTime.UtcNow, BusyGrace) && _told.Add(told))
+                    if (!_told.Contains(told) && ResumeStopped.BusyPast(_busySince, $"{s.SessionId}@{s.Limit?.At.Ticks}", DateTime.UtcNow, BusyGrace) && _told.Add(told))
                     {
-                        (s.ConfigDir == ResumeStopped.DefaultDir ? carried : left).Add($"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} (#{s.Account})");
+                        // A default-login window's account is the live login, not the one that refused: no number for it.
+                        left.Add(Path.GetFileName(s.Cwd.TrimEnd('\\')) + (s.ConfigDir == ResumeStopped.DefaultDir ? "" : $" (#{s.Account})"));
                         Program.Log($"nudge {s.SessionId} left {s.Status}");
                     }
                     retry = true;
@@ -405,8 +415,6 @@ public sealed partial class TrayApp : ApplicationContext
         _retry = retry;
         if (left.Count > 0)
             Notify("Left running at a limit", $"{string.Join(", ", left)}: busy, so not closed. They cannot carry on until reopened: each is reopened on an account with room once it is idle (or close it yourself and resume).");
-        if (carried.Count > 0)
-            Notify("Busy at a limit", $"{string.Join(", ", carried)}: on the default login, so not closed. They carry on at their next request once it is on an account with room.");
         if (plan.Count == 0) return;
         try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
         var done = await Task.WhenAll(plan.Select(m => MoveAsync(m.S, m.To, m.Dir, login))); // windows are independent
@@ -443,7 +451,7 @@ public sealed partial class TrayApp : ApplicationContext
             // The copy can take long: someone may have typed, or the window closed, or an account been refused and the login moved on, meanwhile.
             // A switch still running counts as the login moving: launching the account it moves to would leave two live copies of it.
             if (!ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < (s.AtLimit ? TypingPause : TimeSpan.FromSeconds(60))) return null;
-            if (_limits.RefusedUntil.GetValueOrDefault(account.Number) > DateTimeOffset.UtcNow || _limits.Switching || ResumeStopped.DefaultLogin().Account != login)
+            if (!ResumeStopped.SafeToClose(account.Number, _limits.RefusedUntil, _limits.Switching || _engineSwitches > 0, login, ResumeStopped.DefaultLogin().Account, DateTimeOffset.UtcNow))
             {
                 Program.Log($"move {s.SessionId} to #{account.Number} dropped: the login or the limits moved since the plan");
                 return null;
@@ -609,7 +617,10 @@ public sealed partial class TrayApp : ApplicationContext
             return;
         try
         {
-            var r = await _engine.SwitchAsync(a.Number);
+            Interlocked.Increment(ref _engineSwitches);
+            SwitchResult r;
+            try { r = await _engine.SwitchAsync(a.Number); }
+            finally { Interlocked.Decrement(ref _engineSwitches); }
             if (r.Switched) Notify("", Format.SwitchNotice(r.From, r.To), ToolTipIcon.None);
             else Notify("No switch", r.Reason ?? "Already active");
         }

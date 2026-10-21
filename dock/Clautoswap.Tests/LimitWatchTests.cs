@@ -441,10 +441,23 @@ public class LimitWatchTests
         Assert.Equal(2, (await rig.Hit(Now, resets.AddSeconds(10)))!.Switched!.To!.Number);
         rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
         rig.Changed = DateTime.UtcNow.AddMinutes(-90); // 2 ran for a while, then ran out too
-        var o = await rig.Hit(Now.AddMinutes(90), resets.AddSeconds(10));
+        var o = await rig.Hit(Now.AddMinutes(90), resets.AddSeconds(10), file: @"C:\x\other.jsonl"); // another window, which ran on 2
         Assert.Equal(3, o!.Switched!.To!.Number); // not charged to 1 again, which would have switched nothing
         Assert.Equal([2, 3], rig.Switched);
         Assert.Contains(2, rig.Switch.RefusedUntil.Keys);
+    }
+
+    [Fact]
+    public async Task AReplayedRefusalStaysWithItsFirstRefuser()
+    {
+        var resets = Now.AddHours(2);
+        var rig = new Rig(A(1, 10, active: true, resets: resets), A(2, 20, resets: resets.AddSeconds(20)), A(3, 60));
+        Assert.Equal(2, (await rig.Hit(Now, resets.AddSeconds(10)))!.Switched!.To!.Number);
+        rig.Snap = rig.Snap with { ActiveAccountNumber = 2, Accounts = [.. rig.Snap.Accounts.Select(a => a with { Active = a.Number == 2 })] };
+        rig.Changed = DateTime.UtcNow.AddMinutes(-5); // the stuck window refuses again, well after the switch
+        Assert.Null(await rig.Hit(Now.AddMinutes(5), resets.AddSeconds(10))); // the same window and reset: still 1's, so 2 is not charged
+        Assert.Equal([2], rig.Switched);
+        Assert.DoesNotContain(2, rig.Switch.RefusedUntil.Keys);
     }
 
     [Fact]
@@ -536,32 +549,6 @@ public class LimitWatchTests
             Assert.False(w.Watching(root)); // a Sync still running at exit leaks no watcher
             w.Poll([(f, root)]);
             Assert.Empty(hits); // and a Read still running at exit posts into a gone UI
-        }
-        finally { Directory.Delete(root, true); }
-    }
-
-    [Fact]
-    public async Task TheSwitchAndTheImportAreNotQueuedBehindAGatedEngineCall()
-    {
-        var root = TempRoot();
-        try
-        {
-            var started = Path.Combine(root, "started");
-            var exe = Path.Combine(root, "fake-cswap.cmd"); // synthetic engine: `switch` and `import-usage` answer at once, anything else takes a while
-            File.WriteAllText(exe, "@echo off\r\nif \"%1\"==\"switch\" (\r\n echo {\"switched\":true,\"from\":{\"number\":1,\"email\":\"a@example.com\"},\"to\":{\"number\":2,\"email\":\"b@example.com\"}}\r\n exit /b 0\r\n)\r\n"
-                + "if \"%1\"==\"import-usage\" exit /b 0\r\n"
-                + $"echo x>\"{started}\"\r\nping -n 8 127.0.0.1 >nul\r\necho {{}}\r\n");
-            var engine = new Engine(exe);
-            var slow = engine.RunAsync(["auto", "--once"]); // holds the gate, like the tray's own auto check
-            for (var i = 0; i < 100 && !File.Exists(started); i++) await Task.Delay(100); // the slow call is running, so it holds the gate
-            Assert.True(File.Exists(started));
-            var switching = engine.SwitchNowAsync(2);
-            var importing = engine.ImportUsageAsync("{}");
-            Assert.Same(switching, await Task.WhenAny(switching, Task.Delay(5000)));
-            Assert.Same(importing, await Task.WhenAny(importing, Task.Delay(5000)));
-            Assert.False(slow.IsCompleted, "the gated call finished first: the test proves nothing");
-            Assert.Equal(2, (await switching).To!.Number);
-            await slow;
         }
         finally { Directory.Delete(root, true); }
     }

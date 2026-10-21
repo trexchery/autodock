@@ -548,4 +548,16 @@ public class ResumeStoppedLiveTests(Xunit.Abstractions.ITestOutputHelper output)
         foreach (var f in (Environment.GetEnvironmentVariable("CLAUTOSWAP_LIVE_TRANSCRIPTS") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
             output.WriteLine($"atLimit={ResumeStopped.EndsAtLimit(File.ReadLines(f))} {Path.GetFileName(f)}");
     }
+
+    [Fact]
+    public void AMoveClosesItsWindowOnlyWhileThePlanStillHolds()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var none = new Dictionary<int, DateTimeOffset>();
+        Assert.True(ResumeStopped.SafeToClose(2, none, false, 1, 1, now)); // the plain case
+        Assert.False(ResumeStopped.SafeToClose(2, new Dictionary<int, DateTimeOffset> { [2] = now.AddHours(1) }, false, 1, 1, now)); // refused since the plan
+        Assert.True(ResumeStopped.SafeToClose(2, new Dictionary<int, DateTimeOffset> { [2] = now.AddHours(-1) }, false, 1, 1, now)); // its reset has passed
+        Assert.False(ResumeStopped.SafeToClose(2, none, true, 1, 1, now)); // a switch is running
+        Assert.False(ResumeStopped.SafeToClose(2, none, false, 1, 3, now)); // the login moved
+    }
 }

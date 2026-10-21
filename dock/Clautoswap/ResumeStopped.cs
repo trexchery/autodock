@@ -515,6 +515,11 @@ public static class ResumeStopped
         }
     }
 
+    /// Whether a planned move may still close its window: the target not refused since the plan, no switch running, and the
+    /// default login where the plan saw it (a launch on a login that moved would leave two live copies of it).
+    internal static bool SafeToClose(int target, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, bool switching, int? loginAtPlan, int? loginNow, DateTimeOffset now) =>
+        !(refusedUntil.GetValueOrDefault(target) > now) && !switching && loginAtPlan == loginNow;
+
     /// Whether `key` has been seen for at least `grace`: stamps it on first sight only.
     internal static bool BusyPast(Dictionary<string, DateTime> since, string key, DateTime now, TimeSpan grace)
     {
