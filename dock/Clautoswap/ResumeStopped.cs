@@ -49,6 +49,17 @@ public static class ResumeStopped
     /// before a switch is: its label already names the new default, but the account that said no was the old one.
     public static bool Moved(StoppedSession s, int target) => target != s.Account || s.AtLimit && !s.OwnRefused;
 
+    /// The `autoswitch.model` names whose weekly windows the engine also decides on ("all": every one), read with its threshold.
+    public static IReadOnlySet<string> Models { get; set; } = new HashSet<string>();
+
+    /// The reading switches, frees and moves are judged on, as the engine's `relevant_windows`: the 5-hour and weekly windows and
+    /// the scoped ones `Models` names. `Format.Peak` (every window) is for display only.
+    public static double Peak(Account? a) =>
+        a?.ShownUsage is { } u
+            ? new[] { u.FiveHour?.Pct ?? 0, u.SevenDay?.Pct ?? 0 }
+                .Concat((u.Scoped ?? []).Where(s => Models.Contains("all") || s.Name != null && Models.Contains(s.Name)).Select(s => s.Pct)).Max()
+            : 0;
+
     public static string DefaultDir => Path.Combine(StoreSecurity.UserProfile, ".claude");
     static string ProfilesDir => Path.Combine(StoreSecurity.BackupRoot, "sessions");
 
@@ -110,28 +121,52 @@ public static class ResumeStopped
                     if (Str(r, "sessionId") is not { } id || Str(r, "cwd") is not { } cwd || !r.TryGetProperty("pid", out var pidEl)) continue;
                     var pid = pidEl.GetInt32();
                     // An agents terminal: reopened without its --mcp-config the agents would stop, so it is never closed or moved.
-                    // Stopped at a limit it is reported as "agents" (never idle), so the owner is told to reopen it from the Agents menu.
+                    // With `includeBusy` it is always reported, as "agents" (never idle): stopped at a limit, so the owner is told to reopen it
+                    // from the Agents menu; otherwise as what holds its profile, so a free names it instead of waiting for it to go idle.
                     if (bridged.Contains(pid)) { if (!includeBusy) continue; status = "agents"; }
                     var stamp = Str(r, "procStart");
                     if (!IsLiveClaude(pid, stamp)) continue;
                     var started = long.TryParse(stamp, out var ft) ? DateTime.FromFileTimeUtc(ft) : StartOf(pid)?.ToUniversalTime() ?? DateTime.MinValue; // unstamped record: the process's own start
-                    if (TranscriptOf(dir, id, cwd) is not { } t) continue;
+                    if (TranscriptOf(dir, id, cwd) is not { } t)
+                    {
+                        if (status == "agents") found.Add(new StoppedSession(pid, id, cwd, dir, account, "", false, rec, Status: status));
+                        continue;
+                    }
                     var seen = File.GetLastWriteTimeUtc(t);
                     var tail = Tail(t).ToList();
                     // A limit hit only in a subagent or workflow file stops the process just the same.
                     // A prompt typed after the error does not clear it: the process refuses every request until the reset, so while the reset is ahead and no reply followed, it is still stopped.
-                    var limit = LimitOf(tail) ?? (LimitOf(tail, sticky: true) is { ResetsAt: { } until } held && until.UtcDateTime > nowUtc ? held : null) ?? agentLimits?.GetValueOrDefault(id);
+                    // A subagent's stop holds the same way: only until its reset, and not once the window replied after it.
+                    var limit = LimitOf(tail) ?? (LimitOf(tail, sticky: true) is { ResetsAt: { } until } held && until.UtcDateTime > nowUtc ? held : null)
+                        ?? (agentLimits?.GetValueOrDefault(id) is { } sub && !(sub.ResetsAt?.UtcDateTime <= nowUtc) && !RepliedAfter(tail, sub.At) ? sub : null);
                     // No quiet wait: the error is final, and `LimitOf` already looks past the notices Claude Code writes after it.
                     // This process's own stop only: a resumed (or tray-copied) transcript still ends at the error that stopped the window before it.
                     if (limit != null && (limit.At == default ? seen : limit.At.UtcDateTime) > started)
                         found.Add(new StoppedSession(pid, id, cwd, dir, account, t, true, rec, seen, limit, OwnStop(dir == DefaultDir, limit.At, defaultSince), status));
-                    else if (status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
-                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen));
+                    else if (status == "agents" || status == "idle" && nowUtc - seen >= Quiet && EndsTurn(tail))
+                        found.Add(new StoppedSession(pid, id, cwd, dir, account, t, false, rec, seen, Status: status));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException) { }
             }
         }
         return found;
+    }
+
+    /// Whether Claude replied (not with an error) after `at`: the window worked again since a stop recorded elsewhere.
+    static bool RepliedAfter(IEnumerable<string> lines, DateTimeOffset at)
+    {
+        foreach (var line in lines.Reverse())
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var r = doc.RootElement;
+                if (Str(r, "type") != "assistant" || r.TryGetProperty("isApiErrorMessage", out var err) && err.ValueKind == JsonValueKind.True) continue;
+                return at != default && r.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String && ts.TryGetDateTimeOffset(out var t) && t > at;
+            }
+            catch (JsonException) { } // a line cut by the tail window, or one being written
+        }
+        return false;
     }
 
     /// Whether the conversation's last message is Claude Code's own usage-limit error.
@@ -231,15 +266,22 @@ public static class ResumeStopped
         double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
         IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null)
     {
-        double Weight(Account a) => Format.Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
+        double Weight(Account a) => Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
         bool Read(Account a) => !a.Disabled && a.UsageStatus == "ok" && a.Usage != null;
-        bool Room(Account a) => Read(a) && Format.Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow));
+        bool Room(Account a) => Read(a) && Peak(a) < Full && !(refusedUntil?.GetValueOrDefault(a.Number) > (now ?? DateTimeOffset.UtcNow));
         var own = accounts.FirstOrDefault(a => a.Number == s.Account);
         var refused = s.OwnRefused && s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow);
         if (s.AtLimit && own != null && Room(own) && !refused) return own.Number;
-        if (!s.AtLimit && (own == null || !Read(own) || Format.Peak(own) < threshold)) return null;
-        return accounts.Where(a => a.Number != s.Account && Room(a) && (a.Active || hasProfile(a.Number)))
-            .Where(a => s.AtLimit || Format.Peak(a) < threshold && Format.Peak(own!) - Format.Peak(a) >= hysteresis)
+        if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < threshold)) return null;
+        // A move before the limit leaves alone the account the default login, near its own line, would switch to: a window moved
+        // there makes it a live profile, which the engine never switches onto. (A stopped window cannot wait, so it may take it.)
+        var login = accounts.FirstOrDefault(a => a.Active);
+        var kept = !s.AtLimit && login != null && login.Number != s.Account && Read(login) && Peak(login) >= threshold - hysteresis
+            ? SwitchTargets(accounts, login.Number, new HashSet<int>(), refusedUntil ?? new Dictionary<int, DateTimeOffset>(), now ?? DateTimeOffset.UtcNow, threshold)
+                .Select(n => (int?)n).FirstOrDefault()
+            : null;
+        return accounts.Where(a => a.Number != s.Account && a.Number != kept && Room(a) && (a.Active || hasProfile(a.Number)))
+            .Where(a => s.AtLimit || Peak(a) < threshold && Peak(own!) - Peak(a) >= hysteresis)
             .OrderBy(Weight).ThenByDescending(a => a.Active)
             .Select(a => (int?)a.Number).FirstOrDefault();
     }
@@ -273,9 +315,9 @@ public static class ResumeStopped
     public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
         IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
     {
-        var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Format.Peak(a) < Full
+        var open = accounts.Where(a => a.Number != refused && !a.Disabled && a.UsageStatus == "ok" && a.Usage != null && Peak(a) < Full
                 && !liveProfiles.Contains(a.Number) && !(refusedUntil.TryGetValue(a.Number, out var until) && until > now)).ToList();
-        return [.. (open.Any(a => Format.Peak(a) < threshold) ? open.Where(a => Format.Peak(a) < threshold) : open).OrderBy(a => Format.Peak(a)).Select(a => a.Number)];
+        return [.. (open.Any(a => Peak(a) < threshold) ? open.Where(a => Peak(a) < threshold) : open).OrderBy(a => Peak(a)).Select(a => a.Number)];
     }
 
     /// When the first account frees up: the soonest reset ahead among the accounts refused and the windows read as full.
@@ -298,8 +340,8 @@ public static class ResumeStopped
     {
         if (accounts.FirstOrDefault(a => a.Active) is not { } d) return [];
         var refused = refusedUntil.TryGetValue(d.Number, out var until) && until > now;
-        if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Format.Peak(d) >= threshold)) return [];
-        bool Below(int n, double line) => Format.Peak(accounts.First(a => a.Number == n)) < line;
+        if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Peak(d) >= threshold)) return [];
+        bool Below(int n, double line) => Peak(accounts.First(a => a.Number == n)) < line;
         if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold).Any(n => Below(n, threshold))) return []; // the engine has somewhere to go
         return [.. SwitchTargets(accounts, d.Number, new HashSet<int>(), refusedUntil, now, threshold)
             .Where(n => liveProfiles.Contains(n) && Below(n, threshold - hysteresis))];
@@ -531,7 +573,9 @@ public static class ResumeStopped
     /// Ends the stopped claude and returns; a `cswap run` wrapper around it is then left to exit on its own (it
     /// seals the profile's login) and the shell that held it is closed, so the window it sat in goes away. The
     /// new `cswap run` need not wait for that: it registers its run marker first, which a peer's seal respects.
-    public static async Task CloseAsync(int pid)
+    /// `record`, the killed claude's session record, is deleted once it exited: killed, Claude Code never removes it, and a
+    /// pid reused later would make it read as a live window.
+    public static async Task CloseAsync(int pid, string? record = null)
     {
         var chain = new List<(int Pid, string Name, DateTime Start)>();
         for (var (p, guard) = (pid, 0); guard < 4 && ParentOf(p) is { } parent; p = parent, guard++)
@@ -549,6 +593,8 @@ public static class ResumeStopped
             claude.Kill();
             try { await claude.WaitForExitAsync(new CancellationTokenSource(10_000).Token); }
             catch (OperationCanceledException) { } // slow to go: the window is still reopened
+            if (record != null && claude.HasExited)
+                try { File.Delete(record); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
         _ = CloseShellsAsync(chain).ContinueWith(t => Program.Log(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
     }

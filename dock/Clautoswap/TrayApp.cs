@@ -151,7 +151,7 @@ public sealed partial class TrayApp : ApplicationContext
                 Notify("Auto-Prime paused", _primeProblem, ToolTipIcon.Warning);
             fresh.Add(("claude", _snap));
             if (runAuto && _settings.AutoSwitch) await ResumeStoppedAsync(_snap);
-            _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
+            await UpdateAgentAccountsAsync();
             _error = null;
             _dash.SetStatus($"{DateTime.Now:HH:mm}");
         }
@@ -199,6 +199,7 @@ public sealed partial class TrayApp : ApplicationContext
     {
         var (recorded, changed) = ResumeStopped.DefaultLogin();
         var live = snap?.ActiveAccountNumber;
+        foreach (var (id, l) in _agentLimits) if (l.ResetsAt?.UtcDateTime <= DateTime.UtcNow) _agentLimits.TryRemove(id, out _); // reset: no longer a stop
         return ResumeStopped.Scan(ResumeStopped.ConfigDirs(live), DateTime.UtcNow, recorded == live ? changed : DateTime.MaxValue, includeBusy, _agentLimits);
     }
 
@@ -372,7 +373,7 @@ public sealed partial class TrayApp : ApplicationContext
             // The agents terminal is never closed (its bridge flags would not come back): its owner is told once to reopen it.
             if (s.Status == "agents")
             {
-                if (_told.Add($"{s.SessionId}@{s.Limit?.At.Ticks}"))
+                if (s.AtLimit && _told.Add($"{s.SessionId}@{s.Limit?.At.Ticks}"))
                     Notify("Agents terminal stopped at a limit", $"The agents terminal in {Path.GetFileName(s.Cwd.TrimEnd('\\'))} (#{s.Account}) refuses every prompt until its reset. Close it and open it again from the Agents menu to carry on.", ToolTipIcon.Warning);
                 continue;
             }
@@ -463,7 +464,7 @@ public sealed partial class TrayApp : ApplicationContext
             await Task.Run(Copy);
             // The copy can take long: someone may have typed, or the window closed, meanwhile.
             if (!ResumeStopped.Unchanged(s) || ResumeStopped.UserIdle() < (s.AtLimit ? TypingPause : TimeSpan.FromSeconds(60))) return null;
-            await ResumeStopped.CloseAsync(s.Pid);
+            await ResumeStopped.CloseAsync(s.Pid, s.Record);
             try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); }
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
             _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
@@ -513,7 +514,9 @@ public sealed partial class TrayApp : ApplicationContext
             {
                 // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
                 if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held)
-                    Held($"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. " + (windows.Count == records && windows.All(w => w.Idle)
+                    Held($"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. " + (windows.Any(w => w.Status == "agents")
+                        ? $"It never moves on its own: close the agents terminal to free #{n}, then open it again from the Agents menu."
+                        : windows.Count == records && windows.All(w => w.Idle)
                         ? _agents?.RunsOn(account) > 0 // no window to close: only runs hold it
                             ? $"It moves to #{n} once that run ends; pausing agents frees #{n} sooner."
                             : $"It moves to #{n} once that run ends; stop the headless `cswap run {n}` to free #{n} sooner."
@@ -541,7 +544,7 @@ public sealed partial class TrayApp : ApplicationContext
             // Someone typed, or a turn started: that window keeps the profile, so the switch refuses and the closed ones go back.
             if (!ResumeStopped.Unchanged(w) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)) break;
             if (w.Limit is { } old) _limitWatch.Remember(old.At);
-            try { await ResumeStopped.CloseAsync(w.Pid); closed.Add(w); }
+            try { await ResumeStopped.CloseAsync(w.Pid, w.Record); closed.Add(w); }
             catch (Exception e) { Program.Log(e); break; }
         }
         // The agents yield only once every window is closed: stopped for a switch a window still blocks, their work would be lost for nothing.
@@ -617,7 +620,7 @@ public sealed partial class TrayApp : ApplicationContext
         }
         sw.Enabled = sw.DropDownItems.Count > 0;
         // The folder's assigned account if it has one, else the default login: the dashboard's Terminal path.
-        var term = new ToolStripMenuItem("Open terminal", null, (_, _) => OpenFolderTerminal()) { Enabled = _snap?.Accounts.Any(a => a.Active) == true };
+        var term = new ToolStripMenuItem("Open terminal", null, (_, _) => OpenFolderTerminal());
         _menu.Items.Add(sw);
         _menu.Items.Add(term);
         var proj = new ToolStripMenuItem("Project terminals");

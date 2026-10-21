@@ -504,6 +504,30 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task ARunBeingPreparedOnAnAccountThatYieldsStartsElsewhere()
+    {
+        Issues("""[{"number":65,"title":"Quick","body":"","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        var held = Accounts[1]; // the most headroom: the pick
+        await Tool("agents_control", """{"action":"start"}""");
+        // Yields while the run's worktree is prepared: picked, not started yet, so not among the runs a yield stops.
+        var until = DateTime.UtcNow.AddSeconds(90);
+        while (!await On(r =>
+        {
+            if (r.Items.FirstOrDefault(i => i.Issue == 65) is not { State: ItemState.Working, Run: null }) return false;
+            _ = _sup!.YieldAsync(held, TimeSpan.FromMinutes(30));
+            return true;
+        }))
+        {
+            Assert.True(DateTime.UtcNow < until, "the run is never prepared");
+            await Task.Delay(5);
+        }
+        await Until(r => Item(r, 65).State == ItemState.Open, "the work starts on another account");
+        Assert.DoesNotContain(Runs, r => r.StartsWith($"run {held.Number} "));
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task ClosingTheTerminalPausesTheWorkAndReopeningContinuesIt()
     {
         Issues("""[{"number":61,"title":"Long","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
@@ -634,7 +658,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         """);
         var other = NewRepo("other");
         var config = Fast();
-        config.MaxConcurrent = 0; // automatic: three usable accounts, up to three runs per repository
+        config.MaxConcurrent = 0; // automatic: three usable accounts, up to three runs at once
         config.Ramp = TimeSpan.FromSeconds(1);
         await StartAsync(config, terminal: false);
         // #2, the best account, is this folder's own. The other folder, listed and served first, has three
@@ -650,12 +674,32 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task IssuesAtOnceCountsEveryFolder()
+    {
+        Issues("""[{"number":83,"title":"Held","body":"[fake:hold]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var other = NewRepo("other");
+        var config = Fast();
+        config.Ramp = TimeSpan.FromMilliseconds(100);
+        await StartAsync(config, terminal: false); // the default: one issue at once
+        await Tool("agents_control", """{"action":"start"}""", other);
+        await Tool("agents_control", """{"action":"start"}""");
+        await _loop.Run(() => { _sup!.Attach(other); _sup.Attach(_repo); return 0; });
+        Func<RepoAgents, bool> busy = r => r.Items.Any(i => i.State is ItemState.Working or ItemState.Checking);
+        var until = DateTime.UtcNow.AddSeconds(90);
+        while (!await On(busy) && !await On(busy, other)) { Assert.True(DateTime.UtcNow < until, "one folder starts"); await Task.Delay(100); }
+        await Task.Delay(3000);
+        Assert.False(await On(busy) && await On(busy, other), "both folders work at once");
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task AFolderWaitingForItsOwnAccountNeitherAlarmsNorFlickersWhileOthersWork()
     {
         Issues("""[{"number":85,"title":"Slow","body":"[fake:slow]","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
         var other = NewRepo("other");
         var config = Fast();
         config.Ramp = TimeSpan.FromSeconds(2);
+        config.MaxConcurrent = 2; // one each: the cap counts every folder, and this one waits for its account, not for a slot
         await StartAsync(config);
         // This folder's account is out of usage; #3 still has room for the other folder.
         await _loop.Run(() => { _sup!.UpdateAccounts([A(1, 0, active: true), A(2, 95), A(3, 30)], [new ProjectMapping(_repo, "a2@example.com", "")]); return 0; });
@@ -976,16 +1020,20 @@ public sealed class AgentsEndToEndTests : IDisposable
             r.Items.Add(new WorkItem { Id = "w1", Title = "Closed", State = ItemState.Done, Pr = 7, Goal = key + "/g1", Rank = 10100 });
             r.Items.Add(new WorkItem { Id = "w2", Title = "Waits", Goal = key + "/g1", After = [key + "/w1"], Rank = 10099 });
             r.Items.Add(new WorkItem { Id = "w3", Title = "Skipped", Goal = key + "/g1", After = [key + "/w2"], Rank = 10098 });
+            r.Items.Add(new WorkItem { Id = "w4", Title = "Also waits", Goal = key + "/g1", After = [key + "/w1"], Rank = 10097 });
             _sup.Poke();
             return 0;
         });
         await Until(r => G(r).State == GoalState.NeedsOwner, "a step that can never start asks the owner");
         Assert.Contains("closed without merging", await On(r => G(r).Note));
         Assert.Equal(ItemState.Queued, await On(r => W(r, "w2").State)); // it never started
+        Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w4"}"""));
+        Assert.Equal(GoalState.NeedsOwner, await On(r => G(r).State)); // the question was about w2: it stays
 
         // Skipping a step takes what was planned on it out of the goal, so it cannot start without it.
         Assert.Contains("is skipped", await Tool("agents_queue", """{"action":"skip","item":"w2"}"""));
         Assert.False(await On(r => r.Items.Any(i => i.Id == "w3"))); // a request planned on it is no longer in the goal
+        Assert.Equal(GoalState.Active, await On(r => G(r).State)); // that answered the question about it
         _sup!.Dispose();
     }
 

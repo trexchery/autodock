@@ -100,8 +100,8 @@ public sealed partial class Supervisor
                 return;
             }
             wt = await ProbeWorktreeAsync(repo, probe);
-            // Paused, closed, stopped or ended by the owner while this was prepared: plan again later, nothing failed.
-            if (_disposed || _stopping || !Active(repo) || goal is not { State: GoalState.Active, Replan: true } || !repo.Goals.Contains(goal)) return;
+            // Paused, closed, stopped or ended by the owner (or its account yielded) while this was prepared: plan again later, nothing failed.
+            if (_disposed || _stopping || !Active(repo) || goal is not { State: GoalState.Active, Replan: true } || !repo.Goals.Contains(goal) || Cooled(account)) return;
             // From here to Watch nothing awaits: the prompt, its signature and the run record describe one moment.
             var attempt = (goal.Run?.Attempt ?? 0) + 1;
             var dir = _store.RunDir(repo, probe);

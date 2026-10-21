@@ -117,6 +117,16 @@ public class ResumeStoppedTests
     }
 
     [Fact]
+    public void FinishedTurnLeavesTheDefaultLoginsNextAccountFree()
+    {
+        // The default login at 88 is near its line of 90: #4 is where it goes next, so the window takes #5, or stays without it.
+        Assert.Equal(5, ResumeStopped.Target(Done3, [A(1, 88, active: true), A(3, 92), A(4, 20), A(5, 40)], _ => true, threshold: 90, hysteresis: 10));
+        Assert.Null(ResumeStopped.Target(Done3, [A(1, 88, active: true), A(3, 92), A(4, 20)], _ => true, threshold: 90, hysteresis: 10));
+        Assert.Equal(4, ResumeStopped.Target(Done3, [A(1, 50, active: true), A(3, 92), A(4, 20)], _ => true, threshold: 90, hysteresis: 10)); // far from it
+        Assert.Equal(4, ResumeStopped.Target(On(3), [A(1, 88, active: true), A(3, 100), A(4, 20)], _ => true, threshold: 90, hysteresis: 10)); // stopped: cannot wait
+    }
+
+    [Fact]
     public void FinishedTurnStaysWhenItsOwnUsageIsUnreadable()
     {
         Assert.Null(ResumeStopped.Target(Done3, [A(1, 0), A(3, 95, status: "token_expired")], _ => true, threshold: 90, hysteresis: 10));
@@ -515,8 +525,9 @@ public class ResumeStoppedTests
             Assert.Equal(1, ResumeStopped.Target(s, [A(1, 20), A(3, 93)], _ => true, threshold: 90, hysteresis: 10));
             Assert.True(ResumeStopped.Unchanged(s));
 
-            await ResumeStopped.CloseAsync(s.Pid);
+            await ResumeStopped.CloseAsync(s.Pid, s.Record);
             Assert.True(claude.HasExited);
+            Assert.False(File.Exists(record)); // killed, Claude Code would leave it for a reused pid to revive
             ResumeStopped.CopyTranscript(s, to);
             Assert.Equal(File.ReadAllText(transcript), File.ReadAllText(Path.Combine(to, "projects", "C--w", "sid.jsonl")));
             Assert.Equal(["run", "1", "--", "--resume", "sid"], Launch.Run(1, false, ResumeStopped.ResumeArgs(s, moved: true)));

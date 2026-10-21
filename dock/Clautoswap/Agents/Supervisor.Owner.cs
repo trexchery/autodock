@@ -143,8 +143,9 @@ public sealed partial class Supervisor
                 if (GoalOf(skip.Goal) is { } sg)
                 {
                     AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
-                    // A goal waiting on this step got its answer: plan again without it, now (the owner acted).
-                    if (sg.State == GoalState.NeedsOwner) (sg.State, sg.Note, sg.Claim, sg.Replan, sg.LastPlan) = (GoalState.Active, null, null, true, null);
+                    // A goal waiting on this step got its answer: plan again without it, now (the owner acted). A question
+                    // or problem about anything else stays for the owner.
+                    if (sg.State == GoalState.NeedsOwner && sg.Note?.StartsWith(skip.Label) == true) (sg.State, sg.Note, sg.Claim, sg.Replan, sg.LastPlan) = (GoalState.Active, null, null, true, null);
                 }
                 if (skip.Pr == null) repo.Items.Remove(skip);
                 HoldDependents(_state.Repos, repo, skip);

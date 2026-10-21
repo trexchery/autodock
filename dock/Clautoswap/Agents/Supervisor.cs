@@ -330,7 +330,8 @@ public sealed partial class Supervisor : IDisposable
             // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest;
             // planned work waits for what it builds on.
             Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
-            while (!_disposed && !_launching && repo.Items.Count(i => i.State is ItemState.Working or ItemState.Checking) < cap)
+            // Counted over every folder: the setting is the tray's, not each repository's.
+            while (!_disposed && !_launching && _state.Repos.Sum(r => r.Items.Count(i => i.State is ItemState.Working or ItemState.Checking)) < cap)
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
                 if (_notBefore.TryGetValue(item, out var t) && t > DateTimeOffset.Now) break;
@@ -423,9 +424,9 @@ public sealed partial class Supervisor : IDisposable
                     catch (Exception e) when (e is EngineException or System.Text.Json.JsonException) { }
                 prompt = WorkPrompt(repo, item, notes, item.Issue is { } n ? await IssueDiscussionAsync(repo, n) : null);
             }
-            if (!Active(repo) || _stopping || item.State != ItemState.Working || !repo.Items.Contains(item))
+            if (!Active(repo) || _stopping || item.State != ItemState.Working || !repo.Items.Contains(item) || Cooled(account))
             {
-                // Paused, stopped or skipped while this was being prepared.
+                // Paused, stopped or skipped while this was being prepared, or its account yielded to the owner meanwhile.
                 if (item.State == ItemState.Working && repo.Items.Contains(item)) item.State = ItemState.Queued;
                 else if (item.Worktree != null) await FinishAsync(repo, item, item.Note ?? "skipped by the owner");
                 Save();
@@ -715,6 +716,9 @@ public sealed partial class Supervisor : IDisposable
         Pump();
         return runs.Count;
     }
+
+    /// Resting since it was picked: a run that starts on it now would hold the account a yield just freed.
+    bool Cooled(Account account) => _cooled.GetValueOrDefault(AccountPicker.Key(account)) > DateTimeOffset.Now;
 
     Task StopWorkersAsync(RepoAgents? only, string reason) =>
         Task.WhenAll(_workers.Where(kv => only == null || kv.Value.Repo == only).Select(kv => kv.Key).ToList().Select(k => StopWorkerAsync(k, reason)));

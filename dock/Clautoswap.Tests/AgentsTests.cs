@@ -361,6 +361,11 @@ public class IssueTriageTests
         Assert.Equal([1, 6, 12, 13, 22, 23, 24, 25, 26, 27], skip.Order());
         Assert.Equal([21, 36], only!.Order()); // pull requests are not issues; a stranger's note counts for nothing
         Assert.Null(IssueInfo.Routing(IssueInfo.ParseList(Roadmap)!, "owner").Only); // no note: no restriction
+
+        const string old = """[{"number":2,"title":"Plan","author":{"login":"owner"},"body":"## autodock routing\nSkip: #12\nEligible: #20-#21"}]""";
+        var (oldSkip, oldOnly) = IssueInfo.Routing(IssueInfo.ParseList(old)!, "owner");
+        Assert.Equal([12], oldSkip); // written before the rename
+        Assert.Equal([20, 21], oldOnly!.Order());
     }
 
     [Fact]

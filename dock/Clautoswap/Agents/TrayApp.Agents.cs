@@ -28,9 +28,18 @@ public sealed partial class TrayApp
         _agents.RefreshWanted += () => _ = TickAsync(runAuto: false, refresh: true);
         _link = new AgentsLink.Server(_agents.HandleAsync, presence: (repo, open) => { if (open) _agents.Attach(repo); else _agents.Detach(repo); });
         _agents.Start();
-        _ = ReadEngineThresholdAsync();
-        if (_snap != null) _agents.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
+        _agentsThreshold = ReadEngineThresholdAsync();
+        _ = UpdateAgentAccountsAsync();
         return _agents;
+    }
+
+    Task _agentsThreshold = Task.CompletedTask;
+
+    /// Agents get accounts only once the engine's threshold is read, so the first dispatch judges headroom at its line, not 97.
+    async Task UpdateAgentAccountsAsync()
+    {
+        await _agentsThreshold;
+        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load());
     }
 
     void ApplyAgentSettings()
@@ -55,6 +64,8 @@ public sealed partial class TrayApp
             }
             if (double.TryParse(cfg.GetValueOrDefault("autoswitch.hysteresisPct"), NumberStyles.Float, CultureInfo.InvariantCulture, out var h))
                 _engineHysteresis = h;
+            ResumeStopped.Models = (cfg.GetValueOrDefault("autoswitch.model") ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (_agents != null) _agents.Config.ConsumeFirst = cfg.GetValueOrDefault("autoswitch.strategy") == "consume-first";
         }
         catch (Exception e) when (e is EngineException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException) { }
@@ -67,6 +78,8 @@ public sealed partial class TrayApp
     void AutoPrimeForAgents()
     {
         if (!_settings.AutoPrime || _snap == null || _agents is not { IsRunning: true } || _priming || DateTimeOffset.Now - _lastAutoPrime < TimeSpan.FromMinutes(30)) return;
+        // The default login near its line: a prime would make the account it switches to (a fresh one) a live profile meanwhile.
+        if (_snap.Accounts.FirstOrDefault(a => a.Active) is { } login && ResumeStopped.Peak(login) >= Threshold - (_engineHysteresis ?? 10)) return;
         if (Prime.Ready(_snap.Accounts, DateTimeOffset.Now) is not { Count: > 0 } ready) return;
         _lastAutoPrime = DateTimeOffset.Now;
         _ = PrimeAsync(ready);

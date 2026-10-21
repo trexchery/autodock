@@ -549,8 +549,8 @@ public sealed record IssueInfo(int Number, string Title, string Body, List<strin
     static readonly Regex NotPrerequisite = new(@"\b(coordinat\w*|related|see also)\b", RegexOptions.IgnoreCase);
     // An issue reference or range ("#12", "#22–#27"), not a pull request's ("PR #12").
     static readonly Regex IssueRef = new(@"(?<!\b(?:PRs?|pull requests?)\s?)(?<![\w&])#(\d+)\b(?:\s*[–—-]\s*#?(\d+)\b)?", RegexOptions.IgnoreCase);
-    // The owner's routing for clautoswap: a section whose heading names clautoswap, with Skip: and Eligible: lines.
-    static readonly Regex RoutingSection = new(@"^#{1,6}[^\n]*clautoswap.*(?:\n(?!#{1,6}\s).*)*", RegexOptions.Multiline | RegexOptions.IgnoreCase);
+    // The owner's routing for clautoswap: a section whose heading names clautoswap (or autodock, its old name), with Skip: and Eligible: lines.
+    static readonly Regex RoutingSection = new(@"^#{1,6}[^\n]*(?:clautoswap|autodock).*(?:\n(?!#{1,6}\s).*)*", RegexOptions.Multiline | RegexOptions.IgnoreCase);
     static readonly Regex RoutingLine = new(@"^[\s>*_-]*(skip|eligible)\b[^:\n]*:", RegexOptions.IgnoreCase);
 
     public bool Tracker => TrackerTitle.IsMatch(Title) || TrackerBody.IsMatch(Body) || Checklist.Matches(Body).Count >= 3;

@@ -393,6 +393,23 @@ public class LimitWatchTests
     }
 
     [Fact]
+    public void OnlyTheWindowsTheEngineDecidesOnCountForAFree()
+    {
+        // The default login's Opus-only week is full, its 5-hour and weekly windows are not: the engine stays, so nothing is freed.
+        var login = new Account(1, "1@example.com", true, "ok", new Usage(new Window(30, null), new Window(30, null), [new Window(98, null, "Opus")], null));
+        Account[] accounts = [login, A(2, 20)];
+        var none = new Dictionary<int, DateTimeOffset>();
+        Assert.Equal(98, Format.Peak(login)); // shown
+        Assert.Empty(ResumeStopped.FreeTargets(accounts, new HashSet<int> { 2 }, none, Now, 97, 10));
+        try
+        {
+            ResumeStopped.Models = new HashSet<string>(["opus"], StringComparer.OrdinalIgnoreCase); // autoswitch.model names it
+            Assert.Equal([2], ResumeStopped.FreeTargets(accounts, new HashSet<int> { 2 }, none, Now, 97, 10));
+        }
+        finally { ResumeStopped.Models = new HashSet<string>(); }
+    }
+
+    [Fact]
     public void SwitchTargetsStayBelowTheEnginesThresholdWhileAnyAre()
     {
         Account[] accounts = [A(1, 100, active: true), A(2, 98), A(3, 60)];
@@ -579,6 +596,10 @@ public class LimitWatchTests
             var s = Assert.Single(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, agentLimits: new Dictionary<string, Limit> { ["sid"] = new Limit("five_hour", Now.AddHours(1), Now) }));
             Assert.True(s.AtLimit);
             Assert.True(ResumeStopped.Unchanged(s)); // the main transcript is as quiet as at the scan
+            var sub = new Dictionary<string, Limit> { ["sid"] = new Limit("five_hour", Now.AddHours(1), Now) };
+            Assert.Empty(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddHours(2), DateTime.MinValue, agentLimits: sub)); // its reset has passed
+            Stage(root, "idle", $$$"""{"type":"assistant","timestamp":"{{{Now.AddMinutes(1):O}}}","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}""");
+            Assert.False(Assert.Single(ResumeStopped.Scan([(root, 3)], DateTime.UtcNow.AddSeconds(30), DateTime.MinValue, agentLimits: sub)).AtLimit); // it replied since
         }
         finally { Directory.Delete(root, true); }
     }
