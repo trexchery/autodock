@@ -169,6 +169,16 @@ public static class AgentsLink
                 ["text"] = new JsonObject { ["type"] = "string", ["description"] = "add: the note; forget: its number (g1 for shared) or text it contains." },
                 ["global"] = new JsonObject { ["type"] = "boolean", ["description"] = "Note or forget for every repository instead of this one." },
             }, "action"),
+        Tool("agents_goal", "The owner's goals: objectives bigger than one change. clautoswap's director plans each into steps that agents turn into pull requests, plans again as they land, and calls a goal achieved only on evidence: the owner's checks passing on the base branch, or merged work. Set one when the owner states such an objective, list them, answer a goal's question, ask for a new plan, drop one, or confirm one done.",
+            new JsonObject
+            {
+                ["action"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("set", "list", "answer", "replan", "drop", "done") },
+                ["goal"] = new JsonObject { ["type"] = "string", ["description"] = "answer/replan/drop/done: g1." },
+                ["title"] = new JsonObject { ["type"] = "string", ["description"] = "set: short title." },
+                ["text"] = new JsonObject { ["type"] = "string", ["description"] = "set: the objective and what done looks like; answer: the owner's answer or guidance." },
+                ["checks"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "set/answer/replan: commands that must pass on the base branch for the goal to count as achieved; they replace the goal's checks, and the owner confirms them in a clautoswap dialog." },
+                ["issue"] = new JsonObject { ["type"] = "integer", ["description"] = "set: an issue of this repository to adopt as the goal (its title and body)." },
+            }, "action"),
     ];
 
     static JsonObject Tool(string name, string description, JsonObject properties, params string[] required) => new()

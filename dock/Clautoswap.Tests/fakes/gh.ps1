@@ -25,7 +25,8 @@ switch ("$($a[0]) $($a[1])") {
     'issue comment' { Copy-Item -LiteralPath (Arg '--body-file') -Destination (Join-Path $dir "question-$($a[2]).md"); exit 0 }
     'issue view' {
         if ((Arg '--json') -eq 'comments') { Read-Text "comments-$($a[2]).json" '{"comments":[]}'; exit 0 }
-        $i = @(Read-Text 'issues.json' '[]' | ConvertFrom-Json) | Where-Object { $_.number -eq [int]$a[2] }
+        # Parenthesized: Windows PowerShell emits a JSON array as one object, which Where-Object would pass whole.
+        $i = (Read-Text 'issues.json' '[]' | ConvertFrom-Json) | Where-Object { $_.number -eq [int]$a[2] }
         if ($i) { $i | ConvertTo-Json -Compress -Depth 10; exit 0 }
         [Console]::Error.WriteLine('issue not found'); exit 1
     }

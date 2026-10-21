@@ -36,6 +36,10 @@ public sealed class WorkItem
     public string? PrUrl { get; set; }
     /// Its pull request was merged (a closed one was not).
     public bool Merged { get; set; }
+    /// The goal it serves: "{repo.Key}/{goal.Id}" (always the key, even in its own repository).
+    public string? Goal { get; set; }
+    /// Items ("{repo.Key}/{item.Id}") that must land first: merged, finished without a pull request, or gone.
+    public List<string> After { get; set; } = [];
     /// PR feedback after this moment is new.
     public DateTimeOffset? PrSeen { get; set; }
     public int Failures { get; set; }
@@ -78,7 +82,7 @@ public sealed record Note(string Text, string Source, DateTimeOffset At, bool Ow
 public sealed class Run
 {
     public int Attempt { get; set; }
-    /// "work" or "review".
+    /// "work", "review" or "plan".
     public string Kind { get; set; } = "work";
     public string Job { get; set; } = "";
     public int Pid { get; set; }
@@ -91,6 +95,49 @@ public sealed class Run
     public DateTimeOffset Started { get; set; }
     /// The process may still be running (cleared once its outcome is handled).
     public bool Live { get; set; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
+}
+
+public enum GoalState { Active, Achieved, NeedsOwner, Dropped }
+
+/// An objective the owner set in the agents terminal. The director plans work toward it, replans as that
+/// work lands, and calls it achieved only on evidence.
+public sealed class Goal
+{
+    /// g1, g2 … per repository.
+    public string Id { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string Objective { get; set; } = "";
+    /// An issue of the owner's adopted as this goal.
+    public int? Issue { get; set; }
+    /// Owner-confirmed commands that must pass on the base branch.
+    public List<string> Checks { get; set; } = [];
+    public GoalState State { get; set; }
+    public DateTimeOffset Created { get; set; } = DateTimeOffset.Now;
+    /// The question, why it stopped, or the evidence.
+    public string? Note { get; set; }
+    /// The owner's answer, for the next plan once.
+    public string? Guidance { get; set; }
+    public bool Replan { get; set; } = true;
+    public DateTimeOffset? LastPlan { get; set; }
+    public int Plans { get; set; }
+    /// Plans in a row that changed nothing.
+    public int Idle { get; set; }
+    public int Failures { get; set; }
+    /// The goal items' states as the last plan saw them: a change means plan again.
+    public string? Progress { get; set; }
+    /// The director says it is achieved: its evidence, to be checked.
+    public string? Claim { get; set; }
+    /// Why the last completion check failed, for the next plan.
+    public string? Refuted { get; set; }
+    /// What proved it achieved.
+    public string? Evidence { get; set; }
+    /// When it was achieved (the morning summary counts these).
+    public DateTimeOffset? AchievedAt { get; set; }
+    /// Newest last, at most 12 lines.
+    public List<string> Log { get; set; } = [];
+    /// The planner run.
+    public Run? Run { get; set; }
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
@@ -110,6 +157,8 @@ public sealed class RepoAgents
     public List<int> Skipped { get; set; } = [];
     public List<WorkItem> Items { get; set; } = [];
     public int NextLocal { get; set; } = 1;
+    public List<Goal> Goals { get; set; } = [];
+    public int NextGoal { get; set; } = 1;
     /// What the owner and runs noted about this repository.
     public List<Note> Memory { get; set; } = [];
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
@@ -165,7 +214,7 @@ public sealed class AgentStore(string root)
     /// A repository was left running, or a worker may still be: the tray starts agents, so open terminals link up
     /// and runs without one stop.
     public static bool HasWork(string root) =>
-        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }));
+        new AgentStore(root).Load().Repos.Any(r => r.Authorized || r.Items.Any(i => i.Run is { Live: true }) || r.Goals.Any(g => g.Run is { Live: true }));
 
     public string RunDir(RepoAgents repo, WorkItem item) => System.IO.Path.Combine(Root, "runs", $"{repo.Key}-{item.Id}");
 

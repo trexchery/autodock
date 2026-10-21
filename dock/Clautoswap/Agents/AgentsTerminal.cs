@@ -97,8 +97,8 @@ public static class AgentsTerminal
     public static string StateOf(RepoAgents? repo) =>
         repo is not { Authorized: true } ? "off"
         : repo.Paused ? "paused"
-        : repo.Items.Any(i => i.State == ItemState.NeedsOwner) ? "attention"
-        : repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking) ? "working"
+        : repo.Items.Any(i => i.State == ItemState.NeedsOwner) || repo.Goals.Any(g => g.State == GoalState.NeedsOwner) ? "attention"
+        : repo.Items.Any(i => i.State is ItemState.Working or ItemState.Checking) || repo.Goals.Any(g => g.Run is { Live: true }) ? "working"
         : "idle";
 
     public static void SetState(string root, string repo, string state)

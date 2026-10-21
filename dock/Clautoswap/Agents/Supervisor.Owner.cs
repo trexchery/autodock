@@ -24,7 +24,7 @@ public sealed partial class Supervisor
                 switch (action)
                 {
                     case "pause":
-                        var n = _workers.Keys.Count(repo.Items.Contains);
+                        var n = _workers.Keys.OfType<WorkItem>().Count(repo.Items.Contains);
                         await PauseAsync(repo);
                         return n > 0 ? "Paused. The item in progress stopped where it was and continues from there on resume." : "Paused.";
                     case "resume":
@@ -68,6 +68,10 @@ public sealed partial class Supervisor
             case "agents_details":
                 if (repo == null) return "Agents were never started for this repository.";
                 return Find(repo, Str("item")) is { } item ? Details(repo, item) : NoItem;
+
+            case "agents_goal":
+                if (repo == null) return "Agents were never started for this repository; start them first (agents_control start).";
+                return await GoalCommandAsync(repo, Str("action"), args, Str("goal"), Str("title"), Str("text"));
         }
         return "Unknown tool.";
     }
@@ -136,7 +140,13 @@ public sealed partial class Supervisor
                 if (skip.Issue is { } si && !repo.Skipped.Contains(si)) repo.Skipped.Add(si);
                 await StopWorkerAsync(skip, "skipped");
                 await FinishAsync(repo, skip, "skipped by the owner");
+                if (GoalOf(skip.Goal) is { } sg) AddLog(sg, DateTimeOffset.Now, $"the owner skipped {skip.Label}");
                 if (skip.Pr == null) repo.Items.Remove(skip);
+                // What was planned on it leaves the goal: removed, it counts as landed and they would start on its absence;
+                // kept with its pull request unmerged, they would wait for it forever.
+                for (var q = new Queue<WorkItem>([skip]); q.TryDequeue(out var s);)
+                    foreach (var d in repo.Items.Where(d => d.Goal != null && d.After.Contains(Key(repo, s))).ToList())
+                        if (Unplan(repo, d.Goal!, [d]) > 0) q.Enqueue(d);
                 Save();
                 Pump();
                 return $"{skip.Label} is skipped" + (skip.Pr is { } p ? $"; pull request #{p} is left as it is." : ".");
@@ -204,8 +214,10 @@ public sealed partial class Supervisor
         var opened = items.Where(i => i.Pr != null && i.PrSeen >= since).ToList();
         var asks = items.Count(i => i.State == ItemState.NeedsOwner && !Problem(i));
         var stuck = items.Count(Problem);
-        if (opened.Count + asks + stuck == 0) return null;
+        var achieved = Repos.SelectMany(r => r.Goals).Count(g => g.State == GoalState.Achieved && g.AchievedAt >= since);
+        if (achieved + opened.Count + asks + stuck == 0) return null;
         var parts = new List<string>();
+        if (achieved > 0) parts.Add($"{achieved} goal{(achieved == 1 ? "" : "s")} achieved");
         if (opened.Count > 0) parts.Add($"{opened.Count} pull request{(opened.Count == 1 ? "" : "s")} opened ({string.Join(", ", opened.Take(5).Select(i => "#" + i.Pr))}{(opened.Count > 5 ? ", …" : "")})");
         if (asks > 0) parts.Add($"{asks} waiting on you");
         if (stuck > 0) parts.Add($"{stuck} stuck");
@@ -215,7 +227,7 @@ public sealed partial class Supervisor
     /// Outcomes first. `detail` adds the machinery: accounts, attempts, sessions, worktrees.
     public string Status(RepoAgents? repo, string path, bool detail)
     {
-        if (repo == null || (!repo.Authorized && repo.Items.Count == 0))
+        if (repo == null || (!repo.Authorized && repo.Items.Count == 0 && repo.Goals.Count == 0))
             return $"Agents are not running for {Path.GetFileName(path.TrimEnd('\\', '/'))}. Ask to start them if they should: clautoswap asks the owner to confirm in a native dialog first.";
         var sb = new StringBuilder();
         var actives = repo.Items.Where(i => i.State is ItemState.Working or ItemState.Checking).ToList();
@@ -225,16 +237,18 @@ public sealed partial class Supervisor
         var mode = !repo.Authorized ? "stopped" : repo.Paused ? "paused" : _baseline.Contains(repo) ? "checking the verification command" : "running";
         sb.AppendLine($"{repo.Leaf}: agents {mode}.");
         if (repo.Note != null) sb.AppendLine(repo.Note);
-        foreach (var active in actives) sb.AppendLine($"Working on {active.Label} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
-        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
-        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var g in repo.Goals.Where(g => detail || g.State != GoalState.Dropped))
+            sb.AppendLine(GoalLine(repo, g) + (detail && g.Log.Count > 0 ? "\n  " + string.Join("\n  ", g.Log.TakeLast(5)) : ""));
+        foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
+        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
         if (queued.Count > 0)
-            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label)) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
+            sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
         if (repo.Running && actives.Count == 0 && queued.Count > 0)
-            sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs) == null
+            sb.AppendLine(prs.Count >= Config.MaxOpenPrs && Next(repo, Config.MaxOpenPrs, i => !Ready(i)) == null
                 ? $"Holding new work: {prs.Count} pull requests are waiting for review."
                 : Waiting != null ? $"Waiting: {Waiting}." : "");
-        if (repo.Running && actives.Count == 0 && queued.Count == 0)
+        if (repo.Running && actives.Count == 0 && queued.Count == 0 && !repo.Goals.Any(g => g.State == GoalState.Active))
             sb.AppendLine($"Nothing else is eligible right now; clautoswap checks the issues again every {Config.ScanEvery.TotalMinutes:0} minutes.");
         if (detail)
         {
@@ -294,7 +308,9 @@ public sealed partial class Supervisor
         var sb = new StringBuilder();
         sb.AppendLine(item.Issue is { } n
             ? $"You are an clautoswap agent. Resolve GitHub issue #{n} of this repository: {item.Title}"
-            : $"You are an clautoswap agent. The repository owner asked for: {item.Title}");
+            : item.Goal != null
+                ? $"You are an clautoswap agent. clautoswap's director planned this step toward one of the owner's goals: {item.Title}"
+                : $"You are an clautoswap agent. The repository owner asked for: {item.Title}");
         if (item.Body.Trim().Length > 0) sb.AppendLine().AppendLine(Clip(item.Body, 8000));
         if (discussion != null) sb.AppendLine().AppendLine("Discussion on the issue, oldest first (decisions the owner documented here stand):").AppendLine(discussion);
         if (item.Guidance != null) sb.AppendLine().AppendLine("The owner's answer to your earlier question:").AppendLine(item.Guidance);
@@ -348,7 +364,7 @@ public sealed partial class Supervisor
         $"""
         {summary}
 
-        {(item.Issue is { } n ? $"For #{n}." : "Requested in the clautoswap agents terminal.")}
+        {(item.Issue is { } n ? $"For #{n}." : item.Goal != null ? "Planned by clautoswap's director toward a goal the owner set in the agents terminal." : "Requested in the clautoswap agents terminal.")}
         {(item.ReviewNotes is { } notes ? $"\nThe agent review still raised, for you to weigh:\n{notes}\n" : "")}
         ---
         Prepared by clautoswap agents: reviewed{(repo.Verify is { } v ? $" and `{v}` passed" : "")} before it opened. It is not merged automatically, and merging it does not close the issue.

@@ -22,6 +22,7 @@ public sealed partial class TrayApp
         _agents = new Supervisor(_engine, cli, new AgentStore(AgentStore.DefaultRoot),
             new AgentsConfig { MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs });
         _agents.Authorize = AuthorizeAgents;
+        _agents.ConfirmChecks = ConfirmAgentChecks;
         _agents.Notify = (title, text) => Notify(title, text);
         _agents.Changed += OnAgentsChanged;
         _agents.RefreshWanted += () => _ = TickAsync(runAuto: false, refresh: true);
@@ -200,6 +201,17 @@ public sealed partial class TrayApp
             $"{(repo.Authorized ? "Apply these settings to" : "Start agents for")} {repo.Path}?",
             "clautoswap — agents", MessageBoxButtons.YesNo, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
         return Task.FromResult(ok);
+    }
+
+    /// The owner's confirmation of the exact commands a goal's checks will run, asked by clautoswap itself.
+    Task<bool> ConfirmAgentChecks(RepoAgents repo, IReadOnlyList<string> checks)
+    {
+        using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
+        owner.Show();
+        return Task.FromResult(MessageBox.Show(owner,
+            $"Let clautoswap run these commands in a fresh checkout of {repo.Base} to decide whether a goal in {repo.Leaf} is achieved?\n\n" +
+            string.Join("\n", checks.Select(c => "    " + c)) + "\n\nNothing else asks them to run.",
+            "clautoswap — goal checks", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
     }
 
     async Task ExitAsync()

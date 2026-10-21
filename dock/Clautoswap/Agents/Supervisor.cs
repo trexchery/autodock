@@ -24,6 +24,10 @@ public sealed class AgentsConfig
     public int MaxOpenPrs { get; set; } = Supervisor.MaxOpenPrs;
     /// Open pull requests as drafts.
     public bool DraftPrs { get; set; }
+    /// A goal plans again at most this often after its last plan; the owner's answer or replan skips it.
+    public TimeSpan ReplanEvery { get; set; } = TimeSpan.FromMinutes(10);
+    /// A goal whose work has all landed looks again after this long.
+    public TimeSpan IdleReplan { get; set; } = TimeSpan.FromHours(1);
 }
 
 public sealed class AgentsException(string message) : Exception(message);
@@ -51,9 +55,11 @@ public sealed partial class Supervisor : IDisposable
     readonly AgentStore _store;
     readonly SynchronizationContext _ctx;
     readonly AgentsState _state;
-    readonly Dictionary<WorkItem, Worker> _workers = [];
+    /// Runs under way: an item's work or review, or a goal's planner.
+    readonly Dictionary<object, Worker> _workers = [];
     readonly Dictionary<string, DateTimeOffset> _cooled = [];
-    readonly Dictionary<WorkItem, DateTimeOffset> _notBefore = [];
+    /// An item resting after a failed start, or a goal backing off after a failed plan or check.
+    readonly Dictionary<object, DateTimeOffset> _notBefore = [];
     readonly Dictionary<RepoAgents, DateTimeOffset> _prPolled = [], _fetched = [];
     readonly HashSet<RepoAgents> _baseline = [];
     readonly HashSet<WorkItem> _checks = [];
@@ -83,7 +89,8 @@ public sealed partial class Supervisor : IDisposable
     /// answered in the agents terminal, the only place agents work.
     public bool HasProblem => _state.Repos.Any(Problem) || Waiting is AccountPicker.OnlyYours or AccountPicker.NoneUsable;
 
-    internal static bool Problem(RepoAgents r) => r.Authorized && (r.Note != null || r.Items.Any(Problem));
+    internal static bool Problem(RepoAgents r) =>
+        r.Authorized && (r.Note != null || r.Items.Any(Problem) || r.Goals.Any(g => g is { State: GoalState.NeedsOwner, Failures: >= MaxFailures }));
 
     /// Parked after retries ran out or a check, push or pull request failed; not a hold, a question or a no-op.
     internal static bool Problem(WorkItem i) =>
@@ -94,14 +101,18 @@ public sealed partial class Supervisor : IDisposable
     /// The owner's own yes, asked natively (never by a model) before a repository runs unattended.
     /// Called with the repository and the verification command and base it would run with.
     public Func<RepoAgents, string?, string, Task<bool>>? Authorize;
+    /// The owner's own yes, asked natively (never by a model), before a goal's acceptance checks run
+    /// unattended on the base branch. Null or false: the checks are refused.
+    public Func<RepoAgents, IReadOnlyList<string>, Task<bool>>? ConfirmChecks;
     public Action<string, string>? Notify;
     /// Every account is out of usage and the earliest reset has passed: the tray should read fresh usage now.
     public event Action? RefreshWanted;
     /// Some repository is working (or would, were there work): its terminal is open and it is not paused.
     public bool IsRunning => _state.Repos.Any(Active);
 
-    sealed class Worker(AgentProcess proc, string outPath, string account)
+    sealed class Worker(RepoAgents repo, AgentProcess proc, string outPath, string account)
     {
+        public RepoAgents Repo { get; } = repo;
         public AgentProcess Proc { get; } = proc;
         public string OutPath { get; } = outPath;
         public string Account { get; } = account;
@@ -127,6 +138,7 @@ public sealed partial class Supervisor : IDisposable
     {
         _started = DateTimeOffset.Now;
         foreach (var repo in _state.Repos)
+        {
             foreach (var item in repo.Items)
             {
                 if (item.Run is { Live: true } run)
@@ -138,6 +150,19 @@ public sealed partial class Supervisor : IDisposable
                 }
                 else if (item.State == ItemState.Working) item.State = ItemState.Queued;
             }
+            foreach (var goal in repo.Goals.Where(g => g.Run is { Live: true }))
+            {
+                var run = goal.Run!;
+                var proc = run.Pid == 0 ? null : AgentProcess.Attach(run.Job, run.Pid, run.Created);
+                if (run.Pid == 0) AgentProcess.Reap(run.Job); // crashed between the write-ahead save and the start
+                if (proc != null) WatchPlanner(repo, goal, proc);
+                else
+                {
+                    (run.Live, goal.Replan) = (false, true); // ended while clautoswap was away: plan again
+                    Fire(() => RemoveProbeAsync(repo, PlanProbe(goal)));
+                }
+            }
+        }
         Save();
         Pump();
     }
@@ -193,6 +218,7 @@ public sealed partial class Supervisor : IDisposable
                         // Checks interrupted by a restart or a pause pick up where they were.
                         foreach (var item in repo.Items.Where(i => i.State == ItemState.Checking && !_checks.Contains(i)).ToList())
                             Fire(() => CheckAsync(repo, item));
+                        foreach (var goal in repo.Goals.Where(g => g.State == GoalState.Active).ToList()) Tend(repo, goal);
                     }
                     await DispatchAsync();
                 } while (_pumpAgain && !_disposed);
@@ -225,6 +251,15 @@ public sealed partial class Supervisor : IDisposable
         {
             Min(Until(repo.LastScan, ScanEvery(repo)));
             if (repo.Items.Any(Watched)) Min(Until(_prPolled.GetValueOrDefault(repo), Config.PrEvery));
+            // A goal's next look: its throttle after the last plan, or the idle look-again. Only ahead: one due but
+            // unable to start (backlog, accounts, the gap between starts) is woken by what unblocks it.
+            foreach (var g in repo.Goals.Where(g => g is { State: GoalState.Active, LastPlan: not null }))
+            {
+                var wait = g.Replan ? Until(g.LastPlan, Config.ReplanEvery)
+                    : g.Claim == null && GoalItems(Key(repo, g)).All(i => i.State == ItemState.Done) ? Until(g.LastPlan, Config.IdleReplan)
+                    : TimeSpan.Zero;
+                if (wait > TimeSpan.Zero) Min(wait);
+            }
         }
         foreach (var t in _notBefore.Values) Min(t - DateTimeOffset.Now);
         if (_resumeAt is { } resume) Min(resume - DateTimeOffset.Now);
@@ -264,9 +299,27 @@ public sealed partial class Supervisor : IDisposable
         foreach (var repo in _state.Repos.Skip(_turn).Concat(_state.Repos.Take(_turn)).Where(r => Active(r) && !_baseline.Contains(r)).ToList())
         {
             if (_disposed || _launching) break;
+            // A goal's planner first, outside the item cap: what it plans decides the items. One per repository at a time.
+            if (!_goalBusy.Any(b => b.Value == PlanningNow && repo.Goals.Contains(b.Key))
+                && repo.Goals.Where(g => WantsPlan(repo, g)).MinBy(g => g.LastPlan ?? DateTimeOffset.MinValue) is { } goal)
+            {
+                var (planner, why) = PickAccount(repo, null);
+                if (planner == null) waiting = why is AccountPicker.OnlyYours or AccountPicker.NoneUsable ? why : waiting ?? why;
+                else if (_workers.Count == 0 || DateTimeOffset.Now - _lastLaunch >= Config.Ramp)
+                {
+                    var last = goal.Run;
+                    await LaunchPlannerAsync(repo, goal, planner);
+                    if (goal.Run != last) // one that never got to start (GitHub unreadable, paused meanwhile) takes no turn from the items
+                    {
+                        (_lastLaunch, _turn) = (DateTimeOffset.Now, _state.Repos.IndexOf(repo) + 1);
+                        started = true;
+                    }
+                }
+            }
             var cap = Config.MaxConcurrent > 0 ? Config.MaxConcurrent : Math.Max(1, _accounts.Count(AccountPicker.Usable)); // automatic: one per account, verifying included
-            // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest.
-            Func<WorkItem, bool>? resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now : null;
+            // One at a time, what is under way finishes first; with more, an item resting after a failed start holds none of the rest;
+            // planned work waits for what it builds on.
+            Func<WorkItem, bool> resting = cap > 1 ? i => _notBefore.GetValueOrDefault(i) > DateTimeOffset.Now || !Ready(i) : i => !Ready(i);
             while (!_disposed && !_launching && repo.Items.Count(i => i.State is ItemState.Working or ItemState.Checking) < cap)
             {
                 if (Next(repo, Config.MaxOpenPrs, resting) is not { } item) break;
@@ -320,16 +373,16 @@ public sealed partial class Supervisor : IDisposable
     /// The folder's assigned account if it has one (work code stays on its account), otherwise the best
     /// of the rest, leaving other open folders' assigned accounts to them while another fits. Never the
     /// login in use at the keyboard: runs only happen in isolated profiles.
-    (Account?, string?) PickAccount(RepoAgents repo, WorkItem item)
+    (Account?, string?) PickAccount(RepoAgents repo, WorkItem? item)
     {
         var accounts = _accounts ?? [];
         var busy = _workers.Values.GroupBy(w => w.Account).ToDictionary(g => g.Key, g => g.Count());
-        var prefer = !item.ReviewNext && item.Session is { } s ? s.Email + "|" + s.Org : null;
+        var prefer = item is { ReviewNext: false, Session: { } s } ? s.Email + "|" + s.Org : null;
         (Account?, string?) From(IReadOnlyList<Account> pool) =>
             AccountPicker.Pick(pool, Config.Threshold, busy, _cooled, DateTimeOffset.Now, 1, prefer, Config.ConsumeFirst);
         if (ProjectMap.AccountFor(repo.Path, accounts, _maps) is { } mapped) return From([mapped]);
         // Held only for a folder that would start something, or has not read its issues yet.
-        var theirs = _state.Repos.Where(r => r != repo && Active(r) && (r.LastScan == null || Next(r, Config.MaxOpenPrs) != null)).Select(r => ProjectMap.AccountFor(r.Path, accounts, _maps)).OfType<Account>().ToList();
+        var theirs = _state.Repos.Where(r => r != repo && Active(r) && (r.LastScan == null || Next(r, Config.MaxOpenPrs, i => !Ready(i)) != null)).Select(r => ProjectMap.AccountFor(r.Path, accounts, _maps)).OfType<Account>().ToList();
         var pick = From(accounts.Where(a => !theirs.Contains(a) || AccountPicker.Key(a) == prefer).ToList()); // a session resumes where it lives
         return pick.Item1 != null || theirs.Count == 0 ? pick : From(accounts);
     }
@@ -474,24 +527,27 @@ public sealed partial class Supervisor : IDisposable
         }
     }
 
-    void Watch(RepoAgents repo, WorkItem item, AgentProcess proc)
+    void Watch(RepoAgents repo, WorkItem item, AgentProcess proc) =>
+        Watch(repo, item, item.Run!, _store.RunFile(repo, item, item.Run!.Attempt, "out"), proc, w => FinishRunAsync(repo, item, w));
+
+    /// Tracks a run (an item's, or a goal's planner) until its process exits, then hands it to `finish`.
+    void Watch(RepoAgents repo, object key, Run run, string outPath, AgentProcess proc, Func<Worker, Task> finish)
     {
-        var w = new Worker(proc, _store.RunFile(repo, item, item.Run!.Attempt, "out"), item.Run.Email + "|" + item.Run.Org)
-        {
-            LastCpu = proc.CpuTime,
-        };
-        w.LastLen = FileLength(w.OutPath);
-        _workers[item] = w;
+        var w = new Worker(repo, proc, outPath, run.Email + "|" + run.Org) { LastCpu = proc.CpuTime };
+        w.LastLen = FileLength(outPath);
+        _workers[key] = w;
         w.Finished = Fire(async () =>
         {
             await proc.WaitForExitAsync();
-            await FinishRunAsync(repo, item, w);
+            await finish(w);
         });
     }
 
-    async Task StopWorkerAsync(WorkItem item, string reason)
+    async Task StopWorkerAsync(object key, string reason)
     {
-        if (!_workers.TryGetValue(item, out var w) || w.StopReason != null) return;
+        if (!_workers.TryGetValue(key, out var w)) return;
+        // The owner acting on a goal outranks a pause or a limit that came first: a plan read in after it must not be used.
+        if (w.StopReason != null) { if (reason == "owner") w.StopReason = reason; return; }
         w.StopReason = reason;
         await w.Proc.StopAsync(Config.StopGrace);
     }
@@ -560,9 +616,7 @@ public sealed partial class Supervisor : IDisposable
         else if (LimitHit(text) || LimitHit(err))
         {
             // Not the work's fault: rest the account until it resets; the item moves on with a hand-off.
-            var key = run.Email + "|" + run.Org;
-            var acct = _accounts?.FirstOrDefault(a => AccountPicker.Key(a) == key);
-            _cooled[key] = (acct is null ? null : AccountPicker.NextReset(acct, null, DateTimeOffset.Now)) ?? DateTimeOffset.Now.AddHours(1);
+            CoolAccount(run.Email + "|" + run.Org);
         }
         else if (NoConversation(text) || NoConversation(err)) item.Session = null; // the transcript is elsewhere: hand off
         else if (!started && err.Contains("active default login", StringComparison.OrdinalIgnoreCase))
@@ -573,6 +627,13 @@ public sealed partial class Supervisor : IDisposable
         Save();
         if (item.State == ItemState.Checking) await CheckAsync(repo, item);
         Pump();
+    }
+
+    /// Not the run's fault: rest its account until it resets (an hour when unknown).
+    void CoolAccount(string key)
+    {
+        var acct = _accounts?.FirstOrDefault(a => AccountPicker.Key(a) == key);
+        _cooled[key] = (acct is null ? null : AccountPicker.NextReset(acct, null, DateTimeOffset.Now)) ?? DateTimeOffset.Now.AddHours(1);
     }
 
     static void EnterChecking(WorkItem item, string summary)
@@ -628,7 +689,7 @@ public sealed partial class Supervisor : IDisposable
     }
 
     Task StopWorkersAsync(RepoAgents? only, string reason) =>
-        Task.WhenAll(_workers.Keys.Where(i => only == null || only.Items.Contains(i)).ToList().Select(i => StopWorkerAsync(i, reason)));
+        Task.WhenAll(_workers.Where(kv => only == null || kv.Value.Repo == only).Select(kv => kv.Key).ToList().Select(k => StopWorkerAsync(k, reason)));
 
     /// Stops every run now (clautoswap is exiting and the owner asked for that), and waits until their
     /// outcomes are recorded so the next start resumes them instead of counting failures.
@@ -673,7 +734,7 @@ public sealed partial class Supervisor : IDisposable
         if (DateTimeOffset.Now - _started < Config.Relink) return;
         foreach (var repo in _state.Repos.Where(r => !Active(r)))
         {
-            foreach (var item in _workers.Keys.Where(repo.Items.Contains).ToList()) Fire(() => StopWorkerAsync(item, "paused"));
+            foreach (var key in _workers.Where(kv => kv.Value.Repo == repo).Select(kv => kv.Key).ToList()) Fire(() => StopWorkerAsync(key, "paused"));
             foreach (var (item, (_, proc)) in _verifying.Where(v => v.Value.Repo == repo).ToList())
             {
                 _verifying.Remove(item);
