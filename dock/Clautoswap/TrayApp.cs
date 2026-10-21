@@ -30,6 +30,10 @@ public sealed partial class TrayApp : ApplicationContext
     double Threshold => _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
     readonly Dictionary<string, DateTime> _busySince = []; // busy windows at a limit → when first seen so: only ones still busy after a grace are told about
     static readonly TimeSpan BusyGrace = TimeSpan.FromSeconds(10);
+    readonly Dictionary<int, DateTime> _freed = []; // account → when its `cswap run` windows were last moved to the default login
+    readonly HashSet<int> _heldNotice = []; // pinned accounts the user was told a working window holds, while a free is due
+    (int N, string Text)? _held; // this pass's held warning, shown only if the pass shows no other balloon (a second replaces the first)
+    int _notices; // balloons shown so far
 
     /// While auto-switch is on, its check runs at least this often, whatever the dashboard refresh is:
     /// a window that hits a limit should not wait out a long refresh before anything happens.
@@ -310,13 +314,13 @@ public sealed partial class TrayApp : ApplicationContext
                     break;
                 // The engine never moves the default login onto an account a pinned terminal is using
                 // (two copies of one rotating login). Say so once, rather than leave a silent stall:
-                // windows stopped at the limit are reopened on that account instead.
+                // windows stopped at the limit are reopened on that account instead, and the account is freed once its windows are idle.
                 case "no-switch" when e.Reason == "no-viable-target" && _lastBlockedNotice != e.Reason:
                 case "error" when _lastBlockedNotice != e.Message:
                     _lastBlockedNotice = e.Event == "error" ? e.Message : e.Reason;
                     Notify("Auto-switch can't move the default login",
                         e.Event == "error" ? e.Message ?? "engine error"
-                            : "Every account with room left is in use by a pinned terminal. Windows stopped at a limit are reopened there instead.",
+                            : "Every account with room left is in use by a pinned terminal. Windows stopped at a limit are reopened there instead; once that terminal is idle, it is moved to the default login and the default login follows.",
                         ToolTipIcon.Warning);
                     break;
                 case "all-exhausted" when e.EarliestResetAt != _lastExhaustedNotice:
@@ -335,7 +339,14 @@ public sealed partial class TrayApp : ApplicationContext
     {
         await _movePass.WaitAsync();
         // The caller's snapshot may predate a switch made while this pass waited: a reopened window must see where the default login is now.
-        try { await MovePassAsync(_snap ?? snap); }
+        try
+        {
+            (_held, var shown) = (null, _notices);
+            await MovePassAsync(_snap ?? snap);
+            // Not yet told if anything else showed: the next quiet pass tells it, while a free of that account is still due.
+            if (_held is { } h && _notices == shown && _heldNotice.Add(h.N))
+                Notify($"#{h.N} is held by a pinned terminal", h.Text, ToolTipIcon.Warning);
+        }
         finally { _movePass.Release(); }
     }
 
@@ -345,6 +356,8 @@ public sealed partial class TrayApp : ApplicationContext
         try { stopped = await Task.Run(() => ScanStops(snap, includeBusy: true)); }
         catch (Exception e) { Program.Log(e); return; }
         if (stopped.Count > 0 && _engineThreshold == null) await ReadEngineThresholdAsync();
+        // First, so the default login's stopped windows are reopened where it lands, not in the profile being freed.
+        if (await FreePinnedAsync(snap)) { _retry = true; return; } // the next poll's pass sees where the default login is now
         var (threshold, hysteresis) = (Threshold, _engineHysteresis ?? 10);
         var now = DateTimeOffset.UtcNow;
         var load = new Dictionary<int, int>();
@@ -452,6 +465,79 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e) { Program.Log(e); Error("Could not reopen a stopped window", e); return null; }
     }
 
+    /// Frees the `cswap run` account the default login needs (see `ResumeStopped.FreeTarget`) before it sits at its limit: the
+    /// profile's windows, every one idle, are closed; once nothing runs on the profile (each wrapper's exit seal hands the login
+    /// back to the backup), the default login switches there, `--exclusive` so anything started on it since refuses it, and the
+    /// windows are reopened with `cswap run N`, which on the default login's own account runs in ~/.claude. A refused switch
+    /// reopens them in the profile, where they were. True when windows were closed.
+    async Task<bool> FreePinnedAsync(Snapshot snap)
+    {
+        var (threshold, hysteresis) = (Threshold, _engineHysteresis ?? 10);
+        if (ResumeStopped.FreeTarget(snap.Accounts, LiveOrLaunching(), _limits.RefusedUntil, DateTimeOffset.UtcNow, threshold, hysteresis) is not { } n)
+        {
+            _heldNotice.Clear(); // nothing due: a later stall is news again
+            return false;
+        }
+        if (_freed.TryGetValue(n, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(30) // once per half hour per account: never a loop
+            || ResumeStopped.ProfileDir(n) is not { } dir)
+            return false;
+        List<StoppedSession> windows;
+        try
+        {
+            windows = await Task.Run(() => ResumeStopped.Scan([(dir, n)], DateTime.UtcNow, includeBusy: true, agentLimits: _agentLimits));
+            var (records, runs) = await Task.Run(() => ResumeStopped.LiveCounts(dir));
+            if (!ResumeStopped.Releasable(windows, records, runs))
+            {
+                // Never closed while working; the user is the only one who can free it sooner, so say once what holds it.
+                if (ResumeStopped.Holders(windows, records, runs) is { Count: > 0 } held && !_heldNotice.Contains(n))
+                    _held = (n, $"{string.Join(", ", held)} keeps #{n}, so the default login stays at its limit. It moves to #{n} once that terminal is idle; finish or close it to free #{n} sooner.");
+                return false;
+            }
+            if (ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)
+                || windows.Any(w => ResumeStopped.MovesInLastHour(_resumed, w.SessionId, DateTime.UtcNow) >= ResumeStopped.MovesPerHour))
+                return false;
+            foreach (var w in windows) ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); // a failed copy closes nothing
+        }
+        catch (Exception e) { Program.Log(e); return false; }
+        Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)");
+        var closed = new List<StoppedSession>();
+        foreach (var w in windows)
+        {
+            // Someone typed, or a turn started: that window keeps the profile, so the switch refuses and the closed ones go back.
+            if (!ResumeStopped.Unchanged(w) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)) break;
+            if (w.Limit is { } old) _limitWatch.Remember(old.At);
+            try { await ResumeStopped.CloseAsync(w.Pid); closed.Add(w); }
+            catch (Exception e) { Program.Log(e); break; }
+        }
+        if (closed.Count == 0) return false; // nothing closed: no lockout, the next idle poll tries again
+        _freed[n] = DateTime.UtcNow;
+        var free = false;
+        for (var i = 0; i < 60 && !(free = await Task.Run(() => ResumeStopped.LiveProfiles([(dir, n)]).Count == 0)); i++) await Task.Delay(500);
+        SwitchResult? sw = null;
+        if (free)
+            try { sw = await _engine.SwitchNowAsync(n); }
+            catch (Exception e) { Program.Log($"free #{n}: switch refused: {Engine.Redact(e.Message)}"); }
+        var account = snap.Accounts.First(a => a.Number == n);
+        foreach (var w in closed)
+        {
+            try { ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); } catch (Exception e) { Program.Log(e); } // what it wrote on the way out
+            _resumed[$"{w.SessionId}#{n}"] = _resumed[ResumeStopped.MoveStamp(w.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
+            _engine.LaunchConsole($"Claude · {account.ShortName} · moved", w.Cwd,
+                Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(w, moved: false)));
+            Program.Log($"nudge {w.SessionId} relaunched on #{n}");
+        }
+        try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }
+        if (sw is { Switched: true })
+        {
+            _lastBlockedNotice = null;
+            // One balloon (a second replaces the first): the switch, and that these windows are no longer pinned.
+            Notify(closed.Count == 1 ? "Moved a pinned window to the default login" : $"Moved {closed.Count} pinned windows to the default login",
+                $"{Format.SwitchNotice(sw.From, sw.To)}. {string.Join(", ", closed.Select(w => Path.GetFileName(w.Cwd.TrimEnd('\\'))))} now follow the default login, no longer pinned to #{n}.");
+            if (_snap is { } s) _snap = s with { ActiveAccountNumber = n, Accounts = [.. s.Accounts.Select(a => a with { Active = a.Number == n })] };
+        }
+        return true;
+    }
+
     /// Why a stopped window was left alone, logged once per session and reason.
     bool Skip(StoppedSession s, string reason)
     {
@@ -464,8 +550,11 @@ public sealed partial class TrayApp : ApplicationContext
 
     static string Name(AccountRef? r) => r == null ? "(none)" : $"#{r.Number} {r.Email}";
 
-    void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info) =>
+    void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
+    {
+        _notices++;
         _tray.ShowBalloonTip(5000, title, Engine.Redact(text), icon);
+    }
 
     void BuildMenu()
     {

@@ -1230,6 +1230,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--exclusive",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': refuse while a 'cswap run' session of "
+            "that account is live, instead of warning"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1519,7 +1527,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                exclusive=args.exclusive,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)

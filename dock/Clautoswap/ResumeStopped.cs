@@ -264,7 +264,7 @@ public static class ResumeStopped
 
     /// Where the default login can move when `refused` ran out, best (most room) first. Usage read and below full; enabled;
     /// not refused until a reset still ahead, whatever a reading older than the refusal says; and not run by a `cswap run`
-    /// window (`liveProfiles`): two live copies of one rotating login would strand one. The engine's `switch` only warns of that.
+    /// window (`liveProfiles`): two live copies of one rotating login would strand one. The switch itself is `--exclusive`, so the engine refuses it too.
     /// Below the engine's `threshold` first (above it the engine would switch again at once); only if none, anything below full.
     public static List<int> SwitchTargets(IReadOnlyList<Account> accounts, int refused, ISet<int> liveProfiles,
         IReadOnlyDictionary<int, DateTimeOffset> refusedUntil, DateTimeOffset now, double threshold = Full)
@@ -279,6 +279,48 @@ public static class ResumeStopped
         refusedUntil.Values.Concat(accounts.Where(a => a.ShownUsage != null).SelectMany(a => Windows(a.ShownUsage!).Where(w => w.Pct >= Full).Select(w => w.ResetsAt ?? default)))
             .Where(t => t > now).Select(t => (DateTimeOffset?)t).Min();
 
+    /// The `cswap run` account to free for the default login, or null. Due when the default login is at the engine's
+    /// `threshold` (or refused) and every account with room below it is held by a live profile: the engine never puts the
+    /// default login on a second copy of a rotating login, so it would sit at its limit while that account had room. Freed by
+    /// closing the profile's idle windows and reopening them on the default login once it switched there: one copy at a time.
+    /// Only an account `hysteresis` below the threshold, so the engine stays there and nothing trades back.
+    public static int? FreeTarget(IReadOnlyList<Account> accounts, ISet<int> liveProfiles, IReadOnlyDictionary<int, DateTimeOffset> refusedUntil,
+        DateTimeOffset now, double threshold, double hysteresis)
+    {
+        if (accounts.FirstOrDefault(a => a.Active) is not { } d) return null;
+        var refused = refusedUntil.TryGetValue(d.Number, out var until) && until > now;
+        if (!refused && !(d.UsageStatus == "ok" && d.Usage != null && Format.Peak(d) >= threshold)) return null;
+        bool Below(int n, double line) => Format.Peak(accounts.First(a => a.Number == n)) < line;
+        if (SwitchTargets(accounts, d.Number, liveProfiles, refusedUntil, now, threshold).Any(n => Below(n, threshold))) return null; // the engine has somewhere to go
+        return SwitchTargets(accounts, d.Number, new HashSet<int>(), refusedUntil, now, threshold)
+            .Where(n => liveProfiles.Contains(n) && Below(n, threshold - hysteresis)).Select(n => (int?)n).FirstOrDefault();
+    }
+
+    /// Whether every window on a profile can be closed now: each live claude in it (`records`) was seen idle (`windows`, from
+    /// `Scan`), and no wrapper runs without a window (`runs` above `records`: a headless run, an agent). One busy, shell,
+    /// waiting or unread window keeps the whole profile, so nothing working is closed and the account is never half freed.
+    public static bool Releasable(IReadOnlyCollection<StoppedSession> windows, int records, int runs) =>
+        records > 0 && windows.Count == records && runs <= records && windows.All(w => w.Idle);
+
+    /// What keeps a profile that is not `Releasable`, for the user: each window not idle by folder and status, a window the
+    /// scan did not see as done, a run without a window.
+    public static List<string> Holders(IReadOnlyCollection<StoppedSession> windows, int records, int runs)
+    {
+        var held = windows.Where(w => !w.Idle).Select(w => $"{Path.GetFileName(w.Cwd.TrimEnd('\\'))} ({w.Status})").ToList();
+        if (records > windows.Count) held.Add(records - windows.Count == 1 ? "a window still working" : $"{records - windows.Count} windows still working");
+        if (runs > records) held.Add(runs - records == 1 ? "a run without a window" : $"{runs - records} runs without a window");
+        return held;
+    }
+
+    /// Live claude records and live `cswap run` wrapper markers in a profile dir. Throws when it cannot be listed.
+    public static (int Records, int Runs) LiveCounts(string dir)
+    {
+        var runs = Path.Combine(dir, ".cswap-runs");
+        var records = Path.Combine(dir, "sessions");
+        return (Directory.Exists(records) ? Directory.EnumerateFiles(records, "*.json").Count(IsLiveRecord) : 0,
+            Directory.Exists(runs) ? Directory.EnumerateFiles(runs).Count(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid)) : 0);
+    }
+
     /// Accounts with a `cswap run` window right now: a live claude in the profile, or its wrapper's run marker (a headless
     /// run writes no record). Not knowing (unlistable dir) counts as in use.
     public static HashSet<int> LiveProfiles(IEnumerable<(string Dir, int? Account)> dirs)
@@ -289,11 +331,7 @@ public static class ResumeStopped
             if (account is not { } n || dir == DefaultDir) continue;
             try
             {
-                var runs = Path.Combine(dir, ".cswap-runs");
-                var records = Path.Combine(dir, "sessions");
-                if (Directory.Exists(runs) && Directory.EnumerateFiles(runs).Any(f => int.TryParse(Path.GetFileName(f), out var pid) && IsRunning(pid))
-                    || Directory.Exists(records) && Directory.EnumerateFiles(records, "*.json").Any(IsLiveRecord))
-                    live.Add(n);
+                if (LiveCounts(dir) is not (0, 0)) live.Add(n);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { live.Add(n); }
         }
