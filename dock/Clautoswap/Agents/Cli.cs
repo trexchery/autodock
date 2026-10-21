@@ -17,6 +17,8 @@ public sealed class Cli(string git, string? gh)
 {
     public string Git { get; } = git;
     public string? Gh { get; } = gh;
+    /// Tests shorten it, so a hung call is killed and logged before their own deadline.
+    public TimeSpan GhTimeout { get; init; } = TimeSpan.FromMinutes(2);
 
     public static Cli? Locate() =>
         Engine.FindOnPath("git.exe") is { } git ? new Cli(git, Engine.FindOnPath("gh.exe")) : null;
@@ -24,7 +26,7 @@ public sealed class Cli(string git, string? gh)
     public Task<CliResult> GitAsync(string cwd, params string[] args) => RunAsync(Git, cwd, TimeSpan.FromMinutes(5), args);
 
     public Task<CliResult> GhAsync(string cwd, params string[] args) =>
-        Gh == null ? Task.FromResult(new CliResult(127, "", "gh (GitHub CLI) is not installed")) : RunAsync(Gh, cwd, TimeSpan.FromMinutes(2), args);
+        Gh == null ? Task.FromResult(new CliResult(127, "", "gh (GitHub CLI) is not installed")) : RunAsync(Gh, cwd, GhTimeout, args);
 
     public static async Task<CliResult> RunAsync(string exe, string cwd, TimeSpan timeout, params string[] args)
     {

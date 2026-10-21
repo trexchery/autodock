@@ -43,7 +43,8 @@ public sealed class AgentsEndToEndTests : IDisposable
         AgentProcess.BelowNormal = false;
         _repo = NewRepo("repo");
         var fakes = Path.Combine(AppContext.BaseDirectory, "fakes");
-        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd"));
+        // Well inside Until's 90 s: a hung fake gh is killed and logged, and Until's failure prints clautoswap.log.
+        _cli = new Cli(Engine.FindOnPath("git.exe")!, Path.Combine(fakes, "gh.cmd")) { GhTimeout = TimeSpan.FromSeconds(30) };
         _engine = new Engine(Path.Combine(fakes, "cswap.cmd"));
         _store = new AgentStore(P("agents"));
     }
@@ -874,6 +875,15 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.All(Runs[..2], r => Assert.Contains("NotebookEdit", r));
         Assert.Equal(0, await On(r => G(r).Failures)); // a limit is not the plan's fault
         _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AHungGhCallIsKilledAndLoggedAtItsTimeout()
+    {
+        var hung = new Cli(_cli.Git, Engine.FindOnPath("powershell.exe")!) { GhTimeout = TimeSpan.FromSeconds(1) };
+        var r = await hung.GhAsync(_repo, "-NoProfile", "-Command", "Start-Sleep 60");
+        Assert.Equal(124, r.Code);
+        Assert.Contains("timed out after 1 s", Read(Path.Combine(P("data"), "clautoswap.log")));
     }
 
     public void Dispose()
