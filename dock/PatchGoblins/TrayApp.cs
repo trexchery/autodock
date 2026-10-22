@@ -73,7 +73,7 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.Moved += SavePinnedPosition;
         _dash.AgentsRequested += (anchor, menu) => { if (menu) ShowAgentsMenu(anchor); else LaunchAgents(); };
 
-        HardenStores();
+        _ = Task.Run(HardenStores); // the first run after a move re-permissions every file under the data folder (worktrees too): minutes, never on the UI thread
         if (AgentStore.HasWork(AgentStore.DefaultRoot)) EnsureAgents(); // authorized earlier: open terminals link up, other runs stop
         _timer.Interval = TimerMs;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
@@ -96,7 +96,7 @@ public sealed partial class TrayApp : ApplicationContext
         foreach (var dir in new[] { StoreSecurity.BackupRoot, DockSettings.Dir })
         {
             try { if (!Directory.Exists(dir) || !StoreSecurity.IsHardened(dir)) StoreSecurity.Harden(dir); }
-            catch (Exception e) { Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning); }
+            catch (Exception e) { _ui.Post(_ => Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning), null); }
         }
         ClaudeCli.PurgeEnrollLeftovers(ClaudeCli.EnrollRoot);
     }
