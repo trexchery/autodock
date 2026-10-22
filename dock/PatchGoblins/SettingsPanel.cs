@@ -5,12 +5,9 @@ namespace PatchGoblins;
 public sealed class SettingsPanel : UserControl
 {
     public readonly NumericUpDown Threshold = new() { Minimum = 50, Maximum = 99, Value = 90 };
-    public readonly NumericUpDown RefreshInterval = new() { Minimum = DockSettings.MinRefreshSeconds, Maximum = 3600, Increment = 30, Value = 180 };
-    public readonly TextBox Models = new() { PlaceholderText = "none" };
     public readonly TextBox TerminalFolder = new() { PlaceholderText = "your user folder" };
-    public readonly ComboBox Strategy = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     public readonly Toggle Startup = new("");
-    public readonly Toggle AutoSwitch = new(""), PreserveRc = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new(""), Ultracode = new(""), AskApproval = new("");
+    public readonly Toggle AutoSwitch = new(""), AutoProject = new(""), QuotaNotify = new(""), AutoPrime = new(""), DraftPrs = new(""), Ultracode = new(""), AskApproval = new("");
     public readonly NumericUpDown AgentIssues = new() { Minimum = 0, Maximum = 10, Value = 1 }, AgentOpenPrs = new() { Minimum = 1, Maximum = 50, Value = 10 };
     public readonly TextBox Search = new() { PlaceholderText = "Search settings" };
 
@@ -27,8 +24,6 @@ public sealed class SettingsPanel : UserControl
     public SettingsPanel()
     {
         Font = Ui.Font(9f);
-        Strategy.Items.AddRange(["Most quota left", "Soonest weekly reset"]);
-        Strategy.SelectedIndex = 0;
 
         Search.Location = new Point(_pad, Ui.S(10));
         Search.Width = _w - 2 * _pad;
@@ -36,29 +31,26 @@ public sealed class SettingsPanel : UserControl
         top.Controls.Add(Search);
 
         _rows = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true };
+        Buffer(_rows); // scrolling paints the list once, not each row in turn
         _none = new Label { Text = "No setting matches.", Tag = "muted", AutoSize = true, Visible = false, Margin = new Padding(_pad, Ui.S(8), 0, 0) };
 
         Section("Team");
         Row("Start with Windows", null, Startup, Ui.S(34));
-        Row("Refresh every", null, RefreshInterval, Ui.S(72), "s");
-        Row("Terminal folder", "Where Open terminal starts browsing", TerminalFolderPicker(), Ui.S(200));
-        Row("Use project accounts automatically", "Terminals and Continue in use the account assigned to the folder", AutoProject, Ui.S(34));
-        Row("Preserve Remote Control", "New terminals turn Remote Control back on only if their last session used it", PreserveRc, Ui.S(34));
-        Row("Quota notifications", "When a limit is near, reached or reset", QuotaNotify, Ui.S(34));
+        Row("Terminal folder", "Where Open terminal starts", TerminalFolderPicker(), Ui.S(200));
+        Row("Use project accounts", "A folder's assigned account", AutoProject, Ui.S(34));
+        Row("Quota notifications", "Near, at or past a limit", QuotaNotify, Ui.S(34));
 
         Section("Work");
-        Row("Issues at once", "0 = automatic: one per account with quota to spare, started a few minutes apart", AgentIssues, Ui.S(72));
-        Row("Open pull requests", "New work holds while this many wait for review", AgentOpenPrs, Ui.S(72));
-        Row("Draft pull requests", "Agents open pull requests as drafts", DraftPrs, Ui.S(34));
-        Row("Ultracode", "Agents may fan a task out to parallel subagents when it benefits and an account has ample room; uses quota faster", Ultracode, Ui.S(34));
-        Row("Ask for approval", "Off: agents start, run goal checks and push without asking; only files the repository's policy protects (workflows, secrets) still wait for you. You hear from Patch Goblins only when something is blocked or has a question", AskApproval, Ui.S(34));
+        Row("Issues at once", "0 = one per account with room", AgentIssues, Ui.S(72));
+        Row("Open pull requests", "New work waits past this many", AgentOpenPrs, Ui.S(72));
+        Row("Draft pull requests", null, DraftPrs, Ui.S(34));
+        Row("Ultracode", "Parallel subagents; uses quota faster", Ultracode, Ui.S(34));
+        Row("Ask for approval", "Off: never asks, except protected files", AskApproval, Ui.S(34));
 
         Section("Upkeep");
-        Row("Auto-switch near limit", "Claude accounts only; Codex and Grok visitors switch by hand", AutoSwitch, Ui.S(34));
-        Row("Switch at", "of the 5-hour or weekly limit", Threshold, Ui.S(72), "%");
-        Row("Next account", null, Strategy, Ui.S(170));
-        Row("Also watch models", "e.g. Opus, or 'all'", Models, Ui.S(170));
-        Row("Auto-Prime", "Track 5-hour windows; prime fresh ones early from the tray menu, and automatically while agents run", AutoPrime, Ui.S(34));
+        Row("Auto-switch near limit", "Claude accounts only", AutoSwitch, Ui.S(34));
+        Row("Switch at", "of any limit", Threshold, Ui.S(72), "%");
+        Row("Auto-Prime", "Start 5-hour windows early", AutoPrime, Ui.S(34));
 
         var about = new Label
         {
@@ -125,6 +117,7 @@ public sealed class SettingsPanel : UserControl
     void Row(string label, string? hint, Control input, int inputWidth, string? suffix = null)
     {
         var row = new Panel { Width = _w - SystemInformation.VerticalScrollBarWidth - Ui.S(2), Margin = Padding.Empty }; // room for the scrollbar: no sideways scrolling
+        Buffer(row);
         var textWidth = _w - 2 * _pad - inputWidth - Ui.S(40);
         row.Controls.Add(new Label { Text = label, AutoSize = true, MaximumSize = new Size(textWidth + Ui.S(20), 0), Location = new Point(_pad, 0) });
         var hintHeight = 0;
@@ -168,12 +161,8 @@ public sealed class SettingsPanel : UserControl
         return panel;
     }
 
-    /// Engine values for the strategy picker.
-    public string StrategyValue
-    {
-        get => Strategy.SelectedIndex == 1 ? "consume-first" : "best";
-        set => Strategy.SelectedIndex = value == "consume-first" ? 1 : 0;
-    }
+    static void Buffer(Control c) =>
+        typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(c, true);
 
     protected override void OnHandleCreated(EventArgs e)
     {
