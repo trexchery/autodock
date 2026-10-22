@@ -4,6 +4,14 @@ using Microsoft.Win32;
 
 namespace PatchGoblins;
 
+/// The one goblin green: the tray's dots, buttons, switches and meters, and the agents terminal's theme all read it.
+/// `Hex` is what a theme file wants; the goblin's own pixels are not here and never change.
+public static class Brand
+{
+    public const string DarkHex = "#5BD25B", LightHex = "#2E7D32";
+    public static readonly Color Dark = ColorTranslator.FromHtml(DarkHex), Light = ColorTranslator.FromHtml(LightHex);
+}
+
 public sealed record Palette(
     bool IsDark, Color Back, Color Card, Color Text, Color Muted, Color Faint, Color Track,
     Color Live, Color Border, Color Hover, Color Pressed)
@@ -13,16 +21,16 @@ public sealed record Palette(
     /// Tests and screenshots pin a theme instead of reading Windows'.
     internal static bool? ForceDark;
 
-    // Neutral greys only. Colour is reserved for state: the active dot and
-    // meters that are close to a limit.
+    // Neutral greys plus the one goblin green (Brand): green for what is live or healthy, amber and red
+    // for meters that are close to a limit.
     static readonly Palette Light = new(false,
         Color.FromArgb(249, 249, 249), Color.White, Color.FromArgb(24, 24, 24), Color.FromArgb(112, 112, 112),
-        Color.FromArgb(160, 160, 160), Color.FromArgb(0, 0, 0, 0x14), Color.FromArgb(46, 160, 100),
+        Color.FromArgb(160, 160, 160), Color.FromArgb(0, 0, 0, 0x14), Brand.Light,
         Color.FromArgb(0, 0, 0, 0x14), Color.FromArgb(0, 0, 0, 0x08), Color.FromArgb(0, 0, 0, 0x10));
 
     static readonly Palette Dark = new(true,
         Color.FromArgb(32, 32, 32), Color.FromArgb(40, 40, 40), Color.FromArgb(236, 236, 236), Color.FromArgb(150, 150, 150),
-        Color.FromArgb(100, 100, 100), Color.FromArgb(0x1A, 255, 255, 255), Color.FromArgb(98, 196, 140),
+        Color.FromArgb(100, 100, 100), Color.FromArgb(0x1A, 255, 255, 255), Brand.Dark,
         Color.FromArgb(0x16, 255, 255, 255), Color.FromArgb(0x0C, 255, 255, 255), Color.FromArgb(0x16, 255, 255, 255));
 
     static bool IsLight()
@@ -36,13 +44,13 @@ public sealed record Palette(
     /// Where meters turn amber; quota notifications use the same line.
     public const double WarnPct = 80;
 
-    /// Meter fill: quiet foreground until a window is nearly spent.
+    /// Meter fill: goblin green until a window is nearly spent.
     public Color Meter(double pct) =>
-        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Color.FromArgb(IsDark ? 200 : 170, Text);
+        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Live;
 
     /// Tray dot (needs to read on any taskbar).
     public static Color ForPct(double pct) =>
-        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Color.FromArgb(98, 196, 140);
+        pct >= 95 ? Critical : pct >= WarnPct ? Warn : Brand.Dark;
 }
 
 /// Fonts, DPI scaling, glyphs and Win32 cosmetics shared by every surface.
@@ -145,9 +153,9 @@ public sealed class Pill : Control, IButtonControl
 {
     public PillStyle Style { get; set; }
     public string Glyph { get; set; } = "";
-    /// A small state dot on an icon pill (null: none).
+    /// A small state dot at the pill's top right (null: none).
     public Color? Badge { get; set; }
-    /// A highlight sweeping across the icon, 0 to 1 left to right (below 0: none).
+    /// A highlight sweeping across the icon and label, 0 to 1 left to right (below 0: none).
     public float Shine { get; set; } = -1;
     public DialogResult DialogResult { get; set; }
     bool _hover, _down;
@@ -194,13 +202,16 @@ public sealed class Pill : Control, IButtonControl
         base.OnKeyUp(e);
     }
 
-    /// White band over the glyph itself (drawn as a path so the gradient can fade), same spot as the text.
-    void PaintShine(Graphics g, Palette pal)
+    /// White band over the glyph (and the label, when there is one), drawn as paths so the gradient can fade, same spot as the text.
+    void PaintShine(Graphics g, Palette pal, bool label = false, int glyphX = 0, int textX = 0)
     {
         using var icon = Ui.Icons(9f);
         using var path = new GraphicsPath();
-        using var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        path.AddString(Glyph, icon.FontFamily, (int)icon.Style, icon.SizeInPoints * g.DpiY / 72f, new RectangleF(0, 0, Width, Height), fmt);
+        // Typographic for the label: the default format pads the left edge, which would sit the glint's text a pixel or two off the drawn text.
+        using var fmt = new StringFormat(label ? StringFormat.GenericTypographic : StringFormat.GenericDefault) { Alignment = label ? StringAlignment.Near : StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        var glyphBox = label ? new RectangleF(glyphX, 0, Ui.S(14), Height) : new RectangleF(0, 0, Width, Height);
+        path.AddString(Glyph, icon.FontFamily, (int)icon.Style, icon.SizeInPoints * g.DpiY / 72f, glyphBox, fmt);
+        if (label) path.AddString(Text, Font.FontFamily, (int)Font.Style, Font.SizeInPoints * g.DpiY / 72f, new RectangleF(textX, 0, Width - textX, Height), fmt);
         float w = Width * 0.7f, x = -w + Shine * (Width + w);
         using var br = new LinearGradientBrush(new RectangleF(x, 0, w, Height), Color.Transparent, Color.Transparent, 20f)
         {
@@ -227,7 +238,7 @@ public sealed class Pill : Control, IButtonControl
         Color fg;
         if (Style == PillStyle.Primary)
         {
-            var bg = Enabled ? pal.Text : pal.Track;
+            var bg = Enabled ? pal.Live : pal.Track;
             if (_down || _hover) bg = Color.FromArgb(_down ? 200 : 225, bg);
             using var b = new SolidBrush(bg);
             g.FillPath(b, path);
@@ -274,6 +285,13 @@ public sealed class Pill : Control, IButtonControl
             var x = (Width - textW - Ui.S(18)) / 2;
             TextRenderer.DrawText(g, Glyph, icon, new Rectangle(x, 0, Ui.S(14), Height), fg, flags);
             TextRenderer.DrawText(g, Text, Font, new Rectangle(x + Ui.S(18), 0, textW + Ui.S(2), Height), fg, flags);
+            if (Shine >= 0) PaintShine(g, pal, label: true, glyphX: x, textX: x + Ui.S(18));
+            if (Badge is { } dot)
+            {
+                using var b = new SolidBrush(dot);
+                float d = Ui.S(6);
+                g.FillEllipse(b, Width - d - Ui.S(6), Ui.S(6), d, d);
+            }
             return;
         }
         TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg, flags | TextFormatFlags.HorizontalCenter);
@@ -323,7 +341,7 @@ public sealed class Toggle : Control
         using var track = Ui.Round(new RectangleF(1, y, w, h), h / 2);
         if (Checked)
         {
-            using var b = new SolidBrush(pal.Text);
+            using var b = new SolidBrush(pal.Live);
             g.FillPath(b, track);
         }
         else

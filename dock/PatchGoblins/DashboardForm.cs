@@ -7,23 +7,28 @@ public sealed class DashboardForm : Form
 {
     readonly FlowLayoutPanel _list;
     readonly Label _title, _status;
-    readonly Toggle _auto;
     readonly Panel _header, _footer;
-    readonly Pill _pin, _close, _agents;
+    readonly Pill _pin, _close, _agents, _refresh;
     readonly System.Windows.Forms.Timer _shine = new() { Interval = 40 };
     long _shineT0;
     readonly ToolTip _tips = new();
-    bool _syncing;
     string? _expandedEmail;
+    Icon? _goblin;
+    string _refreshed = "", _updated = "";
+    string? _team;
+    bool _visitorsOpen; // ponytail: per run, not saved; a setting if people want it kept
+    (Snapshot? Snap, string? Error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? Others, IReadOnlyList<ProjectMapping>? Projects, IReadOnlyDictionary<string, Job>? Jobs) _last;
+
+    /// The refresh states: `Offline` is the one the header shows (it outranks the team's line); the rest live in the refresh button's tip.
+    public const string Updating = "updating…", Offline = "offline";
 
     public bool Pinned { get; private set; }
 
     public event Action<Account>? SwitchRequested;
     public event Action<Account>? TerminalRequested;
     public event Action<Account, string>? AccountAction;
-    public event Action? GeneralRequested;
     public event Action? RefreshRequested, SettingsRequested, AddRequested, Moved;
-    public event Action<bool>? AutoToggled, PinToggled;
+    public event Action<bool>? PinToggled;
     /// The agents launcher: (anchor, menu) where menu is a right-click.
     public event Action<Control, bool>? AgentsRequested;
 
@@ -40,9 +45,18 @@ public sealed class DashboardForm : Form
         Icon = TrayIcons.App;
         Padding = new Padding(1);
 
-        _header = new Panel { Dock = DockStyle.Top, Height = Ui.S(44) };
-        _title = new Label { Text = "Patch Goblins", Font = Ui.Font(9.5f, semibold: true), AutoSize = true, Location = new Point(Ui.S(20), Ui.S(14)) };
-        _status = new Label { Font = Ui.Font(8f), AutoSize = true };
+        // The header: the goblin, the name, and under it one live line about the team.
+        _header = new Panel { Dock = DockStyle.Top, Height = Ui.S(48) };
+        _header.Paint += (_, e) => e.Graphics.DrawIcon(_goblin ??= new Icon(TrayIcons.App, Ui.S(24), Ui.S(24)), new Rectangle(Ui.S(14), Ui.S(12), Ui.S(24), Ui.S(24)));
+        _title = new Label { Text = "Patch Goblins", Font = Ui.Font(9.5f, semibold: true), AutoSize = true, Location = new Point(Ui.S(46), Ui.S(7)) };
+        _status = new Label
+        {
+            Font = Ui.Font(8f),
+            AutoSize = false,
+            AutoEllipsis = true,
+            Location = new Point(Ui.S(46), Ui.S(27)),
+            Size = new Size(Width - Ui.S(46) - 4 * Ui.S(30) - Ui.S(14), Ui.S(16)),
+        };
         var settings = HeaderIcon(Ui.Settings, "Settings", 0);
         var add = HeaderIcon(Ui.Add, "Add account", 1);
         _pin = HeaderIcon(Ui.Pin, "Pin to desktop", 2);
@@ -64,28 +78,22 @@ public sealed class DashboardForm : Form
             Padding = new Padding(Ui.S(8), 0, 0, Ui.S(4)),
         };
 
+        // The footer: one labeled Agents button (right-click for its menu) and refresh.
         _footer = new Panel { Dock = DockStyle.Bottom, Height = Ui.S(42) };
         _footer.Paint += (_, e) =>
         {
             using var pen = new Pen(Palette.Current.Border);
             e.Graphics.DrawLine(pen, Ui.S(20), 0, _footer.Width - Ui.S(20), 0);
         };
-        _auto = new Toggle("Auto-switch near limit") { Location = new Point(Ui.S(20), Ui.S(10)) };
-        _auto.CheckedChanged += (_, _) => { if (!_syncing) AutoToggled?.Invoke(_auto.Checked); };
-        var refresh = new Pill("", PillStyle.Icon, Ui.Refresh) { TabStop = false };
-        refresh.Location = new Point(Width - Ui.S(14) - refresh.Width, Ui.S(7));
-        refresh.Click += (_, _) => RefreshRequested?.Invoke();
-        _tips.SetToolTip(refresh, "Refresh now");
-        _agents = new Pill("", PillStyle.Icon, Ui.Agents) { TabStop = false };
-        _agents.Location = new Point(refresh.Left - Ui.S(2) - _agents.Width, Ui.S(7));
+        _agents = new Pill("Agents", PillStyle.Subtle, Ui.Agents) { TabStop = false, Location = new Point(Ui.S(14), Ui.S(6)) };
         _agents.MouseUp += (_, e) => { if (e.Button is MouseButtons.Left or MouseButtons.Right) AgentsRequested?.Invoke(_agents, e.Button == MouseButtons.Right); };
         _tips.SetToolTip(_agents, "Agents terminal");
-        var general = new Pill("", PillStyle.Icon, Ui.Chat) { TabStop = false };
-        general.Location = new Point(_agents.Left - Ui.S(2) - general.Width, Ui.S(7));
-        general.Click += (_, _) => GeneralRequested?.Invoke();
-        _tips.SetToolTip(general, "General agent");
-        _footer.Controls.AddRange([_auto, general, _agents, refresh]);
-        // The agents pill glints every few seconds, whatever Windows' animation setting says. One timer, only while shown.
+        _refresh = new Pill("", PillStyle.Icon, Ui.Refresh) { TabStop = false };
+        _refresh.Location = new Point(Width - Ui.S(14) - _refresh.Width, Ui.S(7));
+        _refresh.Click += (_, _) => RefreshRequested?.Invoke();
+        _tips.SetToolTip(_refresh, "Refresh now");
+        _footer.Controls.AddRange([_agents, _refresh]);
+        // The agents button glints every few seconds, whatever Windows' animation setting says. One timer, only while shown.
         _shine.Tick += (_, _) => Shimmer((Environment.TickCount64 - _shineT0) % ShinePeriodMs / (float)ShineSweepMs);
         VisibleChanged += (_, _) =>
         {
@@ -106,7 +114,7 @@ public sealed class DashboardForm : Form
     Pill HeaderIcon(string glyph, string tip, int slot)
     {
         var b = new Pill("", PillStyle.Icon, glyph) { TabStop = false };
-        b.Location = new Point(Width - Ui.S(14) - (slot + 1) * Ui.S(30), Ui.S(8));
+        b.Location = new Point(Width - Ui.S(14) - (slot + 1) * Ui.S(30), Ui.S(10));
         _tips.SetToolTip(b, tip);
         return b;
     }
@@ -134,17 +142,35 @@ public sealed class DashboardForm : Form
     {
         var pal = Palette.Current;
         BackColor = _list.BackColor = _header.BackColor = _footer.BackColor = pal.Back;
+        _agents.BackColor = _refresh.BackColor = pal.Back; // opaque: a transparent pill is composited twice when the window is captured
         _title.ForeColor = pal.Text;
-        _status.ForeColor = pal.Faint;
+        _status.ForeColor = pal.Muted;
         if (IsHandleCreated) Ui.ThemeWindow(_list, pal);
         Invalidate(true);
     }
 
+    /// The refresh state: a time, or `Updating`/`Offline`. Only `Offline` shows in the header; the refresh button's tip carries the rest.
     public void SetStatus(string text)
     {
-        _status.Text = text;
-        _status.MaximumSize = new Size(Math.Max(0, Width - Ui.S(14) - 4 * Ui.S(30) - _title.Right - Ui.S(8)), 0);
-        _status.Location = new Point(_title.Right + Ui.S(4), _title.Top + (_title.Height - _status.Height) / 2 + Ui.S(1));
+        _refreshed = text;
+        _updated = text is Updating or Offline or "" ? text : "updated " + text;
+        ShowStatus();
+    }
+
+    /// The team's one-line summary ("2 working · 1 resting"), or null when there is none.
+    public void SetTeam(string? summary)
+    {
+        if (_team == summary) return;
+        _team = summary;
+        ShowStatus();
+    }
+
+    internal string StatusText => _status.Text;
+
+    void ShowStatus()
+    {
+        _status.Text = _refreshed == Offline ? Offline : _team ?? "";
+        _tips.SetToolTip(_refresh, _updated.Length > 0 ? "Refresh now · " + _updated : "Refresh now");
     }
 
     const int ShinePeriodMs = 4500, ShineSweepMs = 800;
@@ -160,7 +186,7 @@ public sealed class DashboardForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { _shine.Dispose(); _tips.Dispose(); }
+        if (disposing) { _shine.Dispose(); _tips.Dispose(); _goblin?.Dispose(); }
         base.Dispose(disposing);
     }
 
@@ -173,34 +199,24 @@ public sealed class DashboardForm : Form
         _agents.Invalidate();
     }
 
-    public void SetAuto(bool on)
-    {
-        _syncing = true;
-        _auto.Checked = on;
-        _syncing = false;
-    }
-
-    /// `others`: Codex/Grok snapshots (or their error), drawn below Claude's rows.
-    /// `projects`: folder assignments; each Claude row shows its own.
+    /// `others`: Codex/Grok snapshots (or their error), the visitors below the team. `projects`: folder assignments; each row shows its own.
+    /// `jobs`: what each Claude account is doing (AccountPicker.Key), the line under its name.
     public void Render(Snapshot? snap, string? error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? others = null,
-        IReadOnlyList<ProjectMapping>? projects = null)
+        IReadOnlyList<ProjectMapping>? projects = null, IReadOnlyDictionary<string, Job>? jobs = null)
     {
+        _last = (snap, error, others, projects, jobs);
         ApplyTheme();
         _list.SuspendLayout();
         // Copy first: Dispose removes the control, so enumerating live would skip every other one.
         foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
         _list.Controls.Clear();
-        var sections = new List<(string Provider, Snapshot? Snap, string? Error)> { ("claude", snap, error) };
-        sections.AddRange((others ?? []).Where(o => o.Snap is { Accounts.Count: > 0 } || o.Error != null));
-        var labelled = sections.Count(s => s.Snap is { Accounts.Count: > 0 } || (s.Provider != "claude" && s.Error != null)) > 1;
+        var visitors = (others ?? []).Where(o => o.Snap is { Accounts.Count: > 0 } || o.Error != null).ToList();
         var now = DateTimeOffset.Now;
-        foreach (var (provider, s, err) in sections)
+        void AddRows(Snapshot? s, Func<Account, Job?> job)
         {
-            if (labelled && (s is { Accounts.Count: > 0 } || err != null)) _list.Controls.Add(SectionLabel(ProviderCli.Title(provider)));
-            if (err != null) _list.Controls.Add(Message("Couldn't refresh · " + err));
             foreach (var a in (s?.Accounts ?? []).OrderByDescending(a => a.Active).ThenBy(a => a.Number))
             {
-                var row = new AccountRow(a, now, projects?.Where(m => m.Matches(a)).ToList());
+                var row = new AccountRow(a, now, projects?.Where(m => m.Matches(a)).ToList(), job(a));
                 row.SwitchClicked += x => SwitchRequested?.Invoke(x);
                 row.TerminalClicked += x => TerminalRequested?.Invoke(x);
                 row.MenuAction += (x, act) => AccountAction?.Invoke(x, act);
@@ -210,7 +226,22 @@ public sealed class DashboardForm : Form
                 _list.Controls.Add(row);
             }
         }
-        var any = sections.Any(x => x.Snap is { Accounts.Count: > 0 });
+
+        if (snap is { Accounts.Count: > 0 } || error != null) _list.Controls.Add(SectionLabel("Team"));
+        if (error != null) _list.Controls.Add(Message("Couldn't refresh · " + error));
+        AddRows(snap, a => jobs?.TryGetValue(AccountPicker.Key(a), out var j) == true ? j : null);
+        if (visitors.Count > 0)
+        {
+            _list.Controls.Add(VisitorsLabel(visitors.Select(v => v.Provider)));
+            if (_visitorsOpen)
+                foreach (var (provider, s, err) in visitors)
+                {
+                    _list.Controls.Add(SectionLabel(ProviderCli.Title(provider)));
+                    if (err != null) _list.Controls.Add(Message("Couldn't refresh · " + err));
+                    AddRows(s, _ => null);
+                }
+        }
+        var any = snap is { Accounts.Count: > 0 } || visitors.Any(v => v.Snap is { Accounts.Count: > 0 });
         if (!any && snap == null && error == null)
             _list.Controls.Add(Message("Loading…"));
         else if (!any && error == null)
@@ -224,6 +255,14 @@ public sealed class DashboardForm : Form
         FitHeight();
     }
 
+    /// Opens or closes the Visitors (Codex, Grok) rows and redraws.
+    internal void SetVisitorsOpen(bool open)
+    {
+        if (_visitorsOpen == open) return;
+        _visitorsOpen = open;
+        Render(_last.Snap, _last.Error, _last.Others, _last.Projects, _last.Jobs);
+    }
+
     void ToggleRow(AccountRow row)
     {
         var open = !row.Expanded;
@@ -234,7 +273,7 @@ public sealed class DashboardForm : Form
 
     static string Key(Account a) => a.Provider + ":" + a.Email;
 
-    /// Small muted caps above a provider's rows; only drawn when several providers have accounts.
+    /// Small muted caps above a group of rows: Team, then the visitors' providers once they are opened.
     static Label SectionLabel(string title) => new()
     {
         Text = title.ToUpperInvariant(),
@@ -244,6 +283,16 @@ public sealed class DashboardForm : Form
         AutoSize = true,
         Margin = new Padding(Ui.S(12), Ui.S(8), 0, Ui.S(2)),
     };
+
+    /// The visitors' one row: who they are, closed until clicked (Codex and Grok only show usage and switch by hand).
+    Label VisitorsLabel(IEnumerable<string> providers)
+    {
+        var label = SectionLabel((_visitorsOpen ? "– " : "+ ") + "Visitors · " + string.Join(" · ", providers.Select(ProviderCli.Title)));
+        label.ForeColor = Palette.Current.Muted;
+        label.Cursor = Cursors.Hand;
+        label.Click += (_, _) => BeginInvoke(() => SetVisitorsOpen(!_visitorsOpen)); // after the click: this label is gone once it redraws
+        return label;
+    }
 
     Label Message(string text) => new()
     {

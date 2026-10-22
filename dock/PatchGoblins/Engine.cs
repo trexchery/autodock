@@ -35,6 +35,13 @@ public sealed partial class Engine(string exe)
             .Select(d => Path.Combine(d.Trim('"'), file))
             .FirstOrDefault(File.Exists);
 
+    /// On PATH, else where Windows puts it (a tray started with a cut-down PATH still finds it).
+    internal static string? FindProgram(string file, params string[] knownDirs) =>
+        FindOnPath(file) ?? knownDirs.Select(d => Path.Combine(d, file)).FirstOrDefault(File.Exists);
+
+    /// Where Windows keeps app-execution aliases such as wt.exe.
+    static string WindowsApps => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps");
+
     /// Absolute, so cmd is never resolved through the current directory or PATH.
     internal static string Cmd => Path.Combine(Environment.SystemDirectory, "cmd.exe");
 
@@ -162,34 +169,38 @@ public sealed partial class Engine(string exe)
     }
 
     /// Opens a visible console running the engine with `args` (e.g. `run 2`).
-    /// Windows Terminal when installed, plain conhost otherwise.
+    /// Windows Terminal when installed, plain conhost otherwise; inside it PowerShell 7, else Windows PowerShell, else cmd.
     public void LaunchConsole(string title, string? workDir, params string[] args) => LaunchConsoleWith(Exe, title, workDir, args);
 
+    /// The same, with `env` set for the console and everything it runs.
+    public void LaunchConsole(string title, string? workDir, IReadOnlyDictionary<string, string> env, params string[] args) => LaunchConsoleWith(Exe, title, workDir, args, env);
+
     /// Same console, running `exe` (e.g. the provider's own CLI) instead of the engine.
-    public static void LaunchConsoleWith(string Exe, string title, string? workDir, params string[] args)
+    public static void LaunchConsoleWith(string Exe, string title, string? workDir, params string[] args) => LaunchConsoleWith(Exe, title, workDir, args, null);
+
+    public static void LaunchConsoleWith(string Exe, string title, string? workDir, string[] args, IReadOnlyDictionary<string, string>? env)
     {
-        var cmdline = string.Join(' ', new[] { Exe }.Concat(args).Select(QuoteArg));
-        var wt = FindOnPath("wt.exe");
+        var wt = FindProgram("wt.exe", WindowsApps);
+        var shell = Shell;
         var psi = wt != null
             ? new ProcessStartInfo(wt) { UseShellExecute = false }
-            : new ProcessStartInfo(Cmd) { UseShellExecute = false, CreateNoWindow = false };
+            : new ProcessStartInfo(shell) { UseShellExecute = false, CreateNoWindow = false };
+        var shellArgs = ShellArgs(shell, wt == null ? title : null, Exe, args);
         if (wt != null)
         {
-            // One argv item per token: wt re-joins them for cmd.exe, quoting only
-            // what needs it. wt may hand the tab to an already-running Terminal process, which
+            // One argv item per token: wt re-joins them for the shell, quoting only what needs it (which is why
+            // no token ever holds a `"`). wt may hand the tab to an already-running Terminal process, which
             // ignores our WorkingDirectory: pass it explicitly.
-            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", Cmd, "/k", Exe }.Concat(args))
+            foreach (var a in new[] { "-w", "new", "-d", workDir ?? StoreSecurity.UserProfile, "--title", title, "--suppressApplicationTitle", shell }.Concat(shellArgs))
                 psi.ArgumentList.Add(a.Replace(";", "\\;")); // wt splits subcommands on a bare ';'
         }
-        else
-        {
-            var safeTitle = new string(title.Where(c => "\"&|<>^%".IndexOf(c) < 0).ToArray());
-            psi.Arguments = $"/k \"title {safeTitle} && {cmdline}\"";
-        }
+        else if (shell == Cmd) psi.Arguments = $"{shellArgs[0]} \"{shellArgs[1]}\""; // cmd's own quoting: `/k "title … && …"`
+        else foreach (var a in shellArgs) psi.ArgumentList.Add(a);
         psi.WorkingDirectory = workDir ?? StoreSecurity.UserProfile;
         // A new terminal is a top-level session, even when Patch Goblins itself was started from inside one.
         TopLevel(psi.Environment, FreshEnvironment);
         psi.Environment["NoDefaultCurrentDirectoryInExePath"] = "1";
+        foreach (var (k, v) in env ?? new Dictionary<string, string>()) psi.Environment[k] = v;
         Process.Start(psi)?.Dispose();
     }
 
@@ -253,6 +264,33 @@ public sealed partial class Engine(string exe)
 
     internal static string QuoteArg(string a) =>
         a.Length > 0 && a.IndexOfAny([' ', '\t', '"', '&', '|', '<', '>', '^']) < 0 ? a : "\"" + a.Replace("\"", "\\\"") + "\"";
+
+    /// The shell a console runs: PowerShell 7 where installed, else Windows PowerShell (always there), else cmd.
+    internal static string Shell =>
+        FindProgram("pwsh.exe", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PowerShell", "7"), WindowsApps) ?? (File.Exists(WindowsPowerShell) ? WindowsPowerShell : Cmd);
+
+    static string WindowsPowerShell => Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+
+    /// The shell's arguments that run `exe args` and keep the window open afterwards (`-NoExit`, `/k`); `title`
+    /// is set by the shell only where given (conhost: Windows Terminal titles the tab itself). PowerShell gets one
+    /// `-Command` script, every argument single-quoted (`%`, `^` and `&` mean nothing there); cmd gets CRT quoting.
+    internal static string[] ShellArgs(string shell, string? title, string exe, IEnumerable<string> args)
+    {
+        if (shell == Cmd)
+        {
+            if (title == null) return ["/k", exe, .. args];
+            var safeTitle = new string(title.Where(c => "\"&|<>^%".IndexOf(c) < 0).ToArray());
+            return ["/k", $"title {safeTitle} && {string.Join(' ', new[] { exe }.Concat(args).Select(QuoteArg))}"];
+        }
+        var script = "& " + string.Join(' ', new[] { exe }.Concat(args).Select(PsQuote));
+        if (title != null) script = $"$Host.UI.RawUI.WindowTitle = {PsQuote(title)}; " + script;
+        return ["-NoLogo", "-NoExit", "-Command", script];
+    }
+
+    /// A PowerShell literal: single-quoted, so only `'` is special. A `"` is spliced in as `[char]34` instead, so the
+    /// script never holds one (Windows Terminal re-quotes argv with `"` and cannot carry it).
+    internal static string PsQuote(string a) =>
+        a.Contains('"') ? "(" + string.Join("+[char]34+", a.Split('"').Select(PsQuote)) + ")" : "'" + a.Replace("'", "''") + "'";
 
     static string? LastLine(string s) =>
         s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault();

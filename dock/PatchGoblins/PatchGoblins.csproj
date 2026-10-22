@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="dock.ico" LogicalName="dock.ico" />
+    <EmbeddedResource Include="Agents\mascot.js" LogicalName="mascot.js" />
     <InternalsVisibleTo Include="PatchGoblins.Tests" />
   </ItemGroup>
 

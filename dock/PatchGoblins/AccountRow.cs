@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace PatchGoblins;
 
-/// One account as a slim row: name, one meta line, two hairline meters.
+/// One account as a slim row: name, one meta line, two hairline meters, and (for a goblin on the team) its job line.
 /// Clicking expands it (animated) to show every window, reset times and actions.
 public sealed class AccountRow : Control
 {
@@ -18,6 +18,7 @@ public sealed class AccountRow : Control
     readonly DateTimeOffset _now;
     readonly List<(string Label, Window W, string? Extra)> _windows = [];
     readonly string? _note;
+    readonly Job? _job; // null: a visitor (Codex, Grok), or nothing to say
     readonly IReadOnlyList<ProjectMapping> _projects;
     readonly string? _projectsLine; // only when every leaf name fits on one line; the context menu always lists them
     readonly ToolTip _tip = new();
@@ -31,13 +32,14 @@ public sealed class AccountRow : Control
     public Account Account => _a;
     public bool Expanded => _target > 0.5f;
 
-    static int Collapsed => Ui.S(52);
+    int Collapsed => Ui.S(_job != null ? 68 : 52);
 
-    public AccountRow(Account a, DateTimeOffset now, IReadOnlyList<ProjectMapping>? projects = null)
+    public AccountRow(Account a, DateTimeOffset now, IReadOnlyList<ProjectMapping>? projects = null, Job? job = null)
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         _a = a;
         _now = now;
+        _job = job;
         Width = Ui.S(BaseWidth);
         Height = Collapsed;
         Margin = new Padding(0, 0, 0, Ui.S(2));
@@ -185,9 +187,9 @@ public sealed class AccountRow : Control
             g.FillPath(bg, path);
         }
 
-        // Identity: active dot, name, meta line.
+        // Identity: name, meta line, and the job line with its dot. A visitor has no job, so its active dot stays on the name.
         int x = pad + Ui.S(14);
-        if (_a.Active)
+        if (_a.Active && _job == null)
         {
             using var dot = new SolidBrush(pal.Live);
             float d = Ui.S(6);
@@ -196,8 +198,18 @@ public sealed class AccountRow : Control
         var nameWidth = Width - x - Ui.S(150);
         var name = string.IsNullOrEmpty(_a.Alias) ? _a.Email : _a.Alias;
         var flags = TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine;
-        TextRenderer.DrawText(g, name, NameFont, new Rectangle(x, Ui.S(9), nameWidth, NameFont.Height), _a.Disabled ? pal.Muted : pal.Text, flags);
-        TextRenderer.DrawText(g, Meta(), MetaFont, new Rectangle(x, Ui.S(28), nameWidth, MetaFont.Height), pal.Muted, flags);
+        int nameY = Ui.S(_job != null ? 8 : 9), metaY = Ui.S(_job != null ? 25 : 28);
+        var dim = _a.Disabled || _a.Provider != "claude"; // visitors read quieter than the team
+        TextRenderer.DrawText(g, name, NameFont, new Rectangle(x, nameY, nameWidth, NameFont.Height), dim ? pal.Muted : pal.Text, flags);
+        TextRenderer.DrawText(g, Meta(), MetaFont, new Rectangle(x, metaY, nameWidth, MetaFont.Height), pal.Muted, flags);
+        if (_job is { } job)
+        {
+            using var dot = new SolidBrush(job.Kind switch { JobKind.Working or JobKind.Yours => pal.Live, JobKind.Resting => Palette.Warn, _ => pal.Faint });
+            float d = Ui.S(6);
+            g.FillEllipse(dot, pad, Ui.S(46) + (MetaFont.Height - d) / 2f, d, d);
+            TextRenderer.DrawText(g, job.Text, MetaFont, new Rectangle(x, Ui.S(46), right - x, MetaFont.Height),
+                job.Kind == JobKind.Working ? pal.Text : pal.Muted, flags);
+        }
 
         // Hairline meters on the right for the windows this account has (Codex Team: weekly only,
         // Grok: one weekly or monthly pool). No usage yet: two empty placeholders.
@@ -279,7 +291,7 @@ public sealed class AccountRow : Control
         var hot = _hot == action;
         if (primary)
         {
-            using var b = new SolidBrush(Color.FromArgb(hot ? 220 : 255, pal.Text));
+            using var b = new SolidBrush(Color.FromArgb(hot ? 220 : 255, pal.Live));
             g.FillPath(b, path);
         }
         else

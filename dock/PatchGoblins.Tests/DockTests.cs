@@ -193,6 +193,64 @@ public class FormatTests
         Assert.Equal("run", Engine.QuoteArg("run"));
         Assert.Equal("\"C:\\Program Files\\x\\cswap.exe\"", Engine.QuoteArg(@"C:\Program Files\x\cswap.exe"));
         Assert.Equal("\"a&b\"", Engine.QuoteArg("a&b"));
+        Assert.Equal("'run'", Engine.PsQuote("run"));
+        Assert.Equal("'it''s $x `n %PATH% & more'", Engine.PsQuote("it's $x `n %PATH% & more"));
+        Assert.Equal("('say '+[char]34+'hi'+[char]34+'')", Engine.PsQuote("say \"hi\"")); // never a `"` in the script
+    }
+
+    [Fact]
+    public void FindProgramFallsBackToKnownDirectories()
+    {
+        using var t = new TempDir();
+        var exe = Path.Combine(t.Path, "pg-nowhere-on-path.exe");
+        File.WriteAllText(exe, "");
+        Assert.Equal(exe, Engine.FindProgram("pg-nowhere-on-path.exe", Path.Combine(t.Path, "missing"), t.Path));
+        Assert.Null(Engine.FindProgram("pg-nowhere-on-path.exe", Path.Combine(t.Path, "missing")));
+    }
+
+    [Fact]
+    public void TheConsoleShellIsPowerShellWithCmdAsTheFallback()
+    {
+        Assert.Equal(["-NoLogo", "-NoExit", "-Command", @"& 'C:\Program Files\x\cswap.exe' 'run' '3' '--' '--resume' 'sid' 'it''s'"],
+            Engine.ShellArgs(@"C:\Program Files\PowerShell\7\pwsh.exe", null, @"C:\Program Files\x\cswap.exe", ["run", "3", "--", "--resume", "sid", "it's"]));
+        Assert.Equal(["-NoLogo", "-NoExit", "-Command", @"$Host.UI.RawUI.WindowTitle = 'Claude · a'; & 'C:\x\cswap.exe' 'run'"],
+            Engine.ShellArgs(@"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "Claude · a", @"C:\x\cswap.exe", ["run"]));
+        Assert.Equal(["/k", @"C:\x\cswap.exe", "run", "a&b"], Engine.ShellArgs(Engine.Cmd, null, @"C:\x\cswap.exe", ["run", "a&b"]));
+        Assert.Equal(["/k", @"title Claude  a && C:\x\cswap.exe run ""a&b"""], Engine.ShellArgs(Engine.Cmd, "Claude & a", @"C:\x\cswap.exe", ["run", "a&b"]));
+        Assert.True(Engine.Shell.EndsWith("pwsh.exe", StringComparison.OrdinalIgnoreCase) || Engine.Shell.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// Every argument reaches the program as typed, through the shell's `-Command` script (the conhost form, with its title).
+    [Fact]
+    public void ThePowerShellConsoleHandsArgumentsOverVerbatim()
+    {
+        var python = Engine.FindOnPath("python.exe");
+        if (python == null) return; // the probe
+        string[] args = ["-I", "-c", "import sys,json;print(json.dumps(sys.argv[1:]))", "run", "--", "it's \"quoted\"", "50% & more; `x` $y", "a b", "Ünïcödé · dot"];
+        var shellArgs = Engine.ShellArgs(Engine.Shell, "Claude · test", python, args);
+        var psi = new System.Diagnostics.ProcessStartInfo(Engine.Shell) { UseShellExecute = false, RedirectStandardOutput = true, StandardOutputEncoding = System.Text.Encoding.UTF8 };
+        foreach (var a in shellArgs.Where(a => a != "-NoExit")) psi.ArgumentList.Add(a);
+        psi.Environment["PYTHONIOENCODING"] = "utf-8";
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        var line = p.StandardOutput.ReadToEnd().Trim();
+        p.WaitForExit();
+        Assert.Equal(args[3..], JsonSerializer.Deserialize<string[]>(line)!);
+    }
+
+    /// Opt in with PATCH_GOBLINS_LAUNCH_SMOKE=<folder>: a real console opens (Windows Terminal where installed) exactly as
+    /// the tray opens one, and the program inside writes what it received into that folder.
+    [Fact]
+    public void ARealConsoleLaunchCarriesEveryArgument()
+    {
+        var python = Engine.FindOnPath("python.exe");
+        if (Environment.GetEnvironmentVariable("PATCH_GOBLINS_LAUNCH_SMOKE") is not { Length: > 0 } dir || python == null) return;
+        var file = Path.Combine(dir, "launch-smoke.json");
+        File.Delete(file);
+        string[] args = ["run", "--", "it's \"quoted\"", "50% & more; `x` $y", "a b", "Ünïcödé · dot"];
+        Engine.LaunchConsoleWith(python, "Claude · smoke; test", dir,
+            ["-I", "-c", "import sys,json;open(sys.argv[1],'w',encoding='utf-8').write(json.dumps(sys.argv[2:]))", file, .. args]);
+        for (var i = 0; i < 100 && !File.Exists(file); i++) Thread.Sleep(100);
+        Assert.Equal(args, JsonSerializer.Deserialize<string[]>(File.ReadAllText(file))!);
     }
 }
 
@@ -623,34 +681,62 @@ public class RenderTests
             new Account(3, "side@example.com", false, "token_expired", null,
                 LastGoodUsage: new Usage(W(5, 4), W(12, 90), null, null), Disabled: true),
         ]);
+        var jobs = new Dictionary<string, Job>
+        {
+            ["personal@example.com|"] = new(JobKind.Working, "#42 fix login · reviewing"),
+            ["work@example.com|"] = new(JobKind.Yours, "yours · signed in"),
+            ["side@example.com|"] = new(JobKind.Idle, "sitting out"),
+        };
         Exception? failure = null;
         var t = new Thread(() =>
         {
             try
             {
                 using var form = new DashboardForm();
-                form.Render(snap, null);
+                form.Render(snap, null, null, null, jobs);
+                form.SetStatus("12:00");
+                Assert.Equal("", form.StatusText); // a refresh time is not news: the header says nothing until the team does
+                form.SetTeam("1 working · 1 resting");
+                Assert.Equal("1 working · 1 resting", form.StatusText);
+                form.SetStatus(DashboardForm.Updating);
+                Assert.Equal("1 working · 1 resting", form.StatusText);
+                form.SetStatus(DashboardForm.Offline);
+                Assert.Equal("offline", form.StatusText);
                 form.SetStatus("12:00");
                 form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
                 form.Show();
                 Application.DoEvents();
                 using var bmp = new Bitmap(form.Width, form.Height);
                 form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                Assert.InRange(form.Height, Ui.S(200), Ui.S(320)); // three slim rows, not cards
+                Assert.InRange(form.Height, Ui.S(200), Ui.S(360)); // three slim rows, not cards
+                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(68), r.Height)); // each goblin's job line makes its row a line taller
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
-                Assert.Empty(SectionLabels(form)); // one provider: no section labels
+                Assert.Equal(["TEAM"], SectionLabels(form)); // no visitors: just the team
+
+                form.Render(snap, null);
+                Application.DoEvents();
+                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(52), r.Height)); // no job to show: the slim row
 
                 var codex = new Snapshot(1, 1, [new Account(1, "dev@example.com", true, "ok", new Usage(W(40, 3), W(10, 90), null, null)) { Provider = "codex" }]);
-                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")]);
+                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")], null, jobs);
                 Application.DoEvents();
-                Assert.Equal(["CLAUDE", "CODEX", "GROK"], SectionLabels(form));
-                Assert.InRange(form.Height, Ui.S(260), Ui.S(460));
+                Assert.Equal(["TEAM", "+ VISITORS · CODEX · GROK"], SectionLabels(form)); // visitors stay closed until clicked
+                Assert.Empty(FindRows(form).Where(r => r.Account.Provider != "claude"));
+                var closedHeight = form.Height;
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_PROVIDERS_OUT") is { Length: > 0 } pOut)
                 {
+                    form.Shimmer(-1); // the Agents button's glint sweeps for the first moments: a still frame
                     using var pb = new Bitmap(form.Width, form.Height);
                     form.DrawToBitmap(pb, new Rectangle(0, 0, form.Width, form.Height));
                     pb.Save(pOut);
                 }
+                form.SetVisitorsOpen(true);
+                Application.DoEvents();
+                Assert.Equal(["TEAM", "– VISITORS · CODEX · GROK", "CODEX", "GROK"], SectionLabels(form));
+                Assert.Equal(["dev@example.com"], FindRows(form).Where(r => r.Account.Provider != "claude").Select(r => r.Account.Email));
+                Assert.True(form.Height > closedHeight);
+                Assert.InRange(form.Height, Ui.S(300), Ui.S(560));
+                form.SetVisitorsOpen(false);
                 form.Render(snap, null);
                 Application.DoEvents();
 
@@ -670,6 +756,8 @@ public class RenderTests
                 settings.Show();
                 Application.DoEvents();
                 Assert.True(settings.Width > 300 && settings.Height > 200);
+                // The same three names as the tray menu and the flyout, in the same order.
+                Assert.Equal(["TEAM", "WORK", "UPKEEP"], settings.Controls.OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP"));
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
                 {
                     using var sb = new Bitmap(settings.Width, settings.Height);

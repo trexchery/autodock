@@ -68,15 +68,12 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
         _dash.SettingsRequested += () => _ = ShowSettingsAsync();
         _dash.AddRequested += PickProviderToAdd;
-        _dash.AutoToggled += on => SetAutoSwitch(on);
         _dash.VisibleChanged += (_, _) => { if (!_dash.Visible) _dashHiddenAt = DateTime.UtcNow; };
-        _dash.SetAuto(_settings.AutoSwitch);
         _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
         _dash.Moved += SavePinnedPosition;
-        _dash.GeneralRequested += OpenGeneral;
         _dash.AgentsRequested += (anchor, menu) => { if (menu) ShowAgentsMenu(anchor); else LaunchAgents(); };
 
-        HardenStores();
+        _ = Task.Run(HardenStores); // the first run after a move re-permissions every file under the data folder (worktrees too): minutes, never on the UI thread
         if (AgentStore.HasWork(AgentStore.DefaultRoot)) EnsureAgents(); // authorized earlier: open terminals link up, other runs stop
         _timer.Interval = TimerMs;
         _timer.Tick += (_, _) => _ = TickAsync(runAuto: true);
@@ -99,7 +96,7 @@ public sealed partial class TrayApp : ApplicationContext
         foreach (var dir in new[] { StoreSecurity.BackupRoot, DockSettings.Dir })
         {
             try { if (!Directory.Exists(dir) || !StoreSecurity.IsHardened(dir)) StoreSecurity.Harden(dir); }
-            catch (Exception e) { Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning); }
+            catch (Exception e) { _ui.Post(_ => Notify("Could not restrict folder permissions", $"{dir}: {e.Message}", ToolTipIcon.Warning), null); }
         }
         ClaudeCli.PurgeEnrollLeftovers(ClaudeCli.EnrollRoot);
     }
@@ -136,7 +133,7 @@ public sealed partial class TrayApp : ApplicationContext
             return;
         }
         _busy = true;
-        _dash.SetStatus("updating…");
+        _dash.SetStatus(DashboardForm.Updating);
         var fresh = new List<(string Provider, Snapshot Snap)>(); // this pass's readings only; a failed poll never feeds the quota alerts
         try
         {
@@ -163,7 +160,7 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e)
         {
             _error = Engine.Redact(e.Message);
-            _dash.SetStatus("offline");
+            _dash.SetStatus(DashboardForm.Offline);
         }
         try { await PollProvidersAsync(refresh, fresh); }
         finally
@@ -294,8 +291,28 @@ public sealed partial class TrayApp : ApplicationContext
         }
     }
 
-    void RenderDash() =>
-        _dash.Render(_snap, _error, ProviderCli.All.Where(_others.ContainsKey).Select(p => (p, _others[p].Snap, _others[p].Error)).ToList(), ProjectMap.Load());
+    Dictionary<string, Job> _jobs = [];
+    HashSet<int> _live = [];
+
+    void RenderDash()
+    {
+        _jobs = TeamJobs();
+        _dash.SetTeam(Jobs.Summary(_jobs.Values, _agents?.Repos ?? []));
+        _dash.Render(_snap, _error, ProviderCli.All.Where(_others.ContainsKey).Select(p => (p, _others[p].Snap, _others[p].Error)).ToList(), ProjectMap.Load(), _jobs);
+    }
+
+    /// What each Claude account is doing: an agent run, the owner's own use, rest, or nothing.
+    Dictionary<string, Job> TeamJobs() =>
+        _snap is { } s ? Jobs.For(s.Accounts, _agents?.Repos ?? [], _live, Threshold, DateTimeOffset.Now, a => _agents?.CooledUntil(a)) : [];
+
+    /// The agents moved between ticks: the header's line follows at once, and the flyout is redrawn only if a job line changed.
+    void RefreshTeam()
+    {
+        _dash.SetTeam(Jobs.Summary(_jobs.Values, _agents?.Repos ?? []));
+        var jobs = TeamJobs();
+        if (jobs.Count == _jobs.Count && jobs.All(kv => _jobs.TryGetValue(kv.Key, out var j) && j == kv.Value)) return;
+        RenderDash();
+    }
 
     /// "+" with several CLIs installed: a small themed menu picks which provider to add.
     void PickProviderToAdd()
@@ -644,6 +661,8 @@ public sealed partial class TrayApp : ApplicationContext
     {
         _menu.Items.Clear();
         _menu.Items.Add("Open dashboard", null, (_, _) => ShowDashboard());
+
+        MenuHeader("Team");
         var sw = new ToolStripMenuItem("Switch to");
         foreach (var a in _snap?.Accounts ?? [])
         {
@@ -651,10 +670,19 @@ public sealed partial class TrayApp : ApplicationContext
             sw.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) => _ = SwitchAsync(a)) { Checked = a.Active, Enabled = !a.Active });
         }
         sw.Enabled = sw.DropDownItems.Count > 0;
-        // The folder's assigned account if it has one, else the default login: the dashboard's Terminal path.
-        var term = new ToolStripMenuItem("Open terminal", null, (_, _) => OpenFolderTerminal());
         _menu.Items.Add(sw);
-        _menu.Items.Add(term);
+        _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
+
+        MenuHeader("Work");
+        _menu.Items.Add("New agent", null, (_, _) => OpenNewAgent());
+        if (_agents?.Repos.Count > 0)
+        {
+            var agents = new ToolStripMenuItem("Agents");
+            AddAgentItems(agents.DropDownItems);
+            _menu.Items.Add(agents);
+        }
+        // The folder's assigned account if it has one, else the default login: the dashboard's Terminal path.
+        _menu.Items.Add("Open terminal", null, (_, _) => OpenFolderTerminal());
         var proj = new ToolStripMenuItem("Project terminals");
         foreach (var m in ProjectMap.Load())
             proj.DropDownItems.Add(new ToolStripMenuItem($"{m.Leaf} · {m.Email}", null, (_, _) => OpenProjectTerminal(m)) { ToolTipText = m.Folder });
@@ -665,20 +693,23 @@ public sealed partial class TrayApp : ApplicationContext
                 cont.DropDownItems.Add($"{ProviderCli.Title(src)} → {ProviderCli.Title(t)}…", null, (_, _) => _ = ContinueAsync(src, t));
         cont.Enabled = cont.HasDropDownItems;
         _menu.Items.Add(cont);
-        if (_agents?.Repos.Count > 0)
-        {
-            var agents = new ToolStripMenuItem("Agents");
-            AddAgentItems(agents.DropDownItems);
-            _menu.Items.Add(agents);
-        }
+
+        MenuHeader("Upkeep");
         _menu.Items.Add(new ToolStripMenuItem("Auto-switch near limit", null, (_, _) => SetAutoSwitch(!_settings.AutoSwitch)) { Checked = _settings.AutoSwitch });
         if (_settings.AutoPrime && _snap != null) AddPrimeItems(_snap.Accounts);
-        _menu.Items.Add("Add account…", null, (_, _) => _ = EnrollAsync(null));
+
+        _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Refresh now", null, (_, _) => _ = TickAsync(runAuto: false, refresh: true));
         _menu.Items.Add("Settings…", null, (_, _) => _ = ShowSettingsAsync());
-        _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => _ = ExitAsync());
         MenuRenderer.Apply(_menu);
+    }
+
+    /// A quiet group name between separators: the same Team / Work / Upkeep as the settings.
+    void MenuHeader(string title)
+    {
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem(title.ToUpperInvariant()) { Enabled = false, Font = Ui.Font(7.5f, semibold: true) });
     }
 
     Primer? _primer;
@@ -802,12 +833,13 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e) { Error("Could not open terminal", e); }
     }
 
-    void OpenGeneral()
+    /// A plain Claude session on the default login in the general folder (the Agents button's menu, and Work in the tray menu).
+    void OpenNewAgent()
     {
         try
         {
             Directory.CreateDirectory(Launch.GeneralFolder);
-            _engine.LaunchConsole("Claude · general", Launch.GeneralFolder, Launch.Run(null, _settings.PreserveRemoteControl));
+            _engine.LaunchConsole("Claude · new agent", Launch.GeneralFolder, Launch.Run(null, _settings.PreserveRemoteControl));
         }
         catch (Exception e) { Error("Could not open terminal", e); }
     }
@@ -978,13 +1010,12 @@ public sealed partial class TrayApp : ApplicationContext
                 "• Polling is conservative: the engine spaces out usage checks per account.\n\n" +
                 "Patch Goblins is an independent project, not affiliated with or endorsed by Anthropic.\n\nEnable auto-switch?",
                 "Patch Goblins — auto-switch", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes;
-            if (!ok) { _dash.SetAuto(false); return; }
+            if (!ok) return;
             _settings.AutoSwitchPolicyAccepted = true;
         }
         _settings.AutoSwitch = on;
         _settings.Save();
         _timer.Interval = TimerMs;
-        _dash.SetAuto(on);
         _ = TickAsync(runAuto: true);
     }
 
@@ -1000,6 +1031,7 @@ public sealed partial class TrayApp : ApplicationContext
             f.Models.Text = cfg.GetValueOrDefault("autoswitch.model") ?? "";
         }
         catch (Exception e) { Error("Could not read engine settings", e); return; }
+        f.AutoSwitch.Checked = _settings.AutoSwitch;
         f.RefreshInterval.Value = _settings.RefreshSeconds;
         f.Startup.Checked = Startup.IsEnabled();
         f.PreserveRc.Checked = _settings.PreserveRemoteControl;
@@ -1037,6 +1069,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.Save();
             _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = TimerMs;
+            if (f.AutoSwitch.Checked != _settings.AutoSwitch) SetAutoSwitch(f.AutoSwitch.Checked); // asks for the owner's yes first when switching on
         }
         catch (Exception e) { Error("Could not save settings", e); }
     }

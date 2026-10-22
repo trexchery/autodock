@@ -274,7 +274,8 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         await _loop.Run(() => { _sup!.UpdateAccounts(Accounts, []); return 0; });
         await Until(r => Item(r, 40).State == ItemState.Open, "work resumes once an account has usage again");
-        Assert.Contains(_notes, n => n.StartsWith("Agents resumed"));
+        // The note goes out at the end of the pass that launched the work, so it can trail the item opening.
+        await AgentProcessTests.WaitUntil(() => _notes.Any(n => n.StartsWith("Agents resumed")));
         _sup!.Dispose();
     }
 

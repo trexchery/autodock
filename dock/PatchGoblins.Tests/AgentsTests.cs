@@ -963,7 +963,7 @@ public class AgentsTerminalTests
         Assert.Equal(2, lines.Length);
         Assert.Equal("mine:{\"ses", lines[0]);
         Assert.Contains("\u001b[38;2;", lines[1]);
-        Assert.Equal(AgentsTerminal.Label, System.Text.RegularExpressions.Regex.Replace(lines[1], "\u001b\\[[0-9;]*m", ""));
+        Assert.Equal(AgentsTerminal.Status, System.Text.RegularExpressions.Regex.Replace(lines[1], "\u001b\\[[0-9;]*m", ""));
 
         // Nothing happened in the conversation since: the owner's command is not run again.
         var again = RunStatusLine(bash, script, json).Split('\n');
@@ -972,16 +972,17 @@ public class AgentsTerminalTests
 
         // Every state keeps the gradient across the whole line, the state word included.
         string Plain(string s) => System.Text.RegularExpressions.Regex.Replace(s, "\u001b\\[[0-9;]*m", "").TrimEnd('\n').Split('\n')[^1];
-        foreach (var (state, shown) in new[] { ("working", " · working"), ("attention", " · needs you"), ("paused", " · paused"), ("off", " · off"), ("on", "") })
+        foreach (var (state, shown) in new[] { ("working", ""), ("attention", " · needs you"), ("paused", " · paused"), ("off", " · off"), ("on", "") })
         {
             File.WriteAllText(F("state"), state + "\n");
             var line = RunStatusLine(bash, script, json).TrimEnd('\n').Split('\n')[^1];
-            // A gradient: many distinct colors across the label, not one grey.
+            // A gradient: many distinct colors across the label, not one grey. The wave's flat stretches round to the same
+            // color, so which frame the clock lands on costs a letter or two: half the letters is what every frame keeps.
             var colors = System.Text.RegularExpressions.Regex.Matches(line, "\u001b\\[38;2;([0-9;]+)m").Select(m => m.Groups[1].Value).ToList();
-            Assert.True(colors.Distinct().Count() >= 8, line);
+            Assert.True(colors.Distinct().Count() >= colors.Count / 2, line);
             Assert.All(colors.Where(c => c != "128;128;128"), c => Assert.Contains(c, AgentsTerminal.Palette())); // the dots stay neutral, the rest is the wheel
-            Assert.Equal((AgentsTerminal.Label + shown).Count(ch => ch is not (' ' or '·')), colors.Count(c => c != "128;128;128")); // every letter colored
-            Assert.Equal(AgentsTerminal.Label + shown, Plain(line));
+            Assert.Equal((AgentsTerminal.Status + shown).Count(ch => ch is not (' ' or '·')), colors.Count(c => c != "128;128;128")); // every letter colored
+            Assert.Equal(AgentsTerminal.Status + shown, Plain(line));
         }
         // Motion: the next refresh shows the same words in moved colors.
         var before = RunStatusLine(bash, script, json);
@@ -991,7 +992,7 @@ public class AgentsTerminalTests
         Assert.Equal(Plain(before), Plain(after));
 
         File.Delete(F("state")); // never opened by the tray yet: off
-        Assert.Equal(AgentsTerminal.Label + " · off", Plain(RunStatusLine(bash, script, json)));
+        Assert.Equal(AgentsTerminal.Status + " · off", Plain(RunStatusLine(bash, script, json)));
     }
 
     [Fact]

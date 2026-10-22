@@ -481,7 +481,10 @@ public class LimitWatchTests
     {
         Assert.True(ResumeStopped.TrayConsole(@"C:\WINDOWS\system32\cmd.exe /k C:\Apps\patch-goblins\engine\cswap.exe run 3 --restore-rc -- --resume sid"));
         Assert.True(ResumeStopped.TrayConsole(@"""C:\WINDOWS\system32\cmd.exe"" /k ""title Claude · a · moved && ""C:\Program Files\patch-goblins\engine\cswap.exe"" run 3"""));
+        Assert.True(ResumeStopped.TrayConsole(@"""C:\Program Files\PowerShell\7\pwsh.exe"" -NoLogo -NoExit -Command ""& 'C:\Apps\patch-goblins\engine\cswap.exe' 'run' '3' '--' '--resume' 'sid'"""));
+        Assert.True(ResumeStopped.TrayConsole(@"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoExit -Command ""$Host.UI.RawUI.WindowTitle = 'Claude · a'; & 'C:\Program Files\patch-goblins\engine\cswap.exe' 'run' '3'"""));
         Assert.False(ResumeStopped.TrayConsole(@"""C:\Program Files\PowerShell\7\pwsh.exe"" -NoLogo")); // the user's own shell
+        Assert.False(ResumeStopped.TrayConsole(@"pwsh.exe -NoExit -Command ""& 'cswap.exe' 'list'""")); // not a window running Claude
         Assert.False(ResumeStopped.TrayConsole(@"C:\WINDOWS\system32\cmd.exe")); // an interactive cmd tab
         Assert.False(ResumeStopped.TrayConsole(@"cmd.exe /c claude & npm test")); // a script running claude
         Assert.False(ResumeStopped.TrayConsole(null));
