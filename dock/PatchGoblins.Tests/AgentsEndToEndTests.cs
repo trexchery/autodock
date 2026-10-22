@@ -123,7 +123,7 @@ public sealed class AgentsEndToEndTests : IDisposable
         while (!await On(r => { try { return condition(r); } catch (InvalidOperationException) { return false; } }, repo))
         {
             if (DateTime.UtcNow > until)
-                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))))}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
+                throw new TimeoutException($"{what}; state: {await On(r => string.Join(", ", r.Items.Select(i => $"{i.Label}={i.State} ({i.Note})").Concat(r.Goals.Select(g => $"{g.Id}={g.State} plans={g.Plans} failures={g.Failures} ({g.Note})"))), repo)}\nlog:\n{Read(_log)}\ngh:\n{Read(Path.Combine(_gh, "gh.log"))}\npatch-goblins.log:\n{Read(Path.Combine(P("data"), "patch-goblins.log"))}");
             await Task.Delay(200);
         }
     }
@@ -1370,6 +1370,128 @@ public sealed class AgentsEndToEndTests : IDisposable
         var r = await hung.GhAsync(_repo, "-NoProfile", "-Command", "Start-Sleep 60");
         Assert.Equal(124, r.Code);
         Assert.Contains("timed out after 1 s", Read(Path.Combine(P("data"), "patch-goblins.log")));
+    }
+
+    /// The repository's own policy, merged on main as the owner would.
+    void CommitPolicy(string json)
+    {
+        File.WriteAllText(Path.Combine(_repo, PatchGoblins.Policy.FileName), json);
+        Git(_repo, "add", ".");
+        Git(_repo, "commit", "--quiet", "-m", "policy");
+        Git(_repo, "push", "--quiet", "origin", "main");
+    }
+
+    [Fact]
+    public async Task ASensitiveChangeGetsAnAdversarialReviewAndWaitsForTheOwnerEvenAcrossARestart()
+    {
+        CommitPolicy("""{"version":1,"sensitive":["deploy/**"],"checks":[{"run":"git --version","paths":["issue-*.txt"]},{"run":"exit 1","paths":["never/**"]},{"run":"exit 1","os":"linux"}]}""");
+        Issues("""[{"number":50,"title":"Deploy script","body":"[fake:touch=deploy/run.txt] Add it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        string? shown = null;
+        await _loop.Run(() => { _sup!.Authorize = (_, v, _) => { shown = v; return Task.FromResult(true); }; return 0; });
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        Assert.Equal("`git --version` when issue-*.txt change\n`exit 1` when never/** change\n`exit 1` (linux only)", shown); // the owner confirms the policy's checks
+
+        await Until(r => Item(r, 50) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the sensitive change waits for the owner");
+        Assert.DoesNotContain("patch-goblins/50", Git(_repo, "ls-remote", "origin"));
+        Assert.Contains("deploy/run.txt", await On(r => Item(r, 50).Note!));
+        Assert.Contains("--model opus --effort high", Runs.Single(r => r.Contains("NotebookEdit")));
+        var review = Read(_log + ".prompts").Split("---- account").Single(p => p.Contains("You are reviewing"));
+        Assert.Contains("Review them adversarially", review);
+        Assert.Contains("deploy/run.txt", review);
+
+        // Patch Goblins restarting changes nothing: still held, still not pushed.
+        await _loop.Run(() => { _sup!.Dispose(); return 0; });
+        await StartAsync();
+        await Task.Delay(3000);
+        Assert.Equal("sensitive", await On(r => Item(r, 50).HoldFor));
+        Assert.DoesNotContain("patch-goblins/50", Git(_repo, "ls-remote", "origin"));
+
+        await Tool("agents_queue", """{"action":"answer","item":"#50"}""");
+        await Until(r => Item(r, 50).State == ItemState.Open, "the owner's yes pushes it");
+        var body = Read(Path.Combine(_gh, "pr-body-7.md"));
+        Assert.Contains("passed: `git --version` at", body); // selected by the changed paths
+        Assert.Contains("not run here: `exit 1` needs linux", body); // covers the change, but proves nothing here
+        Assert.DoesNotContain("never/**", body);
+        Assert.Contains("pushed with the owner's approval", body);
+
+        // CI that only skipped proves nothing, and a head someone else pushed was never verified.
+        File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[{"name":"build","status":"COMPLETED","conclusion":"SKIPPED"}],"comments":[],"reviews":[],"headRefOid":"0123456789abcdef0123456789abcdef01234567"}""");
+        await Until(r => Item(r, 50).Verification?.LastOrDefault() == "CI skipped: no evidence", "the pull request's CI is judged");
+        Assert.Contains("(CI skipped: no evidence)", await Tool("agents_status", "{}"));
+        Assert.Contains("stale: the pull request's head is now 0123456", await Tool("agents_details", """{"item":"#50"}"""));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ACommitThatSkipsCiIsReworkedAndAnAskPolicyHoldsEveryPush()
+    {
+        CommitPolicy("""{"version":1,"push":"ask","deny":["Bash(ddc *)"]}""");
+        Issues("""[{"number":51,"title":"Quiet fix","body":"[fake:skipci] Fix it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+        await Until(r => Item(r, 51) is { State: ItemState.NeedsOwner, HoldFor: "push" }, "the push waits for the owner");
+        Assert.Contains("tells GitHub to skip CI", Read(_log + ".prompts"));
+        Assert.False(PatchGoblins.Policy.SkipsCi(Git(await On(r => Item(r, 51).Worktree!), "log", "--format=%B", "origin/main..HEAD")));
+        Assert.DoesNotContain("patch-goblins/51", Git(_repo, "ls-remote", "origin"));
+        Assert.All(Runs.Where(r => !r.Contains("NotebookEdit")), r => Assert.Contains("Bash(ddc *)", r));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AnUnreadablePolicyOrAMovedPinStopsTheStart()
+    {
+        await StartAsync();
+        var local = Path.Combine(P("data"), "policies", "repo.json"); // the owner's, outside the repository
+        Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+        File.WriteAllText(local, """{"version":2}""");
+        var refused = await Tool("agents_control", """{"action":"start"}""");
+        Assert.StartsWith("Nothing started:", refused);
+        Assert.Contains("policy version 2", refused);
+        File.WriteAllText(local, """{"version":1,"base":"main@0000000"}""");
+        refused = await Tool("agents_control", """{"action":"start"}""");
+        Assert.StartsWith("Nothing started: origin/main is at", refused);
+        Assert.Contains("not the pinned 0000000", refused);
+        Assert.False(await On(r => r?.Authorized ?? false));
+        File.WriteAllText(local, $$"""{"version":1,"base":"main@{{Git(_repo, "rev-parse", "origin/main")[..10]}}"}""");
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        _sup!.Dispose();
+    }
+
+    /// A dry run on a copy of a real repository (PATCH_GOBLINS_DRYRUN_REPO, e.g. an Easy Tile checkout): the doctor's
+    /// bootstrap turns its pull-request CI into the policy's checks, and an issue goes through work, those real checks,
+    /// review and a pull request. Its origin is a local bare copy and GitHub is the fake, so nothing reaches the real
+    /// repository; the checkout itself is only cloned. Skipped (passes) without the variable.
+    [Fact]
+    public async Task ADryRunOnACopyOfARealRepositoryVerifiesWithItsOwnCi()
+    {
+        if (Environment.GetEnvironmentVariable("PATCH_GOBLINS_DRYRUN_REPO") is not { Length: > 0 } source) return;
+        var head = Git(source, "rev-parse", "HEAD");
+        var status = Git(source, "status", "--porcelain");
+        var dry = P("dry");
+        Git(_tmp.Path, "clone", "--quiet", "--bare", "--no-local", source, dry + ".git");
+        Git(_tmp.Path, "clone", "--quiet", dry + ".git", dry);
+        Git(dry, "config", "user.email", "agents@example.com");
+        Git(dry, "config", "user.name", "Patch Goblins test");
+
+        var report = await Doctor.AssessAsync(_cli, dry, null, "owner");
+        Assert.NotEmpty(report.CiCommands);
+        var policy = Path.Combine(P("data"), "policies", "dry.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(policy)!);
+        File.WriteAllText(policy, JsonSerializer.Serialize(new RepoPolicy { Checks = report.CiCommands }, Json.Options));
+
+        Issues("""[{"number":1,"title":"Note the dry run","body":"Add a line about it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync(terminal: false);
+        await Terminal(true, dry);
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}""", dry));
+        await Until(r => r.Items.Any(i => i.Issue == 1 && i.State == ItemState.Open), "the issue reaches a pull request", 300, dry);
+        var body = Read(Path.Combine(_gh, "pr-body-7.md"));
+        foreach (var c in report.CiCommands) Assert.Contains($"passed: `{c.Run}` at", body);
+        Assert.Contains("patch-goblins/1-note-the-dry-run", Git(dry, "ls-remote", "origin")); // the local bare copy
+        Assert.Equal((head, status), (Git(source, "rev-parse", "HEAD"), Git(source, "status", "--porcelain")));
+        if (Environment.GetEnvironmentVariable("PATCH_GOBLINS_DRYRUN_OUT") is { Length: > 0 } output)
+            File.WriteAllText(output, report.Text() + "\n\n--- pull request body\n" + body + "\n--- calls to the fake GitHub\n" + Read(Path.Combine(_gh, "gh.log")));
+        _sup!.Dispose();
     }
 
     public void Dispose()

@@ -1068,7 +1068,7 @@ public class AgentsLinkTests
         Assert.Null(AgentsLink.Respond("""{"jsonrpc":"2.0","method":"notifications/initialized"}""", "x"));
         Assert.Null(AgentsLink.Respond("not json", "x"));
         var tools = Reply("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").GetProperty("result").GetProperty("tools");
-        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details", "agents_memory", "agents_goal"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
+        Assert.Equal(["agents_status", "agents_control", "agents_queue", "agents_details", "agents_memory", "agents_goal", "agents_doctor"], tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()));
         Assert.Equal(-32601, Reply("""{"jsonrpc":"2.0","id":3,"method":"resources/list"}""").GetProperty("error").GetProperty("code").GetInt32());
     }
 

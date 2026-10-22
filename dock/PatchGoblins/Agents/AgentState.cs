@@ -55,8 +55,12 @@ public sealed class WorkItem
     public string? ReviewedHead { get; set; }
     /// Findings the last allowed review still had, carried into the pull request for the owner.
     public string? ReviewNotes { get; set; }
-    /// Why it waits for the owner before a push ("review", "workflow"); an answer without text approves it.
+    /// Why it waits for the owner before a push ("review", "sensitive", "push"; "workflow" from older builds); an answer without text approves it.
     public string? HoldFor { get; set; }
+    /// Changed files the policy calls sensitive (Policy.SensitiveIn): their review is adversarial, their push the owner's.
+    public List<string>? Sensitive { get; set; }
+    /// What verified the pushed commit: one line per check, with its outcome and commit; the pull request's CI after it.
+    public List<string>? Verification { get; set; }
     /// The owner cleared the next push.
     public bool PushApproved { get; set; }
     /// The implementing conversation, resumed when its account is available again.
@@ -163,6 +167,8 @@ public sealed class RepoAgents
     public string Base { get; set; } = "main";
     /// Command that must pass in the worktree before a branch is pushed.
     public string? Verify { get; set; }
+    /// The policy's path-selected checks as the owner confirmed them; a changed policy applies once confirmed again.
+    public List<PolicyCheck> Checks { get; set; } = [];
     public bool Authorized { get; set; }
     public DateTimeOffset? AuthorizedAt { get; set; }
     public bool Paused { get; set; }

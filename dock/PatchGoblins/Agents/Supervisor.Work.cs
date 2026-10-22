@@ -117,17 +117,40 @@ public sealed partial class Supervisor
                 return;
             }
             if (!Active(repo)) return; // closed meanwhile: checked again on the next open
-            var verified = repo.Verify is { Length: > 0 } verify ? await VerifyAsync(repo, item, wt, verify) : null;
-            if (Dropped(repo, item)) return; // skipped during verification
-            if (_interrupted.Remove(item)) return; // its terminal closed: verified again on the next open
-            if (verified is { } failure)
+            // The base's policy, never the worktree's: a change cannot relax the rules it is judged by.
+            RepoPolicy policy;
+            try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
+            catch (PolicyException e) { Park(repo, item, "the repository's policy is unreadable, so nothing is pushed: " + e.Message); return; }
+            var files = (await GitAsync(wt, "diff", "--name-only", start + "..HEAD")).Out
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            if (Policy.SkipsCi((await GitAsync(wt, "log", "--format=%B", start + "..HEAD")).Out))
             {
-                item.Followup = $"Patch Goblins ran `{repo.Verify}` in this worktree and it failed:\n{failure}";
-                Escalate(repo, item, "verify");
-                Charge(repo, item, $"`{repo.Verify}` failed");
+                item.Followup = $"A commit message on this branch tells GitHub to skip CI ([skip ci], [ci skip], [no ci], [skip actions] or skip-checks: true), so its checks would prove nothing. Rewrite the branch's commit messages without it (for example `git reset --soft {start}` and commit again).";
+                Charge(repo, item, "a commit skips CI");
                 return;
             }
             var head = (await GitAsync(wt, "rev-parse", "HEAD")).Out.Trim();
+            var (selected, elsewhere) = Policy.Select(repo.Checks, files);
+            var commands = (repo.Verify is { Length: > 0 } v ? [v] : new List<string>()).Concat(selected.Select(c => c.Run)).Distinct().ToList();
+            var evidence = new List<string>();
+            foreach (var command in commands)
+            {
+                var verified = await VerifyAsync(repo, item, wt, command);
+                if (Dropped(repo, item)) return; // skipped during verification
+                if (_interrupted.Remove(item)) return; // its terminal closed: verified again on the next open
+                if (verified is { } failure)
+                {
+                    item.Followup = $"Patch Goblins ran `{command}` in this worktree and it failed:\n{failure}";
+                    Escalate(repo, item, "verify");
+                    Charge(repo, item, $"`{command}` failed");
+                    return;
+                }
+                evidence.Add($"passed: `{command}` at {head[..Math.Min(7, head.Length)]}");
+            }
+            evidence.AddRange(elsewhere.Select(c => $"not run here: `{c.Run}` needs {c.Os}"));
+            if (commands.Count == 0) evidence.Add("unverified: no verification command covers these changes; only CI can show they work");
+            item.Verification = evidence;
+            item.Sensitive = Policy.SensitiveIn(policy, files) is { Count: > 0 } touchy ? touchy : null;
             if (item.ReviewedHead != head && !item.PushApproved)
             {
                 // A fresh, read-only session reviews the change before anyone else sees it.
@@ -142,13 +165,16 @@ public sealed partial class Supervisor
                     Hold(repo, item, "review", "two review passes still found problems; answer to push it as is, or say what to change:\n" + notes);
                     return;
                 }
-                // A push runs the branch's own workflows with the repository's secrets, before anyone reviews it.
-                var ci = (await GitAsync(wt, "diff", "--name-only", start + "..HEAD")).Out
-                    .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    .Where(f => f.StartsWith(".github/", StringComparison.OrdinalIgnoreCase)).ToList();
-                if (ci.Count > 0)
+                // A push runs the branch's own workflows with the repository's secrets, before anyone reviews it; the policy's
+                // other sensitive paths change what runs on this machine, what agents are told, or hold secrets.
+                if (item.Sensitive is { } sensitive)
                 {
-                    Hold(repo, item, "workflow", $"the change touches {string.Join(", ", ci.Take(5))}, which runs with the repository's secrets once pushed; answer to push it, or say what to change");
+                    Hold(repo, item, "sensitive", $"the change touches {string.Join(", ", sensitive.Take(5))}{(sensitive.Count > 5 ? $" and {sensitive.Count - 5} more" : "")}, which the repository's policy keeps for you (workflows run with the repository's secrets once pushed); answer to push it, or say what to change");
+                    return;
+                }
+                if (policy.Push == "ask")
+                {
+                    Hold(repo, item, "push", "this repository's policy asks before every push (a push starts its remote CI); answer to push it, or say what to change");
                     return;
                 }
             }
@@ -173,6 +199,7 @@ public sealed partial class Supervisor
             // Pushing is idempotent: a pause now leaves it in Checking, and resuming opens the pull request.
             if (!Active(repo) || Dropped(repo, item)) return;
             if (item.Pr == null) await OpenPullRequestAsync(repo, item, wt, summary);
+            else await RecordEvidenceAsync(repo, item);
             item.State = ItemState.Open;
             item.Followup = null;
             item.Reviews = 0;
@@ -251,6 +278,18 @@ public sealed partial class Supervisor
         Notify?.Invoke(draft ? "Draft pull request opened" : "Pull request ready", $"{repo.Leaf} #{item.Pr} · {item.Title}");
     }
 
+    /// A follow-up pushed to an open pull request: what verified this commit goes on the record there too.
+    async Task RecordEvidenceAsync(RepoAgents repo, WorkItem item)
+    {
+        var body = Path.Combine(_store.RunDir(repo, item), "evidence.md");
+        File.WriteAllText(body, "Patch Goblins pushed a follow-up.\n\n" + EvidenceSection(item));
+        var r = await _cli.GhAsync(repo.Path, "pr", "comment", item.Pr!.Value.ToString(), "--body-file", body);
+        if (!r.Ok) Program.Log($"gh pr comment {item.Pr}: exit {r.Code}: {r.Why}"); // the push stands; the record waits for the next one
+    }
+
+    internal static string EvidenceSection(WorkItem item) =>
+        "Verification:\n" + string.Join("\n", (item.Verification ?? ["unverified: no record"]).Select(e => "- " + e)) + "\n";
+
     internal static (int, string)? ParsePrList(string json)
     {
         try
@@ -320,8 +359,9 @@ public sealed partial class Supervisor
         foreach (var item in repo.Items.Where(Watched).ToList())
         {
             var seen = DateTimeOffset.Now;
-            var r = await _cli.GhAsync(repo.Path, "pr", "view", item.Pr!.Value.ToString(), "--json", "state,mergeable,statusCheckRollup,comments,reviews");
+            var r = await _cli.GhAsync(repo.Path, "pr", "view", item.Pr!.Value.ToString(), "--json", "state,mergeable,statusCheckRollup,comments,reviews,headRefOid");
             if (!r.Ok || PullRequestState.Parse(r.Out, item.PrSeen ?? DateTimeOffset.MinValue, _me) is not { } pr) continue;
+            item.Verification = Evidence(item.Verification, pr);
             if (pr.State is "MERGED" or "CLOSED")
             {
                 var merged = pr.State == "MERGED";
@@ -391,6 +431,17 @@ public sealed partial class Supervisor
     }
 
     static string Tail(string s, int chars) => s.Length > chars ? s[^chars..] : s;
+
+    /// The local record, then what GitHub says of the pull request's head: its CI, and whether that head is still the commit
+    /// Patch Goblins verified (someone may have pushed since).
+    internal static List<string> Evidence(List<string>? local, PullRequestState pr)
+    {
+        var list = (local ?? []).Where(e => !e.StartsWith("CI ") && !e.StartsWith("stale: ")).ToList();
+        if (pr.Head is { Length: >= 7 } head && list.LastOrDefault(e => e.StartsWith("passed: ")) is { } last && !head.StartsWith(last[(last.LastIndexOf(" at ") + 4)..]))
+            list.Add($"stale: the pull request's head is now {head[..7]}, which Patch Goblins did not verify");
+        list.Add(pr.Ci);
+        return list;
+    }
 
     // -- issue discovery ----------------------------------------------------
 
@@ -730,7 +781,8 @@ public sealed record IssueInfo(int Number, string Title, string Body, List<strin
 }
 
 /// What `gh pr view --json state,mergeable,statusCheckRollup,comments,reviews` says needs doing.
-public sealed record PullRequestState(string State, bool Conflicting, bool ChecksPending, List<string> FailedChecks, string? FailedRunId, List<string> Feedback)
+public sealed record PullRequestState(string State, bool Conflicting, bool ChecksPending, List<string> FailedChecks, string? FailedRunId, List<string> Feedback,
+    string Ci = "CI none: no checks ran", string? Head = null)
 {
     public static PullRequestState? Parse(string json, DateTimeOffset since, string? me)
     {
@@ -740,6 +792,7 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
             var root = doc.RootElement;
             var pending = false;
             var failed = new List<string>();
+            var (passed, skipped) = (0, 0);
             string? runId = null;
             if (root.TryGetProperty("statusCheckRollup", out var checks) && checks.ValueKind == JsonValueKind.Array)
                 foreach (var c in checks.EnumerateArray())
@@ -748,6 +801,8 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
                     var status = Str(c, "status");
                     var outcome = Str(c, "conclusion") ?? Str(c, "state");
                     if (status is { } s && s != "COMPLETED" || outcome is "PENDING" or "EXPECTED") { pending = true; continue; }
+                    if (outcome is "SUCCESS") passed++;
+                    else if (outcome is "SKIPPED" or "NEUTRAL" or "STALE") skipped++;
                     if (outcome is "FAILURE" or "ERROR" or "TIMED_OUT" or "CANCELLED" or "STARTUP_FAILURE" or "ACTION_REQUIRED")
                     {
                         failed.Add(name);
@@ -765,7 +820,10 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
                         if (body.Trim().Length > 0) feedback.Add($"{who}: {body.Trim()}");
                         else if (Str(c, "state") == "CHANGES_REQUESTED") feedback.Add($"{who} requested changes.");
                     }
-            return new(Str(root, "state") ?? "OPEN", Str(root, "mergeable") == "CONFLICTING", pending, failed, runId, feedback);
+            // Only checks on this head count, and a skipped or neutral one proves nothing.
+            var ci = failed.Count > 0 ? $"CI failing: {string.Join(", ", failed)}" : pending ? "CI pending" : passed > 0 ? $"CI passing: {passed} check{(passed == 1 ? "" : "s")}"
+                : skipped > 0 ? "CI skipped: no evidence" : "CI none: no checks ran";
+            return new(Str(root, "state") ?? "OPEN", Str(root, "mergeable") == "CONFLICTING", pending, failed, runId, feedback, ci, Str(root, "headRefOid"));
         }
         catch (Exception e) when (e is JsonException or InvalidOperationException) { return null; }
     }

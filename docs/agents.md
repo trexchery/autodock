@@ -28,7 +28,7 @@ no new issue starts while ten pull requests wait for your review (**Open pull re
 
 when an issue needs your decision, its question is posted on the issue, Patch Goblins moves on to other work, and your reply there (or in the terminal) brings the issue back where it stopped.
 
-Patch Goblins holds a change for you instead of pushing it when two review passes still found problems, or when it touches `.github/` (pushed workflows run with the repository's secrets). answer in the terminal to push it as is, or say what to change.
+Patch Goblins holds a change for you instead of pushing it when two review passes still found problems, or when it touches a sensitive path: `.github/` (pushed workflows run with the repository's secrets), agent instructions or settings, secrets, or what the repository's policy adds (see readiness, policy and evidence). answer in the terminal to push it as is, or say what to change.
 
 pausing or stopping also holds any push that was about to happen. closing an issue on GitHub ends its work unless a pull request is already open.
 
@@ -91,3 +91,29 @@ nothing runs until you first open an agents terminal. measured on the release bu
 the sessions themselves are ordinary Claude Code processes, run at below-normal priority.
 
 requires Git for Windows and the GitHub CLI (`gh auth login`), and Claude Code with auto mode.
+
+## readiness, policy and evidence
+
+**doctor.** ask the agents terminal *"is this repository ready for agents?"*, or run `patch-goblins.exe doctor [folder] [--base branch] [--verify command] [--bootstrap]` (exit 0 ready, 1 limited, 2 blocked). it fetches origin and changes nothing else, then reports **READY**, **LIMITED** or **BLOCKED**, each finding with its evidence and a fix: a base branch that is missing, moved past its pin or merged away; local branches with work on no remote; open pull requests on another base, conflicting, stale, or changing the same files (stacked ones are fine); instructions that point at paths that no longer exist; no way to verify a change, a base merged with `[skip ci]`, flaky workflows; risky workflows (`pull_request_target`, no `permissions:`, secrets given to pull requests, issue text expanded into scripts, deploys reachable from a branch push); committed secrets (named by file and line, never quoted); issue dependency circles and issues with no acceptance criteria; and what agents achieved here (pull requests merged and closed unmerged, items waiting on you, retries, hours, repeated failure reasons). it reports issue and pull request numbers and paths, never their text. `--bootstrap` adds a preview of what is missing: a policy whose checks come from the repository's pull-request CI, an `AGENTS.md` only when there are no agent instructions at all, and an issue template with acceptance criteria and dependencies. nothing is written.
+
+**policy.** a shared policy holds for every repository: changes to `.github/`, `.claude/`, `.mcp.json`, `AGENTS.md`, `CLAUDE.md`, `CODEOWNERS`, the policy file, `.env` files, keys and certificates get an adversarial review (on Opus where there is room) and wait for your yes before they are pushed. a repository can only add to it, in `.patch-goblins.json` read from its base branch (a change cannot loosen the rules it is judged by, and the file itself is sensitive), or in `%LOCALAPPDATA%\patch-goblins\policies\<folder>.json` for repositories you'd rather not change:
+
+```json
+{
+  "version": 1,
+  "base": "release/baseline@1a2b3c4d",
+  "push": "ask",
+  "sensitive": ["src/**", "lease/**"],
+  "deny": ["Bash(ddc *)"],
+  "checks": [
+    { "run": "npm --prefix apps/web test", "paths": ["apps/web/**"] },
+    { "run": "shellcheck lease/*.sh", "paths": ["lease/**"], "os": "linux" }
+  ]
+}
+```
+
+`base` with `@sha` pins it: agents refuse to start once the branch has moved. `push: "ask"` holds every push for you (for repositories where a push spends CI you have not approved). `deny` adds Claude Code tool rules to every run. `checks` run with the verification command, each only when the change touches its paths; you confirm them in the start dialog, and a changed list asks again. an unreadable policy, or one written for a newer Patch Goblins, stops the work rather than being skipped.
+
+**evidence.** every pull request says what verified it: each check with the commit it passed on, checks that cover the change but need another operating system (*not run here*, never counted as passed), or *unverified* when nothing covers it. a follow-up push adds the same as a comment. agents' commits may not say `[skip ci]` (or `[ci skip]`, `[no ci]`, `skip-checks: true`); such a branch goes back to be reworded. once the pull request is open, its CI is judged on its head: *passing*, *failing*, *pending*, *skipped* (no evidence) or *none*, and evidence for a commit that is no longer the head is marked stale. the status shows anything short of passing.
+
+**isolation.** sessions run as your Windows user. the disallowed tools, the empty GitHub profile and the policy's deny rules stop mistakes, not a determined program: Claude Code's own sandbox (bubblewrap) runs only on macOS, Linux and WSL2, and on native Windows it runs commands unsandboxed. for repositories that hold production credentials or can move money, keep those credentials out of the user profile agents run under, or run the repository's agents from WSL2 with Claude Code's sandbox on, or in a separate Windows user or VM. Patch Goblins does not claim more.
