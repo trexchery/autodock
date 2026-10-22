@@ -33,6 +33,8 @@ public sealed class AgentsConfig
     public int MaxOpenPrs { get; set; } = Supervisor.MaxOpenPrs;
     /// Open pull requests as drafts.
     public bool DraftPrs { get; set; }
+    /// The shell verification, policy and goal checks run under (AgentProcess.StartShell); tests judge as another machine would.
+    public CheckShell.Kind Shell { get; set; } = CheckShell.Runner;
     /// A goal plans again at most this often after its last plan; the owner's answer or replan skips it.
     public TimeSpan ReplanEvery { get; set; } = TimeSpan.FromMinutes(10);
     /// A goal whose work has all landed looks again after this long.
