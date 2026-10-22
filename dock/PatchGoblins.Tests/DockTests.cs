@@ -777,7 +777,7 @@ public class RenderTests
                 settings.Search.Text = "approval";
                 Assert.Equal(["Ask for approval"], settings.VisibleRows);
                 settings.Search.Text = "";
-                Assert.Equal(16, settings.VisibleRows.Count());
+                Assert.Equal(12, settings.VisibleRows.Count());
                 form.CloseSettings();
                 Assert.False(form.SettingsOpen);
                 Assert.True(form.Visible); // closing settings keeps the flyout open

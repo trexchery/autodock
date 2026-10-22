@@ -1023,19 +1023,12 @@ public sealed partial class TrayApp : ApplicationContext
     async Task ShowSettingsAsync()
     {
         var f = new SettingsPanel();
-        try
-        {
-            var cfg = await _engine.ConfigAsync();
-            if (double.TryParse(cfg.GetValueOrDefault("autoswitch.threshold"), System.Globalization.CultureInfo.InvariantCulture, out var t))
-                f.Threshold.Value = Math.Clamp((decimal)t, f.Threshold.Minimum, f.Threshold.Maximum);
-            f.StrategyValue = cfg.GetValueOrDefault("autoswitch.strategy") ?? "best";
-            f.Models.Text = cfg.GetValueOrDefault("autoswitch.model") ?? "";
-        }
-        catch (Exception e) { f.Dispose(); Error("Could not read engine settings", e); return; }
+        // The engine's threshold as the tray already read it: asking the engine again starts its process, a second's wait on every open.
+        if (_engineThreshold == null) await ReadEngineThresholdAsync();
+        if (_engineThreshold == null) { f.Dispose(); Error("Could not read engine settings", new EngineException("cswap config did not answer")); return; }
+        f.Threshold.Value = Math.Clamp((decimal)_engineThreshold.Value, f.Threshold.Minimum, f.Threshold.Maximum);
         f.AutoSwitch.Checked = _settings.AutoSwitch;
-        f.RefreshInterval.Value = _settings.RefreshSeconds;
         f.Startup.Checked = Startup.IsEnabled();
-        f.PreserveRc.Checked = _settings.PreserveRemoteControl;
         f.AutoProject.Checked = _settings.AutoProjectAccount;
         f.TerminalFolder.Text = _settings.TerminalFolder ?? "";
         f.QuotaNotify.Checked = _settings.QuotaNotifications;
@@ -1053,18 +1046,10 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task SaveSettingsAsync(SettingsPanel f)
     {
+        var threshold = (double)f.Threshold.Value;
         try
         {
-            var inv = System.Globalization.CultureInfo.InvariantCulture;
-            await _engine.CommandAsync("config", "set", "autoswitch.threshold", f.Threshold.Value.ToString(inv));
-            await _engine.CommandAsync("config", "set", "autoswitch.strategy", f.StrategyValue);
-            var models = f.Models.Text.Trim();
-            await _engine.CommandAsync(models.Length == 0
-                ? ["config", "unset", "autoswitch.model"]
-                : ["config", "set", "autoswitch.model", models]);
             Startup.Set(f.Startup.Checked);
-            _settings.RefreshSeconds = (int)f.RefreshInterval.Value;
-            _settings.PreserveRemoteControl = f.PreserveRc.Checked;
             _settings.AutoProjectAccount = f.AutoProject.Checked;
             _settings.TerminalFolder = f.TerminalFolder.Text.Trim() is { Length: > 0 } tf ? tf : null;
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
@@ -1077,12 +1062,17 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AskApproval = f.AskApproval.Checked;
             ApplyAgentSettings();
             _settings.Save();
-            _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = TimerMs;
-            if (f.AutoSwitch.Checked != _settings.AutoSwitch) SetAutoSwitch(f.AutoSwitch.Checked); // asks for the owner's yes first when switching on
+            var autoSwitch = f.AutoSwitch.Checked;
+            _dash.CloseSettings(); // every control is read: the flyout goes back now, the engine is told after
+            if (autoSwitch != _settings.AutoSwitch) SetAutoSwitch(autoSwitch); // asks for the owner's yes first when switching on
+            if (threshold != _engineThreshold)
+            {
+                await _engine.CommandAsync("config", "set", "autoswitch.threshold", threshold.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await ReadEngineThresholdAsync(); // agents follow the engine's threshold
+            }
         }
-        catch (Exception e) { Error("Could not save settings", e); }
-        finally { _dash.CloseSettings(); } // after: its controls were read above
+        catch (Exception e) { _dash.CloseSettings(); Error("Could not save settings", e); }
     }
 
     static string? PickFolder(string description, string? start = null)
