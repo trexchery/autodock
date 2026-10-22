@@ -48,6 +48,7 @@ switch ("$($a[0]) $($a[1])") {
         $url
         exit 0
     }
+    'pr comment' { Copy-Item -LiteralPath (Arg '--body-file') -Destination (Join-Path $dir "pr-comment-$($a[2]).md"); exit 0 }
     'pr view' { Read-Text "pr-$($a[2]).json" '{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[],"comments":[],"reviews":[]}'; exit 0 }
     'run view' { 'FAIL greeting.test: expected hello'; exit 0 }
 }

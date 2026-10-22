@@ -434,6 +434,7 @@ public sealed partial class Supervisor : IDisposable
     {
         var route = item.Route ?? Routing.Default;
         var s = item.ReviewNext ? Routing.Review(route) : new RunSettings(route.Model, route.Effort, false);
+        if (item is { ReviewNext: true, Sensitive: not null }) s = s with { Model = "opus", Effort = "high" }; // an adversarial review of sensitive files
         var (account, why) = PickAccount(repo, item, s.Model);
         if (account == null && s.Model == "opus" && !(route.ModelRaised && !item.ReviewNext)
             && PickAccount(repo, item, "sonnet") is ({ } fallback, _))
@@ -475,6 +476,18 @@ public sealed partial class Supervisor : IDisposable
         {
             var wt = await PrepareWorktreeAsync(repo, item);
             var head = (await GitAsync(wt, "rev-parse", "HEAD")).Out.Trim();
+            // After the worktree is prepared (which may fetch the base): no run starts on a base the policy does not allow.
+            var start = await StartPointAsync(repo);
+            RepoPolicy policy;
+            try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
+            catch (PolicyException e) { throw new AgentsException("the repository's policy is unreadable: " + e.Message); }
+            if (!await PolicyHoldsAsync(repo, policy, start))
+            {
+                item.State = ItemState.Queued;
+                Save();
+                return;
+            }
+            string[] deny = [.. policy.Deny];
             var org = account.OrganizationUuid ?? "";
             var resume = !review && item.Session is { } s && s.Email == account.Email && s.Org == org;
             string prompt;
@@ -520,7 +533,7 @@ public sealed partial class Supervisor : IDisposable
             item.Route ??= Routing.Default; // started unrouted: escalation needs a base
             Save(); // write-ahead: the job is known before its process exists
             var outPath = _store.RunFile(repo, item, attempt, "out");
-            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings, own: _solo && account.Active), wt, item.Run.Job,
+            var proc = AgentProcess.Start(_engine.Exe, WorkerArgs(account.Number, session, resume, review, settings, own: _solo && account.Active, deny), wt, item.Run.Job,
                 promptPath, outPath, _store.RunFile(repo, item, attempt, "err"), WorkerEnvironment(Path.Combine(_store.Root, "no-gh"), settings));
             (item.Run.Pid, item.Run.Created) = (proc.Pid, proc.CreatedTicks);
             Save();
@@ -552,15 +565,16 @@ public sealed partial class Supervisor : IDisposable
 
     /// `cswap run N --require-session`: the account's isolated profile or nothing, never the default login. `own`: the one
     /// account there is, and it is the default login (AccountPicker.Solo): the engine then launches plain claude on it, never a second copy of its login.
-    /// Runs cannot push or call gh; reviewers cannot edit files either. Every run states its model, effort and ultracode.
-    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null, bool own = false) =>
+    /// Runs cannot push or call gh, nor use what the repository's policy denies; reviewers cannot edit files either. Every run
+    /// states its model, effort and ultracode.
+    internal static string[] WorkerArgs(int account, string session, bool resume, bool review, RunSettings? settings = null, bool own = false, string[]? deny = null) =>
     [
         "run", account.ToString(), .. own ? (string[])[] : ["--require-session"], "--",
         "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", // a request that streams is never taken for a stall
         resume ? "--resume" : "--session-id", session,
         "--permission-mode", PermissionMode,
         "--strict-mcp-config",
-        "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [],
+        "--disallowedTools", "Bash(git push *)", "Bash(gh *)", .. review ? (string[])["Edit", "Write", "NotebookEdit"] : [], .. deny ?? [],
         .. settings != null ? Routing.Args(settings) : [],
     ];
 

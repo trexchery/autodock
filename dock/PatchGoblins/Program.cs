@@ -7,6 +7,8 @@ static class Program
     {
         // Started by the agents terminal's Claude Code as its Patch Goblins tools; talks to the running tray.
         if (args is ["agents-mcp", ..]) { Environment.ExitCode = AgentsLink.ServeMcp(args); return; }
+        // A read-only readiness report on a repository, printed to the console it was started from.
+        if (args is ["doctor", ..]) { Environment.ExitCode = Doctor.Run(args); return; }
 
         var isolated = DockSettings.Env("DATA") is { Length: > 0 } ? "-" + AgentStore.KeyFor(DockSettings.Dir) : "";
         using var mutex = new Mutex(true, @"Local\PatchGoblins-" + Environment.UserName + isolated, out var first);

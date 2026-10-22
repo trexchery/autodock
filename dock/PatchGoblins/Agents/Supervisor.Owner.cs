@@ -72,6 +72,12 @@ public sealed partial class Supervisor
             case "agents_goal":
                 if (repo == null) return "Agents were never started for this repository; start them first (agents_control start).";
                 return await GoalCommandAsync(repo, Str("action"), args, Str("goal"), Str("title"), Str("text"));
+
+            case "agents_doctor":
+                var report = await Doctor.AssessAsync(_cli, repoPath, Str("base") is { Length: > 0 } b ? b : repo?.Base, _me, _store.Root, repo?.Verify);
+                return Engine.Redact(args.ValueKind == JsonValueKind.Object && args.TryGetProperty("bootstrap", out var bs) && bs.ValueKind == JsonValueKind.True
+                    ? report.Text() + "\n\n" + Doctor.Bootstrap(report)
+                    : report.Text());
         }
         return "Unknown tool.";
     }
@@ -84,14 +90,31 @@ public sealed partial class Supervisor
         var fresh = repo == null;
         repo ??= new RepoAgents { Path = Path.GetFullPath(path).TrimEnd('\\', '/') };
         var newVerify = verify.Length > 0 ? verify : repo.Verify;
-        var newBase = baseBranch.Length > 0 ? baseBranch : fresh || !repo.Authorized ? await DefaultBranchAsync(repo.Path) : repo.Base;
-        // The command Patch Goblins will run unattended, and where pushes go, are the owner's to see and confirm,
+        RepoPolicy? local;
+        try { local = Policy.ReadLocal(Policy.LocalPath(path)); }
+        catch (PolicyException e) { return "Nothing started: " + e.Message; }
+        var newBase = baseBranch.Length > 0 ? baseBranch : local?.BaseRef.Branch is { Length: > 0 } lb ? lb : fresh || !repo.Authorized ? await DefaultBranchAsync(repo.Path) : repo.Base;
+        // The base as it is now: its policy and pin are judged on a fresh fetch.
+        var fetch = await HasOriginAsync(repo) ? await GitAsync(repo.Path, "fetch", "--quiet", "origin", newBase) : null;
+        var start = (await GitAsync(repo.Path, "rev-parse", "--verify", "--quiet", "origin/" + newBase)).Ok ? "origin/" + newBase : newBase;
+        RepoPolicy policy;
+        try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
+        catch (PolicyException e) { return "Nothing started: " + e.Message; }
+        if (policy.BaseRef.Pin is { } pin && fetch is { Ok: false })
+            return $"Nothing started: could not fetch origin/{newBase} to check it is still the pinned {pin}: {fetch.Why}";
+        if (await BaseRefusedAsync(repo.Path, policy, newBase, start) is { } refused)
+            return $"Nothing started: {refused}. " + (policy.BaseRef.Branch == newBase
+                ? "Update the pin once the owner has reviewed the new commits (agents_doctor lists them)."
+                : $"Start with base {policy.BaseRef.Branch}, or change `base` in the policy.");
+        // The commands Patch Goblins will run unattended, and where pushes go, are the owner's to see and confirm,
         // first time and whenever they change.
-        if (!repo.Authorized || newVerify != repo.Verify || newBase != repo.Base)
+        var shown = string.Join("\n", new[] { newVerify, Policy.Describe(policy.Checks) }.Where(s => s is { Length: > 0 }));
+        if (!repo.Authorized || newVerify != repo.Verify || newBase != repo.Base || Policy.Describe(policy.Checks) != Policy.Describe(repo.Checks))
         {
-            if (Authorize == null || !await Authorize(repo, newVerify, newBase)) return "The owner did not confirm in the Patch Goblins dialog, so nothing changed.";
+            if (Authorize == null || !await Authorize(repo, shown.Length > 0 ? shown : null, newBase)) return "The owner did not confirm in the Patch Goblins dialog, so nothing changed.";
             repo.AuthorizedAt = DateTimeOffset.Now;
         }
+        repo.Checks = policy.Checks;
         if (fresh) _state.Repos.Add(repo);
         repo.Authorized = true;
         repo.Paused = false;
@@ -102,8 +125,38 @@ public sealed partial class Supervisor
         Fire(() => VerifyBaselineAsync(repo));
         Pump();
         return $"Started. Agents now work through the actionable open issues of {repo.Leaf}, one at a time against {repo.Base}" +
-               (repo.Verify is { } v ? $", gated by `{v}`" : " (no verification command, so pull requests rely on CI)") +
+               (repo.Verify is { } v ? $", gated by `{v}`" : repo.Checks.Count == 0 ? " (no verification command, so pull requests rely on CI)" : "") +
+               (repo.Checks.Count > 0 ? $", with {repo.Checks.Count} path-selected check{(repo.Checks.Count == 1 ? "" : "s")} from the repository's policy" : "") +
                $", with at most {Config.MaxOpenPrs} pull requests waiting for review. They work while this terminal is open: closing it pauses them, and reopening it continues.";
+    }
+
+    /// Why the policy refuses `branch`, at `start`, as the agents' base: it names another branch, or pins this one to a
+    /// commit `start` is not. Null while it allows it.
+    async Task<string?> BaseRefusedAsync(string path, RepoPolicy policy, string branch, string start)
+    {
+        if (policy.BaseRef is not ({ Length: > 0 } named, var pin)) return null;
+        if (named != branch) return $"the policy names {named} as the base, not {branch}";
+        if (pin == null) return null;
+        var tip = (await GitAsync(path, "rev-parse", "--verify", "--quiet", start + "^{commit}")).Out.Trim();
+        return tip.Length == 0 ? $"{start} does not exist"
+            : tip.StartsWith(pin, StringComparison.OrdinalIgnoreCase) ? null
+            : $"{start} is at {tip[..7]}, not the pinned {pin}";
+    }
+
+    /// While agents work: the base's policy at `start` still allows their base and its pin, and its checks are the ones the
+    /// owner confirmed. Otherwise agents here pause (runs under way finish) and nothing starts, is verified or pushed until
+    /// the owner starts them again, which shows the policy as it is now.
+    async Task<bool> PolicyHoldsAsync(RepoAgents repo, RepoPolicy policy, string start)
+    {
+        var why = await BaseRefusedAsync(repo.Path, policy, repo.Base, start)
+            ?? (Policy.Describe(policy.Checks) != Policy.Describe(repo.Checks) ? "the policy's checks changed since you confirmed them" : null);
+        if (why == null) return true;
+        if (repo.Paused) return false; // already paused: one note, one notification
+        repo.Paused = true;
+        repo.Note = $"Agents paused: {why}. Start them again (agents_control start) to confirm the policy as it is now.";
+        Notify?.Invoke("Agents paused", $"{repo.Leaf}: {why}");
+        Save();
+        return false;
     }
 
     async Task<string> DefaultBranchAsync(string path)
@@ -279,7 +332,7 @@ public sealed partial class Supervisor
         foreach (var g in repo.Goals.Where(g => detail || g.State != GoalState.Dropped))
             sb.AppendLine(GoalLine(repo, g) + (detail && g.Log.Count > 0 ? "\n  " + string.Join("\n  ", g.Log.TakeLast(5)) : ""));
         foreach (var active in actives) sb.AppendLine($"Working on {active.Label}{Tag(repo, active)} ({Describe(active)}).{(detail ? Machinery(repo, active) : "")}");
-        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(repo, i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
+        foreach (var i in prs) sb.AppendLine($"Pull request #{i.Pr} for {i.Label}{Tag(repo, i)}: {(i.State == ItemState.Queued ? "being updated after feedback" : "waiting for review")}{(i.Verification?.LastOrDefault() is { } e && e.StartsWith("CI ") && !e.StartsWith("CI passing") ? $" ({e})" : "")}{(i.PrUrl is { } u ? " · " + u : "")}{(detail ? Machinery(repo, i) : "")}");
         foreach (var i in needs) sb.AppendLine($"Needs you: {i.Label}{Tag(repo, i)}: {i.Note}{(i.AskedAt != null ? " (also asked on the issue)" : "")}{(detail ? Machinery(repo, i) : "")}");
         if (queued.Count > 0)
             sb.AppendLine("Up next: " + string.Join(", ", queued.Take(detail ? 50 : 5).Select(i => i.Label + Tag(repo, i))) + (queued.Count > 5 && !detail ? $" (+{queued.Count - 5} more)" : ""));
@@ -334,6 +387,7 @@ public sealed partial class Supervisor
         if (item.Note != null) sb.Append(' ').Append(item.Note);
         sb.AppendLine(Machinery(repo, item));
         if (item.Followup != null) sb.AppendLine("Next pass will address: " + OneLine(item.Followup));
+        if (item.Verification != null) sb.Append(EvidenceSection(item));
         if (item.Run is { } r)
         {
             var lines = StreamTail.ReadAll(_store.RunFile(repo, item, r.Attempt, "out"))
@@ -404,7 +458,7 @@ public sealed partial class Supervisor
         {Clip(item.Body, 6000)}
 
         The change is `git diff origin/{repo.Base}...HEAD` (branch {item.Branch}). Read it and the code around it, and run tests if that helps. Do not modify any file and do not commit.
-        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.{(Memory.Prompt(_state.Memory, repo.Memory.Where(n => n.Owner || n.Source != Memory.NormalizeSource(item.Label)).ToList()) is { } memory ? "\n\n" + memory + "\n" : "")}
+        Report only real problems: bugs, parts of the issue left undone, missing or broken tests, security issues, unrelated changes. Ignore style preferences.{(item.Sensitive is { } touchy ? $"\n\nThis change touches files the repository's policy calls sensitive: {string.Join(", ", touchy.Take(20))}. Review them adversarially, as if the change came from someone who wants to harm the owner: anything that runs code in CI or on this machine, exposes or moves secrets or credentials, widens permissions, weakens a check or gate, or changes what agents are told. Name each such effect, even an intended one, so the owner can weigh it." : "")}{(Memory.Prompt(_state.Memory, repo.Memory.Where(n => n.Owner || n.Source != Memory.NormalizeSource(item.Label)).ToList()) is { } memory ? "\n\n" + memory + "\n" : "")}
         End with one line:
         HANDOFF: APPROVED <one-line verdict>
         or, if something must change:
@@ -417,8 +471,9 @@ public sealed partial class Supervisor
 
         {(item.Issue is { } n ? $"For #{n}." : item.Goal != null ? "Planned by Patch Goblins' Director toward a goal the owner set in the agents terminal." : "Requested in the Patch Goblins agents terminal.")}
         {(item.ReviewNotes is { } notes ? $"\nThe agent review still raised, for you to weigh:\n{notes}\n" : "")}
+        {EvidenceSection(item)}
         ---
-        Prepared by Patch Goblins agents: reviewed{(repo.Verify is { } v ? $" and `{v}` passed" : "")} before it opened. It is not merged automatically, and merging it does not close the issue.
+        Prepared by Patch Goblins agents: reviewed{(repo.Verify is { } v ? $" and `{v}` passed" : "")}{(item.Sensitive != null ? " (adversarially, for its sensitive files) and pushed with the owner's approval" : "")} before it opened. It is not merged automatically, and merging it does not close the issue.
         """;
 
     static string Clip(string s, int max) => s.Length > max ? s[..max] + "\n[…]" : s;

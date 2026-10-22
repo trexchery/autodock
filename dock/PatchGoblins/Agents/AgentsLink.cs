@@ -135,6 +135,7 @@ public static class AgentsLink
         - Use agents_queue when the owner reorders, skips or restores issues, adds a request ("add": title and text), or answers a question an item is waiting on ("answer": item and text). An item held before its push (review concerns, or a change to .github/) is pushed as is by "answer" with no text, only when the owner says so; with text it goes back for that change.
         - Use agents_memory to list, add or forget shared notes when the owner asks you to remember or forget something: their notes bind every agent, here or (with global) in every repository.
         - Use agents_goal when the owner states an objective bigger than one change (set), and to list goals, answer a goal's question, ask for a new plan, drop one, or confirm one done. Goals come first when you report progress. Checks the owner gives (`checks`) are confirmed in a native Patch Goblins dialog; tell them to look for it. The Director may plan steps in the owner's other repositories that agents work on; those run there while that repository's agents terminal is open.
+        - Use agents_doctor when the owner asks whether this repository is ready for agents, before the first start, or when work keeps failing: it reports READY, LIMITED or BLOCKED with evidence and fixes, read-only. bootstrap adds a preview of missing instructions, policy and issue template; write them only when the owner asks.
         - Items are named #<issue> for issues and w<n> for the owner's own requests; goals g<n>.
         You can still do ordinary work in this repository yourself when the owner asks for it directly.
         """;
@@ -180,6 +181,12 @@ public static class AgentsLink
                 ["checks"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "set/answer/replan: commands that must pass on the base branch for the goal to count as achieved; they replace the goal's checks, and the owner confirms them in a Patch Goblins dialog." },
                 ["issue"] = new JsonObject { ["type"] = "integer", ["description"] = "set: an issue of this repository to adopt as the goal (its title and body)." },
             }, "action"),
+        Tool("agents_doctor", "Read-only readiness check of this repository for agents: base branch and pins, unpushed or overlapping work, stale instructions, verification gaps, risky workflows, committed secrets, production side effects, issue dependencies and what agents achieved here. READY, LIMITED or BLOCKED, with evidence and fixes. Changes nothing.",
+            new JsonObject
+            {
+                ["base"] = new JsonObject { ["type"] = "string", ["description"] = "Base branch to assess; defaults to the agents' base, the policy's, or the remote default." },
+                ["bootstrap"] = new JsonObject { ["type"] = "boolean", ["description"] = "Add a preview of the policy, instructions and issue template that are missing (nothing is written)." },
+            }),
     ];
 
     static JsonObject Tool(string name, string description, JsonObject properties, params string[] required) => new()

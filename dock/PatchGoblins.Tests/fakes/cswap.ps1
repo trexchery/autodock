@@ -1,7 +1,7 @@
 # Fake claude-swap engine for the Patch Goblins agents tests. Synthetic only: no credentials anywhere.
 # `run N --require-session -- <claude args>` plays a headless Claude Code worker; prompt markers pick
 # its behaviour: [fake:quota] [fake:blocked] [fake:stall] [fake:slow] [fake:hold] [fake:break] [fake:learn] [fake:think]
-# [fake:bgwait] [fake:linger]; a prompt with
+# [fake:bgwait] [fake:linger] [fake:skipci] [fake:touch=path] [fake:token=path]; a prompt with
 # `HANDOFF: PLAN` plays the Director: it answers with the oldest $FAKE_LOG.plan-*.json (used once), else a plan that changes nothing.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -126,7 +126,13 @@ Emit @{ type = 'assistant'; message = @{ id = 'w1'; content = @(@{ type = 'tool_
 if ($prompt -match '\[fake:break\]' -and $prompt -notmatch 'failed') { Set-Content -LiteralPath broken.txt -Value 'x' }
 elseif (Test-Path broken.txt) { git rm -q broken.txt | Out-Null }
 Add-Content -LiteralPath "issue-$n.txt" -Value "work by account $account"
+# [fake:touch=path]: also changes that file (a policy's sensitive path); [fake:skipci]: the commit tells GitHub to skip CI, until told otherwise.
+if ($prompt -match '\[fake:touch=([^\]]+)\]') { $t = $Matches[1]; New-Item -ItemType Directory -Force -Path (Split-Path -Parent "./$t") | Out-Null; Add-Content -LiteralPath $t -Value 'x' }
+# [fake:token=path]: writes a token-shaped string there (synthetic: AWS's documented example key, split so no scanner takes this file for one).
+if ($prompt -match '\[fake:token=([^\]]+)\]') { Add-Content -LiteralPath $Matches[1] -Value ('aws_key = AKIA' + 'IOSFODNN7EXAMPLE') }
+$skip = $prompt -match '\[fake:skipci\]' -and $prompt -notmatch 'tells GitHub to skip CI'
+if ($prompt -match 'tells GitHub to skip CI') { git reset -q --soft origin/main | Out-Null }
 git add -A | Out-Null
-git commit -q -m "fake work for $n" | Out-Null
+git commit -q -m ("fake work for $n" + $(if ($skip) { ' [skip ci]' } else { '' })) | Out-Null
 $learned = if ($prompt -match '\[fake:learn\]') { "HANDOFF: LEARNED the build needs the fake toolchain`nHANDOFF: LEARNED tests live next to the code`n" } else { '' }
 Finish "Did it.`n${learned}HANDOFF: DONE added issue-$n.txt"

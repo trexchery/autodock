@@ -46,7 +46,7 @@ public static class AgentsTerminal
         {
             // Sourced, not started: the status line already runs in a Git Bash; no second process.
             ["statusLine"] = new JsonObject { ["type"] = "command", ["command"] = ". " + BashQuote(Posix(script)), ["refreshInterval"] = RefreshSeconds },
-            ["permissions"] = new JsonObject { ["allow"] = new JsonArray("mcp__patch-goblins__agents_status", "mcp__patch-goblins__agents_details") },
+            ["permissions"] = new JsonObject { ["allow"] = new JsonArray("mcp__patch-goblins__agents_status", "mcp__patch-goblins__agents_details", "mcp__patch-goblins__agents_doctor") },
         };
         session["theme"] = $"custom:{ThemePlugin}:{ThemeSlug}";
         File.WriteAllText(settings, session.ToJsonString());

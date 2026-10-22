@@ -5,6 +5,7 @@ namespace PatchGoblins.Tests;
 
 /// A usage-limit error reaching the switch: seen in a file, deduped, charged to an account, the default login moved.
 /// Synthetic accounts, files and engine calls only: nothing here touches a real login or process.
+[Collection("own process")] // one test makes this process a bridge host, which hides it from ResumeStoppedTests' scans
 public class LimitWatchTests
 {
     readonly DateTimeOffset Now = DateTimeOffset.UtcNow; // per test (xunit builds one instance each), so a slow run never ages a hit past the watcher's freshness window

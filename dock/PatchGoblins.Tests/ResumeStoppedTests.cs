@@ -3,6 +3,7 @@ using Xunit;
 
 namespace PatchGoblins.Tests;
 
+[Collection("own process")] // stages windows under this process's pid: never alongside LimitWatchTests' bridge test
 public class ResumeStoppedTests
 {
     const string Limit = """{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 1:30am (America/Chicago)"}]}}""";
