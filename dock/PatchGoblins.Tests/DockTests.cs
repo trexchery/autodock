@@ -773,11 +773,11 @@ public class RenderTests
                 settings.Search.Text = "draft";
                 Assert.Equal(["Draft pull requests"], settings.VisibleRows);
                 settings.Search.Text = "upkeep switch";
-                Assert.Equal(["Auto-switch near limit", "Switch at"], settings.VisibleRows);
+                Assert.Equal(["Auto-switch near limit", "Automatic switch line", "Switch at"], settings.VisibleRows);
                 settings.Search.Text = "approval";
                 Assert.Equal(["Ask for approval"], settings.VisibleRows);
                 settings.Search.Text = "";
-                Assert.Equal(12, settings.VisibleRows.Count());
+                Assert.Equal(13, settings.VisibleRows.Count());
                 form.CloseSettings();
                 Assert.False(form.SettingsOpen);
                 Assert.True(form.Visible); // closing settings keeps the flyout open

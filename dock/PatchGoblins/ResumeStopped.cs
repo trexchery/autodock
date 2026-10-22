@@ -295,8 +295,10 @@ public static class ResumeStopped
     public static int? Target(StoppedSession s, IReadOnlyList<Account> accounts, Func<int, bool> hasProfile,
         double threshold = Full, double hysteresis = 0, DateTimeOffset? now = null, IReadOnlyDictionary<int, int>? load = null,
         IReadOnlyDictionary<int, DateTimeOffset>? refusedUntil = null, ISet<int>? live = null,
-        IReadOnlyDictionary<(int Account, string Scope), DateTimeOffset>? scopedRefused = null)
+        IReadOnlyDictionary<(int Account, string Scope), DateTimeOffset>? scopedRefused = null, Func<Account, double>? line = null)
     {
+        // The automatic line (SwitchLine) is per account: this window's own account moves at its line, a target must be under its own.
+        double Line(Account a) => line?.Invoke(a) ?? threshold;
         // Judged on what this window spends: a Fable window on its general usage and its Fable window, on every account.
         double Peak(Account a) => PeakFor(a, s.Model);
         double Weight(Account a) => Peak(a) + PerWindow * (load?.GetValueOrDefault(a.Number) ?? 0);
@@ -308,7 +310,7 @@ public static class ResumeStopped
         var own = accounts.FirstOrDefault(a => a.Number == s.Account);
         var refused = s.OwnRefused && s.Limit?.ResetsAt > (now ?? DateTimeOffset.UtcNow);
         if (s.AtLimit && own != null && Room(own) && !refused) return own.Number;
-        if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < threshold)) return null;
+        if (!s.AtLimit && (own == null || !Read(own) || Peak(own) < Line(own))) return null;
         // A move before the limit leaves alone the account the default login, near its own line, would switch to: a window moved
         // there makes it a live profile, which the engine never switches onto. (A stopped window cannot wait, so it may take it.)
         var login = accounts.FirstOrDefault(a => a.Active);
@@ -317,7 +319,7 @@ public static class ResumeStopped
                 .Select(n => (int?)n).FirstOrDefault()
             : null;
         return accounts.Where(a => a.Number != s.Account && a.Number != kept && Room(a) && (a.Active || hasProfile(a.Number)))
-            .Where(a => s.AtLimit || Peak(a) < threshold && Peak(own!) - Peak(a) >= hysteresis)
+            .Where(a => s.AtLimit || Peak(a) < Line(a) && Peak(own!) - Peak(a) >= hysteresis)
             .OrderBy(Weight).ThenByDescending(a => a.Active)
             .Select(a => (int?)a.Number).FirstOrDefault();
     }
