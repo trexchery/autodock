@@ -661,6 +661,8 @@ public class EngineIntegrationTests
 
 public class RenderTests
 {
+    static IEnumerable<Control> All(Control c) => c.Controls.Cast<Control>().SelectMany(x => All(x).Prepend(x));
+
     static List<string> SectionLabels(Control c) =>
         c.Controls.Cast<Control>().SelectMany(x => x is Label { Tag: "section" } l ? [l.Text] : SectionLabels(x)).ToList();
 
@@ -752,17 +754,59 @@ public class RenderTests
                     eb.Save(exOut);
                 }
 
-                using var settings = new SettingsForm { StartPosition = FormStartPosition.Manual, Location = new Point(-10000, -10000) };
-                settings.Show();
+                // Settings open inside the flyout, widened to fit, and close back to the accounts.
+                row.SetExpanded(false, animate: false);
+                var narrow = form.Width;
+                var settings = new SettingsPanel();
+                form.ShowSettings(settings);
                 Application.DoEvents();
-                Assert.True(settings.Width > 300 && settings.Height > 200);
+                Assert.True(form.SettingsOpen && form.Width >= settings.Width && form.Height > 200);
                 // The same three names as the tray menu and the flyout, in the same order.
-                Assert.Equal(["TEAM", "WORK", "UPKEEP"], settings.Controls.OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP"));
+                Assert.Equal(["TEAM", "WORK", "UPKEEP"], All(settings).OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP"));
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
                 {
-                    using var sb = new Bitmap(settings.Width, settings.Height);
-                    settings.DrawToBitmap(sb, new Rectangle(0, 0, settings.Width, settings.Height));
+                    using var sb = new Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(sb, new Rectangle(0, 0, form.Width, form.Height));
                     sb.Save(sOut);
+                }
+                // Search keeps the rows whose name, hint or section match every word.
+                settings.Search.Text = "draft";
+                Assert.Equal(["Draft pull requests"], settings.VisibleRows);
+                settings.Search.Text = "upkeep switch";
+                Assert.Equal(["Auto-switch near limit", "Switch at"], settings.VisibleRows);
+                settings.Search.Text = "approval";
+                Assert.Equal(["Ask for approval"], settings.VisibleRows);
+                settings.Search.Text = "";
+                Assert.Equal(16, settings.VisibleRows.Count());
+                form.CloseSettings();
+                Assert.False(form.SettingsOpen);
+                Assert.True(form.Visible); // closing settings keeps the flyout open
+                Assert.Equal(narrow, form.Width);
+
+                // An approval waits on a card above the accounts; its answer removes it.
+                var asked = form.Ask("Start agents on app?", "They take its open issues.", TimeSpan.FromMinutes(1));
+                Application.DoEvents();
+                Assert.Equal(1, form.Pending);
+                var card = All(form).First(c => c.Tag as string == "ask");
+                if (Environment.GetEnvironmentVariable("DOCK_RENDER_ASK_OUT") is { Length: > 0 } aOut)
+                {
+                    using var ab = new Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(ab, new Rectangle(0, 0, form.Width, form.Height));
+                    ab.Save(aOut);
+                }
+                card.Controls.OfType<Pill>().First(p => p.Text == "Approve").PerformClick();
+                for (var i = 0; i < 20 && !asked.IsCompleted; i++) { Application.DoEvents(); Thread.Sleep(10); }
+                Assert.True(asked.IsCompletedSuccessfully && asked.Result);
+                Assert.Equal(0, form.Pending);
+
+                // The notice that replaces Windows' balloon: drawn off-screen, never shown here.
+                using var toast = new Toast("Agents need you", "app · #12 Fix login: which database should the cache use, Redis or the existing Postgres?", Palette.Current.Live, null);
+                Assert.True(toast.Width > Ui.S(300) && toast.Height is > 50 and < 160);
+                if (Environment.GetEnvironmentVariable("DOCK_RENDER_TOAST_OUT") is { Length: > 0 } tOut)
+                {
+                    using var tb = new Bitmap(toast.Width, toast.Height);
+                    toast.DrawToBitmap(tb, new Rectangle(0, 0, toast.Width, toast.Height));
+                    tb.Save(tOut);
                 }
             }
             catch (Exception e) { failure = e; }

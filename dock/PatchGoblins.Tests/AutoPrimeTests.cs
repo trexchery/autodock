@@ -305,7 +305,10 @@ public class TerminalEnvironmentTests
         using var tmp = new TempDir();
         static JsonNode Theme(string plugin) => JsonNode.Parse(File.ReadAllText(Path.Combine(plugin, "themes", "patch-goblins.json")))!;
         var plugin = AgentsTerminal.WriteTheme(tmp.Path, "dark-daltonized")!;
-        Assert.Equal("patch-goblins-agents", JsonNode.Parse(File.ReadAllText(Path.Combine(plugin, ".claude-plugin", "plugin.json")))!["name"]!.GetValue<string>());
+        Assert.Equal("goblin", JsonNode.Parse(File.ReadAllText(Path.Combine(plugin, ".claude-plugin", "plugin.json")))!["name"]!.GetValue<string>());
+        // Its own commands, /goblin:needs and /goblin:goal, each with a description Claude Code lists under "/".
+        Assert.Equal(["goal.md", "needs.md"], Directory.GetFiles(Path.Combine(plugin, "commands")).Select(Path.GetFileName).Order());
+        Assert.All(Directory.GetFiles(Path.Combine(plugin, "commands")), f => Assert.StartsWith("---\ndescription: ", File.ReadAllText(f).ReplaceLineEndings("\n")));
         var theme = Theme(plugin);
         Assert.Equal("dark-daltonized", theme["base"]!.GetValue<string>()); // the owner's own theme underneath
         Assert.Equal("""{"clawd_body":"#5BD25B","claude":"#6FD36F","claudeShimmer":"#A6EBA6"}""", theme["overrides"]!.ToJsonString()); // the mascot color (the goblin's green) and the brand accent, nothing else

@@ -1441,6 +1441,20 @@ public sealed class AgentsEndToEndTests : IDisposable
     }
 
     [Fact]
+    public async Task WithoutApprovalsAnAskPolicyPushesWithoutWaiting()
+    {
+        CommitPolicy("""{"version":1,"push":"ask"}""");
+        Issues("""[{"number":52,"title":"Quiet fix","body":"Fix it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        var c = Fast();
+        c.AskApproval = false;
+        await StartAsync(c);
+        await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+        await Until(r => Item(r, 52).Pr != null, "the pull request opens without the owner's yes");
+        Assert.Null(await On(r => Item(r, 52).HoldFor));
+        _sup!.Dispose();
+    }
+
+    [Fact]
     public async Task AnUnreadablePolicyOrAMovedPinStopsTheStart()
     {
         await StartAsync();

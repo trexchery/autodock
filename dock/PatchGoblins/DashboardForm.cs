@@ -23,6 +23,13 @@ public sealed class DashboardForm : Form
     public const string Updating = "updating…", Offline = "offline";
 
     public bool Pinned { get; private set; }
+    /// Above 0 while a dialog of the flyout's own is up (a folder picker): losing focus to it must not hide the flyout.
+    public int HoldOpen { get; set; }
+
+    SettingsPanel? _settings;
+    public bool SettingsOpen => _settings != null;
+    /// Questions only the owner answers (starting agents, a goal's checks), asked here instead of in a popup.
+    readonly List<(string Title, string Body, TaskCompletionSource<bool> Answer)> _asks = [];
 
     public event Action<Account>? SwitchRequested;
     public event Action<Account>? TerminalRequested;
@@ -106,8 +113,8 @@ public sealed class DashboardForm : Form
         Controls.Add(_header);
         Controls.Add(_footer);
         ApplyTheme();
-        Deactivate += (_, _) => { if (!Pinned) Hide(); };
-        KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) Hide(); };
+        Deactivate += (_, _) => { if (!Pinned && HoldOpen == 0) Hide(); };
+        KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) { if (_settings != null) CloseSettings(); else Hide(); } };
         ResizeEnd += (_, _) => { if (Pinned) Moved?.Invoke(); };
     }
 
@@ -210,6 +217,7 @@ public sealed class DashboardForm : Form
         // Copy first: Dispose removes the control, so enumerating live would skip every other one.
         foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
         _list.Controls.Clear();
+        foreach (var ask in _asks) _list.Controls.Add(AskCard(ask));
         var visitors = (others ?? []).Where(o => o.Snap is { Accounts.Count: > 0 } || o.Error != null).ToList();
         var now = DateTimeOffset.Now;
         void AddRows(Snapshot? s, Func<Account, Job?> job)
@@ -304,12 +312,96 @@ public sealed class DashboardForm : Form
         Margin = new Padding(Ui.S(12), Ui.S(6), 0, Ui.S(12)),
     };
 
+    /// Settings in place of the accounts, the flyout widened to fit them; Cancel, Save or Escape bring the accounts back.
+    public void ShowSettings(SettingsPanel panel)
+    {
+        CloseSettings();
+        _settings = panel;
+        panel.Dock = DockStyle.Fill;
+        _list.Visible = _footer.Visible = false;
+        _title.Text = "Settings";
+        SetWidth(Math.Max(Ui.S(AccountRow.BaseWidth + 16), panel.Width + Padding.Horizontal));
+        Controls.Add(panel);
+        panel.BringToFront();
+        FitHeight();
+        panel.Search.Focus();
+    }
+
+    public void CloseSettings()
+    {
+        if (_settings is not { } panel) return;
+        _settings = null;
+        ActiveControl = _list; // focus off the panel first: disposing the focused box would deactivate, and so hide, the flyout
+        Controls.Remove(panel);
+        panel.Dispose();
+        _title.Text = "Patch Goblins";
+        _list.Visible = _footer.Visible = true;
+        SetWidth(Ui.S(AccountRow.BaseWidth + 16));
+        FitHeight();
+    }
+
+    /// A new width, the right edge kept (the flyout sits at the tray), the header's icons moved along.
+    void SetWidth(int w)
+    {
+        if (w == Width) return;
+        var dx = w - Width;
+        var right = Right;
+        foreach (var c in _header.Controls.OfType<Pill>()) c.Left += dx;
+        _status.Width += dx;
+        _refresh.Left += dx;
+        Width = w;
+        if (!Pinned) Left = right - w;
+    }
+
+    /// Asks the owner here, on a card above the accounts, and shows the flyout. No answer within `expire` is a no.
+    public async Task<bool> Ask(string title, string body, TimeSpan expire)
+    {
+        var ask = (title, body, new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
+        _asks.Add(ask);
+        CloseSettings();
+        Rerender();
+        if (await Task.WhenAny(ask.Item3.Task, Task.Delay(expire)) != ask.Item3.Task) Answer(ask, false);
+        return await ask.Item3.Task;
+    }
+
+    void Answer((string, string, TaskCompletionSource<bool> Answer) ask, bool yes)
+    {
+        if (!_asks.Remove(ask)) return;
+        ask.Answer.TrySetResult(yes);
+        Rerender();
+    }
+
+    internal int Pending => _asks.Count;
+
+    void Rerender() => Render(_last.Snap, _last.Error, _last.Others, _last.Projects, _last.Jobs);
+
+    Control AskCard((string Title, string Body, TaskCompletionSource<bool> Answer) ask)
+    {
+        var pal = Palette.Current;
+        var w = Ui.S(AccountRow.BaseWidth - 16);
+        var card = new Panel { Width = w, BackColor = pal.Card, Margin = new Padding(Ui.S(4), Ui.S(8), 0, Ui.S(4)), Tag = "ask" };
+        var title = new Label { Text = ask.Title, Font = Ui.Font(9f, semibold: true), ForeColor = pal.Text, AutoSize = true, MaximumSize = new Size(w - Ui.S(24), 0), Location = new Point(Ui.S(12), Ui.S(10)) };
+        var body = new Label { Text = ask.Body, Font = Ui.Font(8f), ForeColor = pal.Muted, AutoSize = true, MaximumSize = new Size(w - Ui.S(24), 0), Location = new Point(Ui.S(12), title.Bottom + Ui.S(6)) };
+        card.Controls.AddRange([title, body]);
+        body.Top = title.Top + title.PreferredHeight + Ui.S(6);
+        var yes = new Pill("Approve", PillStyle.Primary) { BackColor = pal.Card };
+        var no = new Pill("Decline") { BackColor = pal.Card };
+        var y = body.Top + body.PreferredHeight + Ui.S(10);
+        yes.Location = new Point(w - Ui.S(12) - yes.Width, y);
+        no.Location = new Point(yes.Left - Ui.S(8) - no.Width, y);
+        yes.Click += (_, _) => BeginInvoke(() => Answer(ask, true)); // after the click: this card is gone once it redraws
+        no.Click += (_, _) => BeginInvoke(() => Answer(ask, false));
+        card.Controls.AddRange([yes, no]);
+        card.Height = y + yes.Height + Ui.S(12);
+        return card;
+    }
+
     /// Grows/shrinks with content, keeping the edge nearest the taskbar fixed.
     void FitHeight()
     {
-        var content = _list.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical) + _list.Padding.Vertical;
+        var content = _settings?.ContentHeight ?? _list.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical) + _list.Padding.Vertical;
         var screen = Screen.FromPoint(Visible ? Location : Cursor.Position).WorkingArea;
-        var h = Math.Min(_header.Height + _footer.Height + content + Padding.Vertical, (int)(screen.Height * 0.8));
+        var h = Math.Min(_header.Height + (_settings == null ? _footer.Height : 0) + content + Padding.Vertical, (int)(screen.Height * 0.8));
         if (h == Height) return;
         var bottom = Bottom;
         Height = h;
