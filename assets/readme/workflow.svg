@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="230" viewBox="0 0 1200 230" role="img" aria-labelledby="t d">
+<title id="t">How Patch Goblins works</title>
+<desc id="d">Five steps: you set a goal, the Director plans, goblins build in worktrees on spare accounts, your tests and a fresh review check the change, and a pull request waits for you to merge.</desc>
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0d1810"/><stop offset="1" stop-color="#16281a"/></linearGradient>
+<pattern id="px" width="24" height="24" patternUnits="userSpaceOnUse"><rect x="11" y="11" width="2" height="2" fill="#8dd258" opacity="0.07"/></pattern>
+</defs>
+<rect width="1200" height="230" rx="20" fill="url(#bg)"/>
+<rect width="1200" height="230" rx="20" fill="url(#px)"/>
+<rect x="40" y="40" width="200" height="150" rx="12" fill="#0a130c" stroke="#24402a"/>
+<rect x="58" y="58" width="30" height="30" fill="#8dd258"/>
+<text x="73" y="80" text-anchor="middle" font-family="'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,monospace" font-size="20" font-weight="700" fill="#0d1810">1</text>
+<text x="58" y="122" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="24" font-weight="600" fill="#eef4e6">you</text>
+<text x="58" y="150" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">set a goal or</text>
+<text x="58" y="173" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">point at issues</text>
+<g fill="#8dd258"><rect x="248" y="111" width="12" height="8"/><rect x="260" y="107" width="4" height="16"/><rect x="264" y="111" width="4" height="8"/></g>
+<rect x="268" y="40" width="200" height="150" rx="12" fill="#0a130c" stroke="#24402a"/>
+<rect x="286" y="58" width="30" height="30" fill="#8dd258"/>
+<text x="301" y="80" text-anchor="middle" font-family="'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,monospace" font-size="20" font-weight="700" fill="#0d1810">2</text>
+<text x="286" y="122" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="24" font-weight="600" fill="#eef4e6">Director</text>
+<text x="286" y="150" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">plans steps,</text>
+<text x="286" y="173" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">picks model + effort</text>
+<g fill="#8dd258"><rect x="476" y="111" width="12" height="8"/><rect x="488" y="107" width="4" height="16"/><rect x="492" y="111" width="4" height="8"/></g>
+<rect x="496" y="40" width="200" height="150" rx="12" fill="#0a130c" stroke="#24402a"/>
+<rect x="514" y="58" width="30" height="30" fill="#8dd258"/>
+<text x="529" y="80" text-anchor="middle" font-family="'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,monospace" font-size="20" font-weight="700" fill="#0d1810">3</text>
+<text x="514" y="122" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="24" font-weight="600" fill="#eef4e6">goblins</text>
+<text x="514" y="150" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">build, one worktree</text>
+<text x="514" y="173" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">per spare account</text>
+<g fill="#8dd258"><rect x="704" y="111" width="12" height="8"/><rect x="716" y="107" width="4" height="16"/><rect x="720" y="111" width="4" height="8"/></g>
+<rect x="724" y="40" width="200" height="150" rx="12" fill="#0a130c" stroke="#24402a"/>
+<rect x="742" y="58" width="30" height="30" fill="#8dd258"/>
+<text x="757" y="80" text-anchor="middle" font-family="'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,monospace" font-size="20" font-weight="700" fill="#0d1810">4</text>
+<text x="742" y="122" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="24" font-weight="600" fill="#eef4e6">checks</text>
+<text x="742" y="150" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">your tests, then</text>
+<text x="742" y="173" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">a fresh review</text>
+<g fill="#8dd258"><rect x="932" y="111" width="12" height="8"/><rect x="944" y="107" width="4" height="16"/><rect x="948" y="111" width="4" height="8"/></g>
+<rect x="952" y="40" width="200" height="150" rx="12" fill="#183a1d" stroke="#8dd258"/>
+<rect x="970" y="58" width="30" height="30" fill="#ffe24d"/>
+<text x="985" y="80" text-anchor="middle" font-family="'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,monospace" font-size="20" font-weight="700" fill="#0d1810">5</text>
+<text x="970" y="122" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="24" font-weight="600" fill="#eef4e6">pull request</text>
+<text x="970" y="150" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">opened for you;</text>
+<text x="970" y="173" font-family="'Segoe UI Variable Display','Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#8fa98f">you merge</text>
+</svg>
