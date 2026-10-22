@@ -9,7 +9,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>dock.ico</ApplicationIcon>
     <AssemblyName>patch-goblins</AssemblyName>
-    <Version>0.6.0</Version>
+    <Version>0.6.1</Version>
     <Product>Patch Goblins</Product>
     <Copyright>Patch Goblins contributors; engine (c) Onur Cetinkol, MIT</Copyright>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
