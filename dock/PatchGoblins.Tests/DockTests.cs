@@ -695,7 +695,14 @@ public class RenderTests
                 using var form = new DashboardForm();
                 form.Render(snap, null, null, null, jobs);
                 form.SetStatus("12:00");
+                Assert.Equal("", form.StatusText); // a refresh time is not news: the header says nothing until the team does
                 form.SetTeam("1 working · 1 resting");
+                Assert.Equal("1 working · 1 resting", form.StatusText);
+                form.SetStatus(DashboardForm.Updating);
+                Assert.Equal("1 working · 1 resting", form.StatusText);
+                form.SetStatus(DashboardForm.Offline);
+                Assert.Equal("offline", form.StatusText);
+                form.SetStatus("12:00");
                 form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
                 form.Show();
                 Application.DoEvents();

@@ -19,7 +19,7 @@ public sealed class DashboardForm : Form
     bool _visitorsOpen; // ponytail: per run, not saved; a setting if people want it kept
     (Snapshot? Snap, string? Error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? Others, IReadOnlyList<ProjectMapping>? Projects, IReadOnlyDictionary<string, Job>? Jobs) _last;
 
-    /// The refresh states that outrank the team's line in the header.
+    /// The refresh states: `Offline` is the one the header shows (it outranks the team's line); the rest live in the refresh button's tip.
     public const string Updating = "updating…", Offline = "offline";
 
     public bool Pinned { get; private set; }
@@ -149,7 +149,7 @@ public sealed class DashboardForm : Form
         Invalidate(true);
     }
 
-    /// The refresh state: a time, or `Updating`/`Offline`. It is the header's line while the team has nothing to report, and the refresh button's tip.
+    /// The refresh state: a time, or `Updating`/`Offline`. Only `Offline` shows in the header; the refresh button's tip carries the rest.
     public void SetStatus(string text)
     {
         _refreshed = text;
@@ -165,9 +165,11 @@ public sealed class DashboardForm : Form
         ShowStatus();
     }
 
+    internal string StatusText => _status.Text;
+
     void ShowStatus()
     {
-        _status.Text = _refreshed is Updating or Offline ? _refreshed : _team ?? _refreshed;
+        _status.Text = _refreshed == Offline ? Offline : _team ?? "";
         _tips.SetToolTip(_refresh, _updated.Length > 0 ? "Refresh now · " + _updated : "Refresh now");
     }
 

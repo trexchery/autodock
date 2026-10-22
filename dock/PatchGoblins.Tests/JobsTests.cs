@@ -113,8 +113,12 @@ public class JobsTests
         var repo = Repo(new WorkItem { Id = "q", State = ItemState.Queued }, new WorkItem { Id = "n", State = ItemState.NeedsOwner },
             new WorkItem { Id = "w", State = ItemState.Queued, Worktree = "wt" }); // started earlier: not "queued"
         Assert.Equal("1 needs you · 2 working · 1 resting · 1 queued", Jobs.Summary(jobs, [repo]));
-        repo.Paused = true; // a paused repository's queue is not counting down
-        Assert.Equal("1 needs you · 2 working · 1 resting", Jobs.Summary(jobs, [repo]));
+        repo.Paused = true; // a paused repository's queue and questions are old state, not news
+        Assert.Equal("2 working · 1 resting", Jobs.Summary(jobs, [repo]));
+        Assert.Null(Jobs.Summary([], [repo]));
+        repo.Paused = false;
+        repo.Authorized = false; // never authorized: the same
+        Assert.Equal("2 working · 1 resting", Jobs.Summary(jobs, [repo]));
         Assert.Null(Jobs.Summary([new Job(JobKind.Idle, "idle"), new Job(JobKind.Yours, "yours")], []));
     }
 

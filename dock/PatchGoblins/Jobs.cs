@@ -61,11 +61,12 @@ public static class Jobs
     }
 
     /// "2 working · 1 resting · 3 queued", leading with what needs the owner; null when the agents have nothing to report.
+    /// Only repositories that are running count: a paused one (or one never authorized) holds old state, not news.
     public static string? Summary(IEnumerable<Job> team, IReadOnlyList<RepoAgents> repos)
     {
         var jobs = team.ToList();
         var parts = new List<string>();
-        var needs = repos.Where(r => r.Authorized).Sum(r => r.Items.Count(i => i.State == ItemState.NeedsOwner) + r.Goals.Count(g => g.State == GoalState.NeedsOwner));
+        var needs = repos.Where(r => r.Running).Sum(r => r.Items.Count(i => i.State == ItemState.NeedsOwner) + r.Goals.Count(g => g.State == GoalState.NeedsOwner));
         if (needs > 0) parts.Add($"{needs} need{(needs == 1 ? "s" : "")} you");
         if (jobs.Count(j => j.Kind == JobKind.Working) is > 0 and var working) parts.Add($"{working} working");
         if (jobs.Count(j => j.Kind == JobKind.Resting) is > 0 and var resting) parts.Add($"{resting} resting");
