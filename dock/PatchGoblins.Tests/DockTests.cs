@@ -681,34 +681,55 @@ public class RenderTests
             new Account(3, "side@example.com", false, "token_expired", null,
                 LastGoodUsage: new Usage(W(5, 4), W(12, 90), null, null), Disabled: true),
         ]);
+        var jobs = new Dictionary<string, Job>
+        {
+            ["personal@example.com|"] = new(JobKind.Working, "#42 fix login · reviewing"),
+            ["work@example.com|"] = new(JobKind.Yours, "yours · signed in"),
+            ["side@example.com|"] = new(JobKind.Idle, "sitting out"),
+        };
         Exception? failure = null;
         var t = new Thread(() =>
         {
             try
             {
                 using var form = new DashboardForm();
-                form.Render(snap, null);
+                form.Render(snap, null, null, null, jobs);
                 form.SetStatus("12:00");
+                form.SetTeam("1 working · 1 resting");
                 form.Location = new Point(-10000, -10000); // off-screen: never steals the user's desktop
                 form.Show();
                 Application.DoEvents();
                 using var bmp = new Bitmap(form.Width, form.Height);
                 form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                Assert.InRange(form.Height, Ui.S(200), Ui.S(320)); // three slim rows, not cards
+                Assert.InRange(form.Height, Ui.S(200), Ui.S(360)); // three slim rows, not cards
+                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(68), r.Height)); // each goblin's job line makes its row a line taller
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_OUT") is { Length: > 0 } outPath) bmp.Save(outPath);
-                Assert.Empty(SectionLabels(form)); // one provider: no section labels
+                Assert.Equal(["TEAM"], SectionLabels(form)); // no visitors: just the team
+
+                form.Render(snap, null);
+                Application.DoEvents();
+                Assert.All(FindRows(form), r => Assert.Equal(Ui.S(52), r.Height)); // no job to show: the slim row
 
                 var codex = new Snapshot(1, 1, [new Account(1, "dev@example.com", true, "ok", new Usage(W(40, 3), W(10, 90), null, null)) { Provider = "codex" }]);
-                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")]);
+                form.Render(snap, null, [("codex", codex, null), ("grok", null, "offline")], null, jobs);
                 Application.DoEvents();
-                Assert.Equal(["CLAUDE", "CODEX", "GROK"], SectionLabels(form));
-                Assert.InRange(form.Height, Ui.S(260), Ui.S(460));
+                Assert.Equal(["TEAM", "+ VISITORS · CODEX · GROK"], SectionLabels(form)); // visitors stay closed until clicked
+                Assert.Empty(FindRows(form).Where(r => r.Account.Provider != "claude"));
+                var closedHeight = form.Height;
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_PROVIDERS_OUT") is { Length: > 0 } pOut)
                 {
+                    form.Shimmer(-1); // the Agents button's glint sweeps for the first moments: a still frame
                     using var pb = new Bitmap(form.Width, form.Height);
                     form.DrawToBitmap(pb, new Rectangle(0, 0, form.Width, form.Height));
                     pb.Save(pOut);
                 }
+                form.SetVisitorsOpen(true);
+                Application.DoEvents();
+                Assert.Equal(["TEAM", "– VISITORS · CODEX · GROK", "CODEX", "GROK"], SectionLabels(form));
+                Assert.Equal(["dev@example.com"], FindRows(form).Where(r => r.Account.Provider != "claude").Select(r => r.Account.Email));
+                Assert.True(form.Height > closedHeight);
+                Assert.InRange(form.Height, Ui.S(300), Ui.S(560));
+                form.SetVisitorsOpen(false);
                 form.Render(snap, null);
                 Application.DoEvents();
 
@@ -728,6 +749,8 @@ public class RenderTests
                 settings.Show();
                 Application.DoEvents();
                 Assert.True(settings.Width > 300 && settings.Height > 200);
+                // The same three names as the tray menu and the flyout, in the same order.
+                Assert.Equal(["TEAM", "WORK", "UPKEEP"], settings.Controls.OfType<Label>().Select(l => l.Text).Where(t => t is "TEAM" or "WORK" or "UPKEEP"));
                 if (Environment.GetEnvironmentVariable("DOCK_RENDER_SETTINGS_OUT") is { Length: > 0 } sOut)
                 {
                     using var sb = new Bitmap(settings.Width, settings.Height);

@@ -4,13 +4,13 @@ Patch Goblins agents work through a repository's actionable GitHub issues on the
 
 ## start
 
-1. click the agents button (bottom right of the Patch Goblins flyout, next to refresh) and pick the repository. a normal Claude Code terminal opens there, with a green `Patch Goblins` line above its footer that shifts every few seconds and says when agents need you, are paused or off.
+1. click the **Agents** button (labeled, bottom left of the Patch Goblins flyout) and pick the repository the first time; later clicks reopen the terminal for your last repository. a normal Claude Code terminal opens there, with a green `Patch Goblins` line above its footer that shifts every few seconds and says when agents need you, are paused or off.
 2. ask in plain words: *"work through the open issues; `npm test` must pass"*, *"start with #36, then #21 and #33"*.
 3. confirm the Patch Goblins dialog. it shows the branch pull requests target and the exact verification command Patch Goblins will run; changing either asks again. the confirmation is remembered, but agents only work while that repository's agents terminal is open: close it and they pause where they are, reopen it and they continue. nothing runs in the background.
 
 ask the same terminal what's going on, to reorder or skip issues, to add your own requests, or to answer a question. it reports outcomes; ask for details when you want the machinery. only its read-only tools run without asking.
 
-right-click the agents button (or use **Agents** in the tray menu) to pause or stop. the agents button gets a yellow dot only when something is broken that you need to fix (repeated failures, a push or pull request error, gh not signed in, a failing verification command, no usable account); questions and approvals wait in the terminal.
+right-click the **Agents** button (or use **Work** in the tray menu) for **New agent** (a plain Claude Code session in a general folder, on your default login), to pause, resume or stop a repository, or to open an agents terminal in another folder. the agents button gets a yellow dot only when something is broken that you need to fix (repeated failures, a push or pull request error, gh not signed in, a failing verification command, no usable account); questions and approvals wait in the terminal.
 
 ## what happens
 

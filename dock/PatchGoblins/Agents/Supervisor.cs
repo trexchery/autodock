@@ -893,6 +893,10 @@ public sealed partial class Supervisor : IDisposable
     /// Resting since it was picked: a run that starts on it now would hold the account a yield just freed.
     bool Cooled(Account account) => _cooled.GetValueOrDefault(AccountPicker.Key(account)) > DateTimeOffset.Now;
 
+    /// When `account` stops resting (a yield, a limit it hit, the owner switching to it), or null when it is not resting: the roster's job line.
+    public DateTimeOffset? CooledUntil(Account account) =>
+        _cooled.TryGetValue(AccountPicker.Key(account), out var until) && until > DateTimeOffset.Now ? until : null;
+
     Task StopWorkersAsync(RepoAgents? only, string reason) =>
         Task.WhenAll(_workers.Where(kv => only == null || kv.Value.Repo == only).Select(kv => kv.Key).ToList().Select(k => StopWorkerAsync(k, reason)));
 

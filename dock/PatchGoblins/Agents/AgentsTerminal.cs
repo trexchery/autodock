@@ -103,7 +103,7 @@ public static class AgentsTerminal
     internal static string WriteTheme(string dir, string? ownerTheme)
     {
         var baseTheme = BuiltInThemes.Contains(ownerTheme) ? ownerTheme! : "dark";
-        var (body, accent, shimmer) = baseTheme.StartsWith("light") ? ("#2E7D32", "#2E7D32", "#43A047") : ("#5BD25B", "#6FD36F", "#A6EBA6");
+        var (body, accent, shimmer) = baseTheme.StartsWith("light") ? (Brand.LightHex, Brand.LightHex, "#43A047") : (Brand.DarkHex, "#6FD36F", "#A6EBA6"); // the body is the tray's goblin green
         var plugin = Path.Combine(dir, "theme");
         Directory.CreateDirectory(Path.Combine(plugin, ".claude-plugin"));
         Directory.CreateDirectory(Path.Combine(plugin, "themes"));

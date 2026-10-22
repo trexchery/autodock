@@ -976,9 +976,10 @@ public class AgentsTerminalTests
         {
             File.WriteAllText(F("state"), state + "\n");
             var line = RunStatusLine(bash, script, json).TrimEnd('\n').Split('\n')[^1];
-            // A gradient: many distinct colors across the label, not one grey.
+            // A gradient: many distinct colors across the label, not one grey. The wave's flat stretches round to the same
+            // color, so which frame the clock lands on costs a letter or two: half the letters is what every frame keeps.
             var colors = System.Text.RegularExpressions.Regex.Matches(line, "\u001b\\[38;2;([0-9;]+)m").Select(m => m.Groups[1].Value).ToList();
-            Assert.True(colors.Distinct().Count() >= 8, line);
+            Assert.True(colors.Distinct().Count() >= colors.Count / 2, line);
             Assert.All(colors.Where(c => c != "128;128;128"), c => Assert.Contains(c, AgentsTerminal.Palette())); // the dots stay neutral, the rest is the wheel
             Assert.Equal((AgentsTerminal.Status + shown).Count(ch => ch is not (' ' or '·')), colors.Count(c => c != "128;128;128")); // every letter colored
             Assert.Equal(AgentsTerminal.Status + shown, Plain(line));

@@ -2,7 +2,7 @@ using System.Globalization;
 
 namespace PatchGoblins;
 
-// The tray's side of Patch Goblins agents: one launcher in the flyout footer, a few menu items, the owner's
+// The tray's side of Patch Goblins agents: the Agents button in the flyout footer, a few menu items, the owner's
 // confirmation dialog, and the supervisor's lifetime. Nothing here exists until agents are first used.
 public sealed partial class TrayApp
 {
@@ -39,7 +39,11 @@ public sealed partial class TrayApp
     async Task UpdateAgentAccountsAsync()
     {
         await _agentsThreshold;
-        if (_snap != null) _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load(), LiveOrLaunching(), await OwnBusyAsync(_snap.Accounts));
+        if (_snap != null)
+        {
+            _live = LiveOrLaunching(); // the roster's job lines read it too
+            _agents?.UpdateAccounts(_snap.Accounts, ProjectMap.Load(), _live, await OwnBusyAsync(_snap.Accounts));
+        }
         MorningSummary(); // every tick too: with no agents terminal open, nothing else wakes it
     }
 
@@ -120,6 +124,7 @@ public sealed partial class TrayApp
         if (_agents == null) return;
         MorningSummary();
         AutoPrimeForAgents();
+        RefreshTeam();
         foreach (var repo in _agents.Repos)
             if (AgentsTerminal.StateOf(repo) is var state && (!_labels.TryGetValue(repo.Path, out var was) || was != state))
             {
@@ -130,7 +135,7 @@ public sealed partial class TrayApp
         var problem = _agents.HasProblem;
         var working = _agents.Working;
         _dash.SetAgents(problem ? Palette.Warn : working > 0 ? Palette.Current.Live : null,
-            problem ? "Agents terminal · something needs fixing" : working > 0 ? "Agents terminal · working" : "Agents terminal");
+            (problem ? "Agents terminal · something needs fixing" : working > 0 ? "Agents terminal · working" : "Agents terminal") + " · right-click for more");
     }
 
     /// The launcher: the agents terminal for the last repository (a folder picker the first time).
@@ -149,6 +154,8 @@ public sealed partial class TrayApp
     void ShowAgentsMenu(Control anchor)
     {
         var menu = new ContextMenuStrip();
+        menu.Items.Add("New agent", null, (_, _) => OpenNewAgent());
+        menu.Items.Add(new ToolStripSeparator());
         AddAgentItems(menu.Items);
         MenuRenderer.Apply(menu);
         MenuRenderer.DisposeOnClose(menu);
