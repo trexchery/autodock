@@ -476,9 +476,18 @@ public sealed partial class Supervisor : IDisposable
         {
             var wt = await PrepareWorktreeAsync(repo, item);
             var head = (await GitAsync(wt, "rev-parse", "HEAD")).Out.Trim();
-            string[] deny;
-            try { deny = [.. (await Policy.LoadAsync(_cli, repo.Path, await StartPointAsync(repo))).Deny]; }
+            // After the worktree is prepared (which may fetch the base): no run starts on a base the policy does not allow.
+            var start = await StartPointAsync(repo);
+            RepoPolicy policy;
+            try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
             catch (PolicyException e) { throw new AgentsException("the repository's policy is unreadable: " + e.Message); }
+            if (!await PolicyHoldsAsync(repo, policy, start))
+            {
+                item.State = ItemState.Queued;
+                Save();
+                return;
+            }
+            string[] deny = [.. policy.Deny];
             var org = account.OrganizationUuid ?? "";
             var resume = !review && item.Session is { } s && s.Email == account.Email && s.Org == org;
             string prompt;

@@ -25,6 +25,10 @@ public class PolicyTests
     [InlineData("""{"push":"sometimes"}""", "push must be")]
     [InlineData("""{"checks":[{"paths":["x"]}]}""", "needs a `run`")]
     [InlineData("""{"deny":["rm -rf /"]}""", "tool rules")]
+    [InlineData("""{"base":"main@"}""", "base is a branch")] // an empty pin: every tip starts with it
+    [InlineData("""{"base":"main@a"}""", "base is a branch")] // a one-letter pin: a sixteenth of all tips match
+    [InlineData("""{"base":"@1a2b3c4d"}""", "base is a branch")] // a pin without a branch would be ignored
+    [InlineData("""{"base":"main@not-a-sha"}""", "base is a branch")]
     public void AnUnusablePolicyIsRefusedNotHalfApplied(string json, string why) =>
         Assert.Contains(why, Assert.Throws<PolicyException>(() => Policy.Parse(json, "p.json")).Message);
 
@@ -47,6 +51,15 @@ public class PolicyTests
         var p = Policy.Parse("""{"sensitive":["lease/**"]}""", "p");
         Assert.Equal([".github/workflows/ci.yml", ".patch-goblins.json", ".claude/settings.json", "AGENTS.md", "apps/api/.env.local", "certs/dev.pem", "lease/close.sh"],
             Policy.SensitiveIn(p, [".github/workflows/ci.yml", ".patch-goblins.json", ".claude/settings.json", "AGENTS.md", "apps/api/.env.local", "certs/dev.pem", "lease/close.sh", "README.md", "src/app.cs"]));
+    }
+
+    [Fact]
+    public void EveryFileTheDoctorCallsASecretIsSensitive()
+    {
+        string[] secrets = ["deploy/prod.env", "credentials.json", "config/secrets.yaml", "secret.yml", "keys/id_ed25519", "id_ecdsa", "certs/dev.pem", ".env"];
+        Assert.All(secrets, f => Assert.NotEmpty(Doctor.SecretFiles([f]))); // what the doctor would block once committed...
+        Assert.Equal(secrets, Policy.SensitiveIn(new RepoPolicy(), secrets)); // ...never reaches the remote without the owner
+        Assert.Equal(["tests/fixtures/prod.env"], Policy.SensitiveIn(new RepoPolicy(), ["tests/fixtures/prod.env", "src/env.cs"])); // a fixture may be synthetic; its push still waits
     }
 
     [Fact]
@@ -75,7 +88,11 @@ public class PolicyTests
     {
         Assert.Equal("CI none: no checks ran", Pr("[]").Ci);
         Assert.Equal("CI skipped: no evidence", Pr("""[{"name":"build","status":"COMPLETED","conclusion":"SKIPPED"},{"name":"lint","status":"COMPLETED","conclusion":"NEUTRAL"}]""").Ci);
-        Assert.Equal("CI passing: 1 check", Pr("""[{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"deploy","status":"COMPLETED","conclusion":"SKIPPED"}]""").Ci);
+        Assert.Equal("CI passing: 2 checks", Pr("""[{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]""").Ci);
+        // Green beside a skipped job is not all green: the skipped one may be the tests.
+        Assert.Equal("CI partial: 1 passed, 2 did not run (test, e2e); what did not run proves nothing",
+            Pr("""[{"name":"changes","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"test","status":"COMPLETED","conclusion":"SKIPPED"},{"name":"e2e","status":"COMPLETED","conclusion":"NEUTRAL"}]""").Ci);
+        Assert.StartsWith("CI partial", Pr("""[{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"odd","status":"COMPLETED"}]""").Ci); // an outcome it does not know proves nothing either
         Assert.Equal("CI pending", Pr("""[{"name":"build","status":"IN_PROGRESS"},{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]""").Ci);
         Assert.Equal("CI failing: build", Pr("""[{"name":"build","status":"COMPLETED","conclusion":"FAILURE"},{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]""").Ci);
     }
@@ -85,9 +102,18 @@ public class PolicyTests
     {
         List<string> local = ["passed: `npm test` at 1111111", "CI pending"];
         var moved = Supervisor.Evidence(local, Pr("""[{"name":"b","status":"COMPLETED","conclusion":"SUCCESS"}]""", "2222222222222222222222222222222222222222"));
-        Assert.Equal(["passed: `npm test` at 1111111", "stale: the pull request's head is now 2222222, which Patch Goblins did not verify", "CI passing: 1 check"], moved);
+        Assert.Equal(["passed: `npm test` at 1111111", "stale: the pull request's head is now 2222222, which Patch Goblins did not verify", "CI on that unverified head: passing: 1 check"], moved);
         var same = Supervisor.Evidence(moved, Pr("[]", "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         Assert.Equal(["passed: `npm test` at 1111111", "CI none: no checks ran"], same); // CI and staleness are re-judged every poll
+    }
+
+    [Fact]
+    public void CiOnAHeadPatchGoblinsDidNotPushIsNoEvidenceEvenWithoutALocalCheck()
+    {
+        List<string> local = ["unverified: no verification command covers these changes; only CI can show they work at 1111111"];
+        Assert.Equal([local[0], "stale: the pull request's head is now 2222222, which Patch Goblins did not verify", "CI on that unverified head: passing: 1 check"],
+            Supervisor.Evidence(local, Pr("""[{"name":"b","status":"COMPLETED","conclusion":"SUCCESS"}]""", "2222222222222222222222222222222222222222")));
+        Assert.Equal([local[0], "CI passing: 1 check"], Supervisor.Evidence(local, Pr("""[{"name":"b","status":"COMPLETED","conclusion":"SUCCESS"}]""", "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
     }
 
     [Fact]
@@ -381,6 +407,28 @@ public sealed class DoctorRepositoryTests : IDisposable
         var r = await Assess("main", verify: "git --version");
         Assert.Equal("BLOCKED", r.Verdict);
         Assert.Contains("policy version 9", r.Text());
+    }
+
+    [Fact]
+    public async Task APolicyThatCannotBeReadIsNeverTakenForNoPolicy()
+    {
+        Commit("README.md", "hello\n");
+        var none = Path.Combine(_tmp.Path, "none.json");
+        Assert.Empty((await Policy.LoadAsync(_cli, _repo, "HEAD", none)).Checks); // no file at all: no local policy
+        var local = Path.Combine(_tmp.Path, "local.json");
+        Directory.CreateDirectory(local); // there, but nothing that reads as a file
+        Assert.Contains("could not read", (await Assert.ThrowsAsync<PolicyException>(() => Policy.LoadAsync(_cli, _repo, "HEAD", local))).Message);
+        Assert.Contains("could not look for", (await Assert.ThrowsAsync<PolicyException>(() => Policy.LoadAsync(_cli, _repo, "origin/gone", none))).Message); // a ref git cannot read
+    }
+
+    [Fact]
+    public async Task APolicyThatNamesAnotherBaseBlocks()
+    {
+        Commit(Policy.FileName, """{"version":1,"base":"release","checks":[{"run":"git --version"}]}""");
+        Git(_repo, "push", "--quiet", "-u", "origin", "main");
+        var r = await Assess("main");
+        Assert.Equal("BLOCKED", r.Verdict);
+        Assert.Contains("the policy names release as the base, not main", r.Text());
     }
 
     public void Dispose() => _tmp.Dispose();

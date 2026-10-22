@@ -1417,8 +1417,8 @@ public sealed class AgentsEndToEndTests : IDisposable
 
         // CI that only skipped proves nothing, and a head someone else pushed was never verified.
         File.WriteAllText(Path.Combine(_gh, "pr-7.json"), """{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[{"name":"build","status":"COMPLETED","conclusion":"SKIPPED"}],"comments":[],"reviews":[],"headRefOid":"0123456789abcdef0123456789abcdef01234567"}""");
-        await Until(r => Item(r, 50).Verification?.LastOrDefault() == "CI skipped: no evidence", "the pull request's CI is judged");
-        Assert.Contains("(CI skipped: no evidence)", await Tool("agents_status", "{}"));
+        await Until(r => Item(r, 50).Verification?.LastOrDefault() == "CI on that unverified head: skipped: no evidence", "the pull request's CI is judged");
+        Assert.Contains("(CI on that unverified head: skipped: no evidence)", await Tool("agents_status", "{}"));
         Assert.Contains("stale: the pull request's head is now 0123456", await Tool("agents_details", """{"item":"#50"}"""));
         _sup!.Dispose();
     }
@@ -1453,8 +1453,181 @@ public sealed class AgentsEndToEndTests : IDisposable
         Assert.StartsWith("Nothing started: origin/main is at", refused);
         Assert.Contains("not the pinned 0000000", refused);
         Assert.False(await On(r => r?.Authorized ?? false));
+        File.WriteAllText(local, """{"version":1,"base":"main@"}"""); // an empty pin would match any tip
+        Assert.Contains("base is a branch, or branch@commit", await Tool("agents_control", """{"action":"start"}"""));
+        File.WriteAllText(local, """{"version":1,"base":"develop"}""");
+        Assert.StartsWith("Nothing started: the policy names develop as the base, not main", await Tool("agents_control", """{"action":"start","base":"main"}"""));
+        File.Delete(local);
+        Directory.CreateDirectory(local); // there, but it does not read: never taken for no policy
+        Assert.StartsWith("Nothing started: could not read", await Tool("agents_control", """{"action":"start"}"""));
+        Directory.Delete(local);
+        Assert.False(await On(r => r?.Authorized ?? false));
         File.WriteAllText(local, $$"""{"version":1,"base":"main@{{Git(_repo, "rev-parse", "origin/main")[..10]}}"}""");
         Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        _sup!.Dispose();
+    }
+
+    /// The owner's policy, outside the repository, pinning main where it is now.
+    void PinLocally(string extra = "")
+    {
+        var local = Path.Combine(P("data"), "policies", "repo.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+        File.WriteAllText(local, $$"""{"version":1,"base":"main@{{Git(_repo, "rev-parse", "origin/main")}}"{{extra}}}""");
+    }
+
+    /// Someone else's commit lands on main.
+    void MoveMain()
+    {
+        File.AppendAllText(Path.Combine(_repo, "moved.txt"), "x\n");
+        Git(_repo, "add", ".");
+        Git(_repo, "commit", "--quiet", "-m", "moved");
+        Git(_repo, "push", "--quiet", "origin", "main");
+    }
+
+    [Fact]
+    public async Task APinThatMovesAfterTheStartStopsTheNextPushAndTheNextRun()
+    {
+        PinLocally(""","sensitive":["deploy/**"]""");
+        Issues("""[{"number":54,"title":"Deploy note","body":"[fake:touch=deploy/run.txt] Add it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        await Until(r => Item(r, 54) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the change waits for the owner");
+
+        // main moves past the pin while the push waits: the owner's yes does not push it.
+        MoveMain();
+        await Tool("agents_queue", """{"action":"answer","item":"#54"}""");
+        await Until(r => r.Paused, "agents pause on the moved pin");
+        Assert.Contains("not the pinned", await On(r => r.Note!));
+        Assert.DoesNotContain("patch-goblins/54", Git(_repo, "ls-remote", "origin"));
+
+        // Nor does a new run start: resumed without a new pin, agents pause again before any worker.
+        var runs = Runs.Length;
+        await Tool("agents_queue", """{"action":"add","title":"Greet","text":"Say hello."}""");
+        await _loop.Run(() => { _sup!.Resume(); return 0; });
+        await Until(r => r.Paused, "agents pause again");
+        await Task.Delay(1500);
+        Assert.Equal(runs, Runs.Length);
+        Assert.NotEqual(ItemState.Working, await On(r => W(r, "w1").State));
+        Assert.DoesNotContain("patch-goblins/54", Git(_repo, "ls-remote", "origin"));
+        Assert.StartsWith("Nothing started: origin/main is at", await Tool("agents_control", """{"action":"start"}""")); // starting needs a new pin
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ChecksChangedOnTheBaseAreConfirmedAgainBeforeAnythingRunsUnderThem()
+    {
+        CommitPolicy("""{"version":1,"checks":[{"run":"git --version"}]}""");
+        await StartAsync();
+        string? shown = null;
+        await _loop.Run(() => { _sup!.Authorize = (_, v, _) => { shown = v; return Task.FromResult(true); }; return 0; });
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        Assert.Equal("`git --version`", shown);
+
+        // Someone merges other checks: the owner never saw them.
+        CommitPolicy("""{"version":1,"checks":[{"run":"git status --short"}]}""");
+        await Tool("agents_queue", """{"action":"add","title":"Greet","text":"Say hello."}""");
+        await Until(r => r.Paused, "agents pause on the changed checks");
+        Assert.Contains("the policy's checks changed since you confirmed them", await On(r => r.Note!));
+        Assert.Empty(Runs);
+        Assert.Equal(ItemState.Queued, await On(r => W(r, "w1").State));
+
+        // Starting again shows them; once confirmed, they are what verifies the work.
+        Assert.StartsWith("Started.", await Tool("agents_control", """{"action":"start"}"""));
+        Assert.Equal("`git status --short`", shown);
+        await Until(r => W(r, "w1").State == ItemState.Open, "the work reaches a pull request");
+        var body = Read(Path.Combine(_gh, "pr-body-7.md"));
+        Assert.Contains("passed: `git status --short` at", body);
+        Assert.DoesNotContain("git --version", body);
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task AnApprovalIsForTheCommitTheOwnerSawAndARenameOrAQuotedNameStillCounts()
+    {
+        Directory.CreateDirectory(Path.Combine(_repo, ".github", "workflows"));
+        File.WriteAllText(Path.Combine(_repo, ".github", "workflows", "ci.yml"), "on: pull_request\n");
+        CommitPolicy("""{"version":1,"push":"ask"}""");
+        Issues("""[{"number":52,"title":"Quiet fix","body":"Fix it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "push" }, "the push waits for the owner");
+        var wt = await On(r => Item(r, 52).Worktree!);
+        var seen = Git(wt, "rev-parse", "HEAD");
+        Assert.Single(Runs, r => r.Contains("NotebookEdit"));
+
+        // Before the owner answers, the branch changes: the CI workflow moves away and another arrives under a name git quotes.
+        Git(wt, "mv", ".github/workflows/ci.yml", "ci.yml.off");
+        File.WriteAllText(Path.Combine(wt, ".github", "workflows", "déploy.yml"), "on: push\n");
+        Git(wt, "add", ".");
+        Git(wt, "commit", "--quiet", "-m", "more");
+        await Tool("agents_queue", """{"action":"answer","item":"#52"}""");
+
+        // The yes was for the commit the owner saw: the new one is reviewed again, adversarially, and waits again.
+        await Until(r => Item(r, 52) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the new commit waits for the owner");
+        Assert.DoesNotContain("patch-goblins/52", Git(_repo, "ls-remote", "origin"));
+        Assert.Equal(2, Runs.Count(r => r.Contains("NotebookEdit")));
+        var note = await On(r => Item(r, 52).Note!);
+        Assert.Contains(".github/workflows/ci.yml", note);
+        Assert.Contains("déploy.yml", note);
+        var head = Git(wt, "rev-parse", "HEAD");
+        Assert.NotEqual(seen, head);
+
+        // The owner's yes for this commit pushes exactly it.
+        await Tool("agents_queue", """{"action":"answer","item":"#52"}""");
+        await Until(r => Item(r, 52).State == ItemState.Open, "the approved commit is pushed");
+        Assert.Contains(head + "\trefs/heads/patch-goblins/52", Git(_repo, "ls-remote", "origin"));
+        Assert.Equal("origin/" + await On(r => Item(r, 52).Branch!), Git(wt, "rev-parse", "--abbrev-ref", "@{upstream}"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ASecretInAnEarlierCommitOrBehindAnAttributeIsStillSensitive()
+    {
+        CommitPolicy("""{"version":1,"push":"ask"}""");
+        Issues("""[{"number":55,"title":"Tidy","body":"Tidy it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start"}""");
+        await Until(r => Item(r, 55) is { State: ItemState.NeedsOwner, HoldFor: "push" }, "the push waits for the owner");
+        var wt = await On(r => Item(r, 55).Worktree!);
+
+        // A key committed and deleted again is still in what a push uploads; the base's own change is not the branch's.
+        File.WriteAllText(Path.Combine(wt, "id_ed25519"), "synthetic\n");
+        Git(wt, "add", ".");
+        Git(wt, "commit", "--quiet", "-m", "add");
+        Git(wt, "rm", "--quiet", "id_ed25519");
+        Git(wt, "commit", "--quiet", "-m", "remove");
+        File.WriteAllText(Path.Combine(_repo, "base-only.pem"), "synthetic\n");
+        Git(_repo, "add", ".");
+        Git(_repo, "commit", "--quiet", "-m", "base");
+        Git(_repo, "push", "--quiet", "origin", "main");
+        await Tool("agents_queue", """{"action":"answer","item":"#55"}""");
+        await Until(r => Item(r, 55) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the secret in the history waits for the owner");
+        var note = await On(r => Item(r, 55).Note!);
+        Assert.Contains("id_ed25519", note);
+        Assert.DoesNotContain("base-only.pem", note);
+
+        // A -diff attribute makes git call a file binary: its token is still found.
+        File.WriteAllText(Path.Combine(wt, ".gitattributes"), "notes.txt -diff\n");
+        File.WriteAllText(Path.Combine(wt, "notes.txt"), "aws_key = AKIA" + "IOSFODNN7EXAMPLE\n");
+        Git(wt, "add", ".");
+        Git(wt, "commit", "--quiet", "-m", "notes");
+        await Tool("agents_queue", """{"action":"answer","item":"#55"}""");
+        await Until(r => Item(r, 55).Note?.Contains("notes.txt (a token- or key-shaped string)") == true, "the hidden token is found");
+        Assert.Contains(".gitattributes", await On(r => Item(r, 55).Note!));
+        Assert.DoesNotContain("patch-goblins/55", Git(_repo, "ls-remote", "origin"));
+        _sup!.Dispose();
+    }
+
+    [Fact]
+    public async Task ATokenShapedStringMakesAChangeSensitive()
+    {
+        Issues("""[{"number":53,"title":"Configure","body":"[fake:token=settings.txt] Configure it.","labels":[],"assignees":[],"author":{"login":"owner"}}]""");
+        await StartAsync();
+        await Tool("agents_control", """{"action":"start","verify":"git --version"}""");
+        await Until(r => Item(r, 53) is { State: ItemState.NeedsOwner, HoldFor: "sensitive" }, "the change waits for the owner");
+        Assert.Contains("settings.txt (a token- or key-shaped string)", await On(r => Item(r, 53).Note!));
+        Assert.DoesNotContain("patch-goblins/53", Git(_repo, "ls-remote", "origin"));
+        Assert.DoesNotContain("IOSFODNN7EXAMPLE", await Tool("agents_details", """{"item":"#53"}""")); // named by its place, never quoted
         _sup!.Dispose();
     }
 

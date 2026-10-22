@@ -110,19 +110,15 @@ public sealed partial class Supervisor
                 var c = await GitAsync(wt, "commit", "--quiet", "-m", item.Label);
                 if (!c.Ok) throw new AgentsException("could not commit: " + c.Why);
             }
-            var start = await StartPointAsync(repo);
+            var start = await StartPointAsync(repo, strict: true); // the base and its policy as they are now
             if ((await GitAsync(wt, "rev-list", "--count", start + "..HEAD")).Out.Trim() == "0")
             {
                 Park(repo, item, NoChange + ": " + summary);
                 return;
             }
             if (!Active(repo)) return; // closed meanwhile: checked again on the next open
-            // The base's policy, never the worktree's: a change cannot relax the rules it is judged by.
-            RepoPolicy policy;
-            try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
-            catch (PolicyException e) { Park(repo, item, "the repository's policy is unreadable, so nothing is pushed: " + e.Message); return; }
-            var files = (await GitAsync(wt, "diff", "--name-only", start + "..HEAD")).Out
-                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            if (await PolicyAtAsync(repo, item, start) == null) return;
+            var files = await ChangedFilesAsync(wt, start);
             if (Policy.SkipsCi((await GitAsync(wt, "log", "--format=%B", start + "..HEAD")).Out))
             {
                 item.Followup = $"A commit message on this branch tells GitHub to skip CI ([skip ci], [ci skip], [no ci], [skip actions] or skip-checks: true), so its checks would prove nothing. Rewrite the branch's commit messages without it (for example `git reset --soft {start}` and commit again).";
@@ -148,12 +144,19 @@ public sealed partial class Supervisor
                 evidence.Add($"passed: `{command}` at {head[..Math.Min(7, head.Length)]}");
             }
             evidence.AddRange(elsewhere.Select(c => $"not run here: `{c.Run}` needs {c.Os}"));
-            if (commands.Count == 0) evidence.Add("unverified: no verification command covers these changes; only CI can show they work");
+            if (commands.Count == 0) evidence.Add($"unverified: no verification command covers these changes; only CI can show they work at {head[..Math.Min(7, head.Length)]}");
             item.Verification = evidence;
-            item.Sensitive = Policy.SensitiveIn(policy, files) is { Count: > 0 } touchy ? touchy : null;
-            if (item.ReviewedHead != head && !item.PushApproved)
+            // Verification takes time: the base, its pin and its checks are judged again, and its policy decides what follows.
+            if (await PolicyAtAsync(repo, item, await StartPointAsync(repo, strict: true)) is not { } policy) return;
+            var touchy = Policy.SensitiveIn(policy, files)
+                .Concat((await ChangedFilesAsync(wt, start, "-G", Policy.SecretPattern)).Select(f => f + " (a token- or key-shaped string)")).ToList();
+            if (touchy.Except(item.Sensitive ?? []).Any()) item.ReviewedHead = null; // newly sensitive: the review so far was not adversarial for it
+            item.Sensitive = touchy.Count > 0 ? touchy : null;
+            // The review and the owner's yes are for one commit: any other head is reviewed again, and a new review needs a new yes.
+            if (item.ReviewedHead != head)
             {
                 // A fresh, read-only session reviews the change before anyone else sees it.
+                item.PushApproved = false;
                 item.ReviewNext = true;
                 item.State = ItemState.Queued;
                 return;
@@ -162,7 +165,9 @@ public sealed partial class Supervisor
             {
                 if (item.ReviewNotes is { } notes)
                 {
-                    Hold(repo, item, "review", "two review passes still found problems; answer to push it as is, or say what to change:\n" + notes);
+                    // One yes covers both, so the owner sees both.
+                    Hold(repo, item, "review", "two review passes still found problems; answer to push it as is, or say what to change:\n" + notes
+                        + (item.Sensitive is { } also ? $"\nIt also touches what the repository's policy keeps for you: {string.Join(", ", also.Take(10))}" : ""));
                     return;
                 }
                 // A push runs the branch's own workflows with the repository's secrets, before anyone reviews it; the policy's
@@ -185,7 +190,8 @@ public sealed partial class Supervisor
                 return;
             }
             if (!Active(repo) || Dropped(repo, item)) return; // paused, stopped, closed or skipped during verification
-            var push = await GitAsync(wt, "push", "--quiet", "-u", "origin", item.Branch!);
+            // Exactly the commit verified, reviewed and approved, whatever the branch points at now.
+            var push = await GitAsync(wt, "push", "--quiet", "origin", $"{head}:refs/heads/{item.Branch}");
             if (!push.Ok)
             {
                 if (push.Err.Contains("non-fast-forward") || push.Err.Contains("fetch first"))
@@ -196,6 +202,7 @@ public sealed partial class Supervisor
                 }
                 throw new AgentsException("could not push: " + push.Why, transient: Offline.IsMatch(push.Err + push.Out));
             }
+            await GitAsync(wt, "branch", "--quiet", "--set-upstream-to=origin/" + item.Branch); // as `push -u` would: the doctor sees it pushed
             // Pushing is idempotent: a pause now leaves it in Checking, and resuming opens the pull request.
             if (!Active(repo) || Dropped(repo, item)) return;
             if (item.Pr == null) await OpenPullRequestAsync(repo, item, wt, summary);
@@ -228,6 +235,27 @@ public sealed partial class Supervisor
             Changed?.Invoke();
             Pump();
         }
+    }
+
+    /// The base's policy at `start`, never the worktree's (a change cannot relax the rules it is judged by); null when it
+    /// stops this item (unreadable: parked) or this repository (PolicyHoldsAsync: paused).
+    async Task<RepoPolicy?> PolicyAtAsync(RepoAgents repo, WorkItem item, string start)
+    {
+        RepoPolicy policy;
+        try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
+        catch (PolicyException e) { Park(repo, item, "the repository's policy is unreadable, so nothing is pushed: " + e.Message); return null; }
+        return await PolicyHoldsAsync(repo, policy, start) ? policy : null;
+    }
+
+    /// Files the branch's own commits since `start` change (`filter`: only those whose changes match, as `-G regex`), in any
+    /// commit, merges included, not only the last tree: a secret added and removed again is still in what a push uploads,
+    /// and the base's own changes are not the branch's. Each path as it is (a rename is its old and its new path, no name
+    /// comes back quoted), every file read as text (an attribute cannot hide one). A list that cannot be read stops the check.
+    async Task<List<string>> ChangedFilesAsync(string wt, string start, params string[] filter)
+    {
+        var r = await GitAsync(wt, ["log", "--format=", "--name-only", "--no-renames", "--diff-merges=first-parent", "--text", "--no-textconv", "--no-ext-diff", "-z", .. filter, start + "..HEAD"]);
+        return r.Ok ? [.. r.Out.Split('\0', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)]
+            : throw new AgentsException("could not list the changed files: " + r.Why);
     }
 
     /// Runs the repository's verification command in the worktree; null when it passes, else its tail.
@@ -437,9 +465,10 @@ public sealed partial class Supervisor
     internal static List<string> Evidence(List<string>? local, PullRequestState pr)
     {
         var list = (local ?? []).Where(e => !e.StartsWith("CI ") && !e.StartsWith("stale: ")).ToList();
-        if (pr.Head is { Length: >= 7 } head && list.LastOrDefault(e => e.StartsWith("passed: ")) is { } last && !head.StartsWith(last[(last.LastIndexOf(" at ") + 4)..]))
-            list.Add($"stale: the pull request's head is now {head[..7]}, which Patch Goblins did not verify");
-        list.Add(pr.Ci);
+        var mine = list.Select(e => Regex.Match(e, @"^(passed|unverified): .* at ([0-9a-f]{7,40})$")).LastOrDefault(m => m.Success)?.Groups[2].Value;
+        var stale = pr.Head is { Length: >= 7 } head && mine != null && !head.StartsWith(mine);
+        if (stale) list.Add($"stale: the pull request's head is now {pr.Head![..7]}, which Patch Goblins did not verify");
+        list.Add(stale ? "CI on that unverified head: " + pr.Ci[3..] : pr.Ci); // green on someone else's commit is no evidence for this one
         return list;
     }
 
@@ -577,6 +606,9 @@ public sealed partial class Supervisor
         if (!Directory.Exists(repo.Path)) throw new AgentsException($"{repo.Path} no longer exists");
         _fetched.Remove(repo);
         var start = await StartPointAsync(repo, strict);
+        // Plans and completion checks run on the base too: only while its policy allows it (callers stop once agents pause).
+        try { await PolicyHoldsAsync(repo, await Policy.LoadAsync(_cli, repo.Path, start), start); }
+        catch (PolicyException e) { throw new AgentsException("the repository's policy is unreadable: " + e.Message); }
         var wt = _store.Worktree(repo, probe);
         await GitAsync(repo.Path, "worktree", "remove", "--force", wt);
         try { if (Directory.Exists(wt)) Directory.Delete(wt, recursive: true); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
@@ -600,6 +632,8 @@ public sealed partial class Supervisor
         try
         {
             var start = await StartPointAsync(repo);
+            try { if (!await PolicyHoldsAsync(repo, await Policy.LoadAsync(_cli, repo.Path, start), start)) return; } // paused: nothing runs on that base
+            catch (PolicyException e) { repo.Note = "the verification command was not checked: the repository's policy is unreadable: " + e.Message; return; }
             await GitAsync(repo.Path, "worktree", "prune");
             var add = await GitAsync(repo.Path, "worktree", "add", "--detach", "--force", wt, start);
             if (!add.Ok) { repo.Note = "could not check the verification command: " + add.Why; return; }
@@ -792,7 +826,8 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
             var root = doc.RootElement;
             var pending = false;
             var failed = new List<string>();
-            var (passed, skipped) = (0, 0);
+            var passed = 0;
+            var skipped = new List<string>();
             string? runId = null;
             if (root.TryGetProperty("statusCheckRollup", out var checks) && checks.ValueKind == JsonValueKind.Array)
                 foreach (var c in checks.EnumerateArray())
@@ -802,12 +837,12 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
                     var outcome = Str(c, "conclusion") ?? Str(c, "state");
                     if (status is { } s && s != "COMPLETED" || outcome is "PENDING" or "EXPECTED") { pending = true; continue; }
                     if (outcome is "SUCCESS") passed++;
-                    else if (outcome is "SKIPPED" or "NEUTRAL" or "STALE") skipped++;
-                    if (outcome is "FAILURE" or "ERROR" or "TIMED_OUT" or "CANCELLED" or "STARTUP_FAILURE" or "ACTION_REQUIRED")
+                    else if (outcome is "FAILURE" or "ERROR" or "TIMED_OUT" or "CANCELLED" or "STARTUP_FAILURE" or "ACTION_REQUIRED")
                     {
                         failed.Add(name);
                         if (runId == null && Regex.Match(Str(c, "detailsUrl") ?? "", @"/actions/runs/(\d+)") is { Success: true } m) runId = m.Groups[1].Value;
                     }
+                    else skipped.Add(name); // skipped, neutral, stale or anything else: it ran nothing that proves the change
                 }
             var feedback = new List<string>();
             foreach (var (array, time) in new[] { ("comments", "createdAt"), ("reviews", "submittedAt") })
@@ -820,9 +855,11 @@ public sealed record PullRequestState(string State, bool Conflicting, bool Check
                         if (body.Trim().Length > 0) feedback.Add($"{who}: {body.Trim()}");
                         else if (Str(c, "state") == "CHANGES_REQUESTED") feedback.Add($"{who} requested changes.");
                     }
-            // Only checks on this head count, and a skipped or neutral one proves nothing.
-            var ci = failed.Count > 0 ? $"CI failing: {string.Join(", ", failed)}" : pending ? "CI pending" : passed > 0 ? $"CI passing: {passed} check{(passed == 1 ? "" : "s")}"
-                : skipped > 0 ? "CI skipped: no evidence" : "CI none: no checks ran";
+            // Only checks on this head count, and a skipped or neutral one proves nothing: green beside it is only partial.
+            var ci = failed.Count > 0 ? $"CI failing: {string.Join(", ", failed)}" : pending ? "CI pending"
+                : passed > 0 && skipped.Count == 0 ? $"CI passing: {passed} check{(passed == 1 ? "" : "s")}"
+                : passed > 0 ? $"CI partial: {passed} passed, {skipped.Count} did not run ({string.Join(", ", skipped.Take(5))}); what did not run proves nothing"
+                : skipped.Count > 0 ? "CI skipped: no evidence" : "CI none: no checks ran";
             return new(Str(root, "state") ?? "OPEN", Str(root, "mergeable") == "CONFLICTING", pending, failed, runId, feedback, ci, Str(root, "headRefOid"));
         }
         catch (Exception e) when (e is JsonException or InvalidOperationException) { return null; }

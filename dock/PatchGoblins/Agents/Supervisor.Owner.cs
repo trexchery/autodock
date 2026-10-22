@@ -91,14 +91,21 @@ public sealed partial class Supervisor
         repo ??= new RepoAgents { Path = Path.GetFullPath(path).TrimEnd('\\', '/') };
         var newVerify = verify.Length > 0 ? verify : repo.Verify;
         RepoPolicy? local;
-        try { local = File.Exists(Policy.LocalPath(path)) ? Policy.Parse(File.ReadAllText(Policy.LocalPath(path)), Policy.LocalPath(path)) : null; }
+        try { local = Policy.ReadLocal(Policy.LocalPath(path)); }
         catch (PolicyException e) { return "Nothing started: " + e.Message; }
         var newBase = baseBranch.Length > 0 ? baseBranch : local?.BaseRef.Branch is { Length: > 0 } lb ? lb : fresh || !repo.Authorized ? await DefaultBranchAsync(repo.Path) : repo.Base;
+        // The base as it is now: its policy and pin are judged on a fresh fetch.
+        var fetch = await HasOriginAsync(repo) ? await GitAsync(repo.Path, "fetch", "--quiet", "origin", newBase) : null;
+        var start = (await GitAsync(repo.Path, "rev-parse", "--verify", "--quiet", "origin/" + newBase)).Ok ? "origin/" + newBase : newBase;
         RepoPolicy policy;
-        try { policy = await Policy.LoadAsync(_cli, repo.Path, (await GitAsync(repo.Path, "rev-parse", "--verify", "--quiet", "origin/" + newBase)).Ok ? "origin/" + newBase : newBase); }
+        try { policy = await Policy.LoadAsync(_cli, repo.Path, start); }
         catch (PolicyException e) { return "Nothing started: " + e.Message; }
-        if (policy.BaseRef is ({ Length: > 0 } pinned, { } pin) && pinned == newBase && await PinMovedAsync(repo.Path, newBase, pin) is { } moved)
-            return $"Nothing started: {moved}. The policy pins {newBase} to {pin}; update the pin once the owner has reviewed the new commits (agents_doctor lists them).";
+        if (policy.BaseRef.Pin is { } pin && fetch is { Ok: false })
+            return $"Nothing started: could not fetch origin/{newBase} to check it is still the pinned {pin}: {fetch.Why}";
+        if (await BaseRefusedAsync(repo.Path, policy, newBase, start) is { } refused)
+            return $"Nothing started: {refused}. " + (policy.BaseRef.Branch == newBase
+                ? "Update the pin once the owner has reviewed the new commits (agents_doctor lists them)."
+                : $"Start with base {policy.BaseRef.Branch}, or change `base` in the policy.");
         // The commands Patch Goblins will run unattended, and where pushes go, are the owner's to see and confirm,
         // first time and whenever they change.
         var shown = string.Join("\n", new[] { newVerify, Policy.Describe(policy.Checks) }.Where(s => s is { Length: > 0 }));
@@ -123,14 +130,33 @@ public sealed partial class Supervisor
                $", with at most {Config.MaxOpenPrs} pull requests waiting for review. They work while this terminal is open: closing it pauses them, and reopening it continues.";
     }
 
-    /// Why a pinned base no longer is the pinned commit, or null while it is.
-    async Task<string?> PinMovedAsync(string path, string branch, string pin)
+    /// Why the policy refuses `branch`, at `start`, as the agents' base: it names another branch, or pins this one to a
+    /// commit `start` is not. Null while it allows it.
+    async Task<string?> BaseRefusedAsync(string path, RepoPolicy policy, string branch, string start)
     {
-        await GitAsync(path, "fetch", "--quiet", "origin", branch);
-        var tip = (await GitAsync(path, "rev-parse", "--verify", "--quiet", "origin/" + branch)).Out.Trim();
-        return tip.Length == 0 ? $"origin/{branch} does not exist"
+        if (policy.BaseRef is not ({ Length: > 0 } named, var pin)) return null;
+        if (named != branch) return $"the policy names {named} as the base, not {branch}";
+        if (pin == null) return null;
+        var tip = (await GitAsync(path, "rev-parse", "--verify", "--quiet", start + "^{commit}")).Out.Trim();
+        return tip.Length == 0 ? $"{start} does not exist"
             : tip.StartsWith(pin, StringComparison.OrdinalIgnoreCase) ? null
-            : $"origin/{branch} is at {tip[..7]}, not the pinned {pin}";
+            : $"{start} is at {tip[..7]}, not the pinned {pin}";
+    }
+
+    /// While agents work: the base's policy at `start` still allows their base and its pin, and its checks are the ones the
+    /// owner confirmed. Otherwise agents here pause (runs under way finish) and nothing starts, is verified or pushed until
+    /// the owner starts them again, which shows the policy as it is now.
+    async Task<bool> PolicyHoldsAsync(RepoAgents repo, RepoPolicy policy, string start)
+    {
+        var why = await BaseRefusedAsync(repo.Path, policy, repo.Base, start)
+            ?? (Policy.Describe(policy.Checks) != Policy.Describe(repo.Checks) ? "the policy's checks changed since you confirmed them" : null);
+        if (why == null) return true;
+        if (repo.Paused) return false; // already paused: one note, one notification
+        repo.Paused = true;
+        repo.Note = $"Agents paused: {why}. Start them again (agents_control start) to confirm the policy as it is now.";
+        Notify?.Invoke("Agents paused", $"{repo.Leaf}: {why}");
+        Save();
+        return false;
     }
 
     async Task<string> DefaultBranchAsync(string path)

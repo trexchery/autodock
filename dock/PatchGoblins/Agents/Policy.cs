@@ -41,11 +41,16 @@ public static class Policy
     /// secrets. Each waits for the owner before it is pushed.
     public static readonly string[] Shared =
     [
-        ".github/**", FileName, ".claude/**", ".mcp.json", "AGENTS.md", "CLAUDE.md", "CODEOWNERS",
+        ".github/**", ".gitattributes", FileName, ".claude/**", ".mcp.json", "AGENTS.md", "CLAUDE.md", "CODEOWNERS",
         ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12", "id_rsa*", "*.tfvars", ".npmrc", ".pypirc",
     ];
 
     static readonly string[] Pushes = ["auto", "ask"];
+
+    /// Secret file names and token- or key-shaped text: the doctor reports them committed, and a change that adds or
+    /// touches one is sensitive.
+    public static readonly Regex SecretFile = new(@"^(\.env(\..+)?|.+\.(pem|key|pfx|p12)|id_(rsa|ed25519|ecdsa)|credentials\.json|.+\.env|secrets?\.(json|ya?ml))$", RegexOptions.IgnoreCase);
+    public const string SecretPattern = @"(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)";
 
     public static RepoPolicy Parse(string json, string source)
     {
@@ -54,6 +59,8 @@ public static class Policy
         catch (JsonException e) { throw new PolicyException($"{source} is not valid JSON: {e.Message}"); }
         if (p == null) throw new PolicyException($"{source} is empty");
         if (p.Version > Version) throw new PolicyException($"{source} is policy version {p.Version}; this Patch Goblins reads version {Version}. Update Patch Goblins.");
+        // A pin is a commit, never an empty or one-letter prefix that any tip would start with.
+        if (p.Base != null && !Regex.IsMatch(p.Base, @"^[^@\s]+(@[0-9a-fA-F]{7,40})?$")) throw new PolicyException($"{source}: base is a branch, or branch@commit with at least 7 hex digits of the commit");
         if (p.Push != null && !Pushes.Contains(p.Push)) throw new PolicyException($"{source}: push must be \"auto\" or \"ask\"");
         if (p.Checks.Any(c => string.IsNullOrWhiteSpace(c.Run))) throw new PolicyException($"{source}: every check needs a `run` command");
         if (p.Deny.Any(d => !Regex.IsMatch(d, @"^\w+(\(.+\))?$"))) throw new PolicyException($"{source}: deny entries are Claude Code tool rules, like Bash(ddc *)");
@@ -79,18 +86,29 @@ public static class Policy
     public static async Task<RepoPolicy> LoadAsync(Cli cli, string repoPath, string gitRef, string? localPath = null)
     {
         var repo = new RepoPolicy();
-        if ((await cli.GitAsync(repoPath, "ls-tree", "--name-only", gitRef, "--", FileName)).Out.Trim().Length > 0)
+        var tree = await cli.GitAsync(repoPath, "ls-tree", "--name-only", gitRef, "--", FileName);
+        if (!tree.Ok) throw new PolicyException($"could not look for {FileName} on {gitRef}: {tree.Why}"); // not knowing is not "no policy"
+        if (tree.Out.Trim().Length > 0)
         {
             var show = await cli.GitAsync(repoPath, "show", $"{gitRef}:{FileName}");
             repo = show.Ok ? Parse(show.Out, $"{FileName} on {gitRef}") : throw new PolicyException($"could not read {FileName} on {gitRef}: {show.Why}");
         }
-        localPath ??= LocalPath(repoPath);
-        return Merge(repo, File.Exists(localPath) ? Parse(File.ReadAllText(localPath), localPath) : null);
+        return Merge(repo, ReadLocal(localPath ?? LocalPath(repoPath)));
     }
 
-    /// Changed files the shared or the repository's policy calls sensitive.
+    /// The owner's local policy, or null when there is none. A file that is there but cannot be read throws.
+    public static RepoPolicy? ReadLocal(string path)
+    {
+        string text;
+        try { text = File.ReadAllText(path); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { throw new PolicyException($"could not read {path}: {e.Message}"); }
+        return Parse(text, path);
+    }
+
+    /// Changed files the shared or the repository's policy calls sensitive, and every file the doctor would call a secret.
     public static List<string> SensitiveIn(RepoPolicy policy, IEnumerable<string> files) =>
-        files.Where(f => Shared.Concat(policy.Sensitive).Any(g => Glob(g, f))).ToList();
+        files.Where(f => SecretFile.IsMatch(Path.GetFileName(f)) || Shared.Concat(policy.Sensitive).Any(g => Glob(g, f))).ToList();
 
     /// The checks that cover these changed files, and those that do but need another operating system.
     public static (List<PolicyCheck> Run, List<PolicyCheck> OtherOs) Select(IEnumerable<PolicyCheck> checks, IReadOnlyCollection<string> files, string os = "windows")

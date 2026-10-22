@@ -53,7 +53,7 @@ public static class Doctor
         // -- base and policy
         var local = Policy.LocalPath(path);
         RepoPolicy? pre = null;
-        try { pre = File.Exists(local) ? Policy.Parse(File.ReadAllText(local), local) : null; }
+        try { pre = Policy.ReadLocal(local); }
         catch (PolicyException e) { report.Add(Severity.Block, "policy", e.Message, "fix the file; agents refuse to work under a policy they cannot read"); }
         var remoteHead = (await Git("symbolic-ref", "--short", "refs/remotes/origin/HEAD"))?.Replace("origin/", "");
         var branch = baseBranch is { Length: > 0 } ? baseBranch : pre?.BaseRef.Branch is { Length: > 0 } b ? b : remoteHead ?? "main";
@@ -73,7 +73,9 @@ public static class Doctor
         var policy = new RepoPolicy();
         try { policy = await Policy.LoadAsync(cli, path, at, local); report.HasPolicy = true; }
         catch (PolicyException e) { report.Add(Severity.Block, "policy", e.Message, "fix the file; agents refuse to work under a policy they cannot read"); }
-        if (policy.BaseRef is ({ } pinned, { } pin) && pinned == branch && !tip.StartsWith(pin, StringComparison.OrdinalIgnoreCase))
+        if (policy.BaseRef.Branch is { Length: > 0 } named && named != branch)
+            report.Add(Severity.Block, "base", $"the policy names {named} as the base, not {branch}: agents refuse to work on {branch}", $"assess {named}, or change `base` in the policy");
+        else if (policy.BaseRef is ({ } pinned, { } pin) && !tip.StartsWith(pin, StringComparison.OrdinalIgnoreCase))
         {
             var past = await Git("rev-list", "--count", $"{pin}..{tip}");
             report.Add(Severity.Block, "base", await Git("merge-base", "--is-ancestor", pin, tip) != null
@@ -105,7 +107,7 @@ public static class Doctor
             if (SideEffect.Match(c.Run) is { Success: true } m)
                 report.Add(Severity.Block, "side effects", $"the verification command `{c.Run}` mentions `{m.Value}`: verification runs unattended, many times", "verify with tests and builds only; keep deploys and publishing for people");
         report.Findings.AddRange(SecretFiles(files));
-        report.Findings.AddRange(SecretHits(await Git("grep", "-I", "-n", "-E", SecretPattern, tip, "--") ?? ""));
+        report.Findings.AddRange(SecretHits(await Git("grep", "-I", "-n", "-E", Policy.SecretPattern, tip, "--") ?? ""));
 
         // -- GitHub: pull requests, issues, protection, flaky checks
         if (origin != null && cli.Gh != null && origin.Contains("github.com", StringComparison.OrdinalIgnoreCase))
@@ -257,11 +259,10 @@ public static class Doctor
 
     // -- secrets --------------------------------------------------------------
 
-    const string SecretPattern = @"(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)";
     static readonly Regex Synthetic = new(@"(test|fixture|fake|example|sample|mock|dummy|template)", RegexOptions.IgnoreCase);
 
     internal static List<Finding> SecretFiles(IEnumerable<string> files) =>
-        files.Where(f => Regex.IsMatch(Path.GetFileName(f), @"^(\.env(\..+)?|.+\.(pem|key|pfx|p12)|id_(rsa|ed25519|ecdsa)|credentials\.json|.+\.env|secrets?\.(json|ya?ml))$", RegexOptions.IgnoreCase) && !Synthetic.IsMatch(f))
+        files.Where(f => Policy.SecretFile.IsMatch(Path.GetFileName(f)) && !Synthetic.IsMatch(f))
             .Select(f => new Finding(Severity.Block, "secrets", $"{f} is committed and looks like a secret", "remove it from Git (and its history), rotate what it held")).ToList();
 
     /// `git grep -n` output (`ref:path:line:text`) to findings that name the place, never the text.
