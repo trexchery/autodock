@@ -28,7 +28,10 @@ public sealed partial class TrayApp : ApplicationContext
     readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
-    double Threshold => _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
+    double Threshold => _settings.AutoLine && _snap?.Accounts.FirstOrDefault(a => a.Active) is { } on
+        ? _line.For(on, null) // the default login's automatic line
+        : _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
+    readonly SwitchLine _line = new();
     readonly Dictionary<string, DateTime> _busySince = []; // busy windows at a limit → when first seen so: only ones still busy after a grace are told about
     static readonly TimeSpan BusyGrace = TimeSpan.FromSeconds(10);
     readonly Dictionary<int, DateTime> _freed = []; // account → when its `cswap run` windows were last moved to the default login
@@ -66,7 +69,7 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.TerminalRequested += a => _ = AccountActionAsync(a, "terminal-folder");
         _dash.AccountAction += (a, act) => _ = AccountActionAsync(a, act);
         _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
-        _dash.SettingsRequested += () => _ = ShowSettingsAsync();
+        _dash.SettingsRequested += () => { if (_dash.SettingsOpen) _dash.CloseSettings(); else _ = ShowSettingsAsync(); };
         _dash.AddRequested += PickProviderToAdd;
         _dash.VisibleChanged += (_, _) => { if (!_dash.Visible) _dashHiddenAt = DateTime.UtcNow; };
         _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
@@ -147,6 +150,7 @@ public sealed partial class TrayApp : ApplicationContext
             var listed = await _engine.ListAsync(refresh || reread);
             if (switches == _switches || _snap == null) _snap = listed;
             else (_pending, _pendingAuto) = (refresh || _pending == true, _pendingAuto | runAuto); // listed before a switch the tray made: listed again
+            _line.Observe(listed.Accounts, DateTimeOffset.Now); // the automatic line's burn rates
             if (reread) Prime.Reread(DateTimeOffset.Now); // spent only on a reading that came back
             if (_settings.AutoPrime && Prime.Observe(_snap.Accounts, DateTimeOffset.Now)) Prime.Save();
             if (_settings.AutoPrime && Prime.Problem != _primeProblem && (_primeProblem = Prime.Problem) != null)
@@ -336,7 +340,7 @@ public sealed partial class TrayApp : ApplicationContext
         {
             await _movePass.WaitAsync();
             _movePass.Release();
-            (_, events) = await _engine.AutoOnceAsync();
+            (_, events) = await _engine.AutoOnceAsync(_settings.AutoLine ? Threshold : null);
         }
         finally { Interlocked.Decrement(ref _engineSwitches); }
         foreach (var e in events)
@@ -413,7 +417,8 @@ public sealed partial class TrayApp : ApplicationContext
                 continue;
             }
             if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
-            var target = s.Idle ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil) : null;
+            var target = s.Idle ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil, scopedRefused: _limits.ScopedRefusedUntil,
+                line: _settings.AutoLine ? a => _line.For(a, s.Model) : null) : null;
             // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             var key = $"{s.SessionId}#{target}";
             var step = ResumeStopped.Decide(s, ResumeStopped.UserIdle(), TypingPause, target, _resumed.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
@@ -651,10 +656,11 @@ public sealed partial class TrayApp : ApplicationContext
 
     static string Name(AccountRef? r) => r == null ? "(none)" : $"#{r.Number} {r.Email}";
 
+    /// A small Patch Goblins card at the bottom right (not Windows' balloon); a click opens the flyout.
     void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
     {
         _notices++;
-        _tray.ShowBalloonTip(5000, title, Engine.Redact(text), icon);
+        Toast.Show(title, Engine.Redact(text), icon switch { ToolTipIcon.Warning => Palette.Warn, ToolTipIcon.Error => Palette.Critical, _ => null }, ShowDashboard);
     }
 
     void BuildMenu()
@@ -1021,20 +1027,14 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task ShowSettingsAsync()
     {
-        using var f = new SettingsForm();
-        try
-        {
-            var cfg = await _engine.ConfigAsync();
-            if (double.TryParse(cfg.GetValueOrDefault("autoswitch.threshold"), System.Globalization.CultureInfo.InvariantCulture, out var t))
-                f.Threshold.Value = Math.Clamp((decimal)t, f.Threshold.Minimum, f.Threshold.Maximum);
-            f.StrategyValue = cfg.GetValueOrDefault("autoswitch.strategy") ?? "best";
-            f.Models.Text = cfg.GetValueOrDefault("autoswitch.model") ?? "";
-        }
-        catch (Exception e) { Error("Could not read engine settings", e); return; }
+        var f = new SettingsPanel();
+        // The engine's threshold as the tray already read it: asking the engine again starts its process, a second's wait on every open.
+        if (_engineThreshold == null) await ReadEngineThresholdAsync();
+        if (_engineThreshold == null) { f.Dispose(); Error("Could not read engine settings", new EngineException("cswap config did not answer")); return; }
+        f.Threshold.Value = Math.Clamp((decimal)_engineThreshold.Value, f.Threshold.Minimum, f.Threshold.Maximum);
+        f.AutoLine.Checked = _settings.AutoLine;
         f.AutoSwitch.Checked = _settings.AutoSwitch;
-        f.RefreshInterval.Value = _settings.RefreshSeconds;
         f.Startup.Checked = Startup.IsEnabled();
-        f.PreserveRc.Checked = _settings.PreserveRemoteControl;
         f.AutoProject.Checked = _settings.AutoProjectAccount;
         f.TerminalFolder.Text = _settings.TerminalFolder ?? "";
         f.QuotaNotify.Checked = _settings.QuotaNotifications;
@@ -1043,19 +1043,19 @@ public sealed partial class TrayApp : ApplicationContext
         f.AgentOpenPrs.Value = Math.Clamp(_settings.AgentOpenPrs, (int)f.AgentOpenPrs.Minimum, (int)f.AgentOpenPrs.Maximum);
         f.DraftPrs.Checked = _settings.AgentDraftPrs;
         f.Ultracode.Checked = _settings.AgentUltracode;
-        if (f.ShowDialog() != DialogResult.OK) return;
+        f.AskApproval.Checked = _settings.AskApproval;
+        f.CancelClicked += _dash.CloseSettings;
+        f.SaveClicked += () => _ = SaveSettingsAsync(f);
+        if (!_dash.Visible) ShowDashboard();
+        _dash.ShowSettings(f);
+    }
+
+    async Task SaveSettingsAsync(SettingsPanel f)
+    {
+        var threshold = (double)f.Threshold.Value;
         try
         {
-            var inv = System.Globalization.CultureInfo.InvariantCulture;
-            await _engine.CommandAsync("config", "set", "autoswitch.threshold", f.Threshold.Value.ToString(inv));
-            await _engine.CommandAsync("config", "set", "autoswitch.strategy", f.StrategyValue);
-            var models = f.Models.Text.Trim();
-            await _engine.CommandAsync(models.Length == 0
-                ? ["config", "unset", "autoswitch.model"]
-                : ["config", "set", "autoswitch.model", models]);
             Startup.Set(f.Startup.Checked);
-            _settings.RefreshSeconds = (int)f.RefreshInterval.Value;
-            _settings.PreserveRemoteControl = f.PreserveRc.Checked;
             _settings.AutoProjectAccount = f.AutoProject.Checked;
             _settings.TerminalFolder = f.TerminalFolder.Text.Trim() is { Length: > 0 } tf ? tf : null;
             if (f.QuotaNotify.Checked != _settings.QuotaNotifications) _quota = new(); // switching on starts from a fresh, silent baseline
@@ -1065,13 +1065,21 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AgentOpenPrs = (int)f.AgentOpenPrs.Value;
             _settings.AgentDraftPrs = f.DraftPrs.Checked;
             _settings.AgentUltracode = f.Ultracode.Checked;
+            _settings.AskApproval = f.AskApproval.Checked;
+            _settings.AutoLine = f.AutoLine.Checked;
             ApplyAgentSettings();
             _settings.Save();
-            _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
             _timer.Interval = TimerMs;
-            if (f.AutoSwitch.Checked != _settings.AutoSwitch) SetAutoSwitch(f.AutoSwitch.Checked); // asks for the owner's yes first when switching on
+            var autoSwitch = f.AutoSwitch.Checked;
+            _dash.CloseSettings(); // every control is read: the flyout goes back now, the engine is told after
+            if (autoSwitch != _settings.AutoSwitch) SetAutoSwitch(autoSwitch); // asks for the owner's yes first when switching on
+            if (threshold != _engineThreshold)
+            {
+                await _engine.CommandAsync("config", "set", "autoswitch.threshold", threshold.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await ReadEngineThresholdAsync(); // agents follow the engine's threshold
+            }
         }
-        catch (Exception e) { Error("Could not save settings", e); }
+        catch (Exception e) { _dash.CloseSettings(); Error("Could not save settings", e); }
     }
 
     static string? PickFolder(string description, string? start = null)

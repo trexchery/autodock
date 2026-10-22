@@ -50,6 +50,10 @@ public sealed partial class Supervisor
         if (!Directory.Exists(repo.Path)) throw new AgentsException($"{repo.Path} no longer exists");
         var start = await StartPointAsync(repo);
         var wt = item.Worktree ?? _store.Worktree(repo, item);
+        // Git forgot the worktree (`git worktree prune` elsewhere): a run there sees no repository and can only ask the
+        // owner, who cannot fix it. Its files move aside (uncommitted work survives) and the branch is checked out afresh.
+        if (File.Exists(Path.Combine(wt, ".git")) && !(await GitAsync(wt, "rev-parse", "--absolute-git-dir")).Ok)
+            Directory.Move(wt, $"{wt}.orphaned-{DateTime.Now:yyyyMMdd-HHmmss}");
         if (!File.Exists(Path.Combine(wt, ".git")))
         {
             await GitAsync(repo.Path, "worktree", "prune");
@@ -126,7 +130,7 @@ public sealed partial class Supervisor
                 return;
             }
             var head = (await GitAsync(wt, "rev-parse", "HEAD")).Out.Trim();
-            var (selected, elsewhere) = Policy.Select(repo.Checks, files);
+            var (selected, elsewhere) = Policy.Select(repo.Checks, files, CheckShell.Os);
             var commands = (repo.Verify is { Length: > 0 } v ? [v] : new List<string>()).Concat(selected.Select(c => c.Run)).Distinct().ToList();
             var evidence = new List<string>();
             foreach (var command in commands)
@@ -163,7 +167,7 @@ public sealed partial class Supervisor
             }
             if (!item.PushApproved)
             {
-                if (item.ReviewNotes is { } notes)
+                if (item.ReviewNotes is { } notes && Config.AskApproval)
                 {
                     // One yes covers both, so the owner sees both.
                     Hold(repo, item, "review", "two review passes still found problems; answer to push it as is, or say what to change:\n" + notes
@@ -177,7 +181,7 @@ public sealed partial class Supervisor
                     Hold(repo, item, "sensitive", $"the change touches {string.Join(", ", sensitive.Take(5))}{(sensitive.Count > 5 ? $" and {sensitive.Count - 5} more" : "")}, which the repository's policy keeps for you (workflows run with the repository's secrets once pushed); answer to push it, or say what to change");
                     return;
                 }
-                if (policy.Push == "ask")
+                if (policy.Push == "ask" && Config.AskApproval)
                 {
                     Hold(repo, item, "push", "this repository's policy asks before every push (a push starts its remote CI); answer to push it, or say what to change");
                     return;

@@ -576,6 +576,39 @@ public class AgentProcessTests
         Assert.Empty(p.ProcessIds());
     }
 
+    /// The runner itself agrees with CheckShell: what it refuses fails under cmd.exe for shell reasons alone, and the
+    /// forms it tells the planner to use (cmd's own, or an explicit PowerShell) do the same job and pass.
+    [Fact]
+    public async Task WhatCheckShellRefusesFailsUnderTheRealRunnerAndWhatItSuggestsPasses()
+    {
+        using var tmp = new TempDir();
+        string F(string n) => Path.Combine(tmp.Path, n);
+        File.WriteAllText(F("in.txt"), "");
+        async Task<int> Run(string command)
+        {
+            using var p = AgentProcess.StartShell(command, tmp.Path, $@"Local\patch-goblins-test-{Guid.NewGuid():N}", F("in.txt"), F($"{Guid.NewGuid():N}.txt"));
+            await p.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(60));
+            await p.ReapAsync();
+            return p.ExitCode ?? -1;
+        }
+        foreach (var posix in new[] { "PG_X=1 git --version", "git --version >/dev/null" })
+        {
+            Assert.NotNull(CheckShell.Problem(posix, CheckShell.Kind.Cmd));
+            Assert.NotEqual(0, await Run(posix)); // fails for the shell alone: git itself is fine
+        }
+        Assert.NotNull(CheckShell.Problem("git --version && exit $rc", CheckShell.Kind.Cmd));
+        foreach (var native in new[]
+                 {
+                     // cmd's own form: the variable reaches the programs after `set` (not %PG_X% on this line, expanded first).
+                     "set PG_X=1&& powershell -NoProfile -NonInteractive -Command \"if ($env:PG_X -ne '1') { exit 1 }\" && git --version >NUL",
+                     "powershell -NoProfile -NonInteractive -Command \"$env:PG_X='1'; foreach ($i in 1..2) { git --version | Out-Null }; if ($env:PG_X -ne '1') { exit 1 }\"",
+                 })
+        {
+            Assert.Null(CheckShell.Problem(native, CheckShell.Kind.Cmd));
+            Assert.Equal(0, await Run(native));
+        }
+    }
+
     /// A file a live process is still writing (a plain File.ReadAllText would be refused).
     internal static string Shared(string path)
     {
@@ -1009,6 +1042,58 @@ public class AgentsTerminalTests
         Assert.Equal("paused", AgentsTerminal.StateOf(repo));
         repo.Authorized = false;
         Assert.Equal("off", AgentsTerminal.StateOf(repo));
+    }
+
+    [Fact]
+    public void EachGoblinAtWorkGetsARowUnderTheLabelLinkedToItsPullRequest()
+    {
+        var repo = new RepoAgents { Path = @"C:\r", Authorized = true };
+        Assert.Equal("", AgentsTerminal.WorkOf(repo));
+        repo.Items.Add(new WorkItem { Id = "w1", Issue = 4, Title = "Fix \u001b[2Jlogin", State = ItemState.Working, Run = new Run { Live = true, Email = "ana@example.com" } });
+        repo.Items.Add(new WorkItem { Id = "w2", Title = "Docs", State = ItemState.Checking, Pr = 9, PrUrl = "https://github.com/o/r/pull/9", Run = new Run { Live = true, Email = "bo@example.com" } });
+        repo.Items.Add(new WorkItem { Id = "w3", Title = "Queued", State = ItemState.Queued });
+        repo.Goals.Add(new Goal { Id = "g1", Title = "Ship it", Run = new Run { Kind = "plan", Live = true, Email = "cy@example.com" } });
+        var work = AgentsTerminal.WorkOf(repo);
+        Assert.Equal(
+            "\n▸ #4 Fix [2Jlogin · ana" // a title's escape cannot reach the terminal
+            + "\n▸ \u001b]8;;https://github.com/o/r/pull/9\u001b\\w2 Docs · bo · PR #9 · checking\u001b]8;;\u001b\\"
+            + "\n▸ planning Ship it · cy", work);
+        // "needs you" says what, and the words that answer it.
+        repo.Items.Add(new WorkItem { Id = "21", Issue = 21, Title = "Audit", State = ItemState.NeedsOwner, HoldFor = "sensitive" });
+        repo.Items.Add(new WorkItem { Id = "w9", Title = "Doc", State = ItemState.NeedsOwner, HoldFor = "push" });
+        repo.Items.Add(new WorkItem { Id = "2", Issue = 2, Title = "Decide", State = ItemState.NeedsOwner });
+        Assert.EndsWith(
+            "\n? #21 Audit · touches protected files: look, then /goblin:needs push #21"
+            + "\n? w9 Doc · waits to push: /goblin:needs push w9"
+            + "\n? #2 Decide · has a question: /goblin:needs", AgentsTerminal.WorkOf(repo));
+        // Clickable: a question opens its issue (an answer there counts), a held push its worktree; "needs you" the first of them.
+        const string Web = "https://github.com/o/r";
+        repo.Items.Single(i => i.Id == "w9").Worktree = @"C:\wt\my repo-w9";
+        var linked = AgentsTerminal.WorkOf(repo, Web);
+        Assert.Contains("\u001b]8;;file:///C:/wt/my%20repo-w9\u001b\\w9 Doc", linked);
+        Assert.Contains("\u001b]8;;https://github.com/o/r/issues/2\u001b\\#2 Decide", linked);
+        Assert.Contains("\u001b]8;;https://github.com/o/r/issues/21\u001b\\#21 Audit", linked); // a held push without its worktree: its issue
+        Assert.StartsWith("attention https://github.com/o/r/issues/21\n", AgentsTerminal.StatusOf(repo, Web));
+        Assert.Equal(Web, AgentsTerminal.Web("git@github.com:o/r.git"));
+        Assert.Equal(Web, AgentsTerminal.Web("https://github.com/o/r"));
+        Assert.Null(AgentsTerminal.Web("https://gitlab.com/o/r.git"));
+        repo.Items.RemoveAll(i => i.State == ItemState.NeedsOwner);
+        repo.Authorized = false;
+        Assert.Equal("", AgentsTerminal.WorkOf(repo));
+
+        if (GitBash() is not { } bash) return;
+        using var tmp = new TempDir();
+        string F(string n) => Path.Combine(tmp.Path, n).Replace('\\', '/');
+        var script = Path.Combine(tmp.Path, "statusline.sh");
+        File.WriteAllText(script, AgentsTerminal.StatusScript(null, F("state"), F("cache")).ReplaceLineEndings("\n"));
+        File.WriteAllText(F("state"), "working" + work + "\n");
+        var lines = RunStatusLine(bash, script, "{}").TrimEnd('\n').Split('\n');
+        Assert.Equal(4, lines.Length); // the label, then a row per goblin
+        Assert.Contains("\u001b]8;;https://github.com/o/r/pull/9\u001b\\w2 Docs", lines[2]);
+        File.WriteAllText(F("state"), "attention https://github.com/o/r/issues/2\n");
+        var label = RunStatusLine(bash, script, "{}").TrimEnd('\n');
+        Assert.StartsWith("\u001b]8;;https://github.com/o/r/issues/2\u001b\\", label); // "needs you" itself is clickable
+        Assert.EndsWith(" · needs you", System.Text.RegularExpressions.Regex.Replace(label, "\u001b(\\[[0-9;]*m|\\]8;;[^\u001b]*\u001b\\\\)", ""));
     }
 
     [Fact]
