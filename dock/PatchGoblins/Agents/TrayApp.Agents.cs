@@ -23,7 +23,8 @@ public sealed partial class TrayApp
             new AgentsConfig { Threshold = Threshold, MaxConcurrent = _settings.AgentIssues, MaxOpenPrs = _settings.AgentOpenPrs, DraftPrs = _settings.AgentDraftPrs, Ultracode = _settings.AgentUltracode });
         _agents.Authorize = AuthorizeAgents;
         _agents.ConfirmChecks = ConfirmAgentChecks;
-        _agents.Notify = (title, text) => Notify(title, text);
+        // Without approvals the owner hears only of questions and blockers; the rest waits in the flyout and the terminal.
+        _agents.Notify = (title, text) => { if (_settings.AskApproval || title is "Agents need you" or "Agents paused") Notify(title, text); };
         _agents.Changed += OnAgentsChanged;
         _agents.RefreshWanted += () => _ = TickAsync(runAuto: false, refresh: true);
         _link = new AgentsLink.Server(_agents.HandleAsync, presence: (repo, open) => { if (open) _agents.Attach(repo); else _agents.Detach(repo); });
@@ -70,6 +71,7 @@ public sealed partial class TrayApp
         _agents.Config.MaxOpenPrs = _settings.AgentOpenPrs;
         _agents.Config.DraftPrs = _settings.AgentDraftPrs;
         _agents.Config.Ultracode = _settings.AgentUltracode;
+        _agents.Config.AskApproval = _settings.AskApproval;
         _agents.Poke();
     }
 
@@ -126,7 +128,7 @@ public sealed partial class TrayApp
         AutoPrimeForAgents();
         RefreshTeam();
         foreach (var repo in _agents.Repos)
-            if (AgentsTerminal.StateOf(repo) is var state && (!_labels.TryGetValue(repo.Path, out var was) || was != state))
+            if (AgentsTerminal.StatusOf(repo, AgentsTerminal.WebOf(repo.Path)) is var state && (!_labels.TryGetValue(repo.Path, out var was) || was != state))
             {
                 AgentsTerminal.SetState(AgentStore.DefaultRoot, repo.Path, state);
                 _labels[repo.Path] = state;
@@ -203,7 +205,7 @@ public sealed partial class TrayApp
         if (EnsureAgents() is not { } agents) return;
         _settings.AgentLastRepo = root;
         _settings.Save();
-        var state = AgentsTerminal.StateOf(agents.RepoFor(root));
+        var state = AgentsTerminal.StatusOf(agents.RepoFor(root), AgentsTerminal.WebOf(root));
         try { AgentsTerminal.Open(_engine, AgentStore.DefaultRoot, root, _settings.PreserveRemoteControl, state); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception) { Error("Could not open the agents terminal", e); }
         _labels[root] = state;
@@ -217,41 +219,30 @@ public sealed partial class TrayApp
         return null;
     }
 
-    /// The owner's own decision, asked by Patch Goblins itself rather than by any model, once per repository.
-    Task<bool> AuthorizeAgents(RepoAgents repo, string? verify, string baseBranch)
-    {
-        // A tray app has no window of its own in front; a topmost owner keeps the question visible
-        // above the terminal that asked for it.
-        using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
-        owner.Show();
-        var ok = MessageBox.Show(owner,
-            $"Let Patch Goblins agents work on {repo.Leaf} while its agents terminal is open?\n\n" +
-            "• They take on its actionable open GitHub issues, " + (_settings.AgentIssues > 0 ? $"up to {_settings.AgentIssues} at a time" : "as many at a time as there are accounts with quota to spare") + " (and requests you make in the agents terminal), " +
-            "each in its own git worktree, using your other Claude accounts: never the account you're signed in with, " +
-            "which is never switched.\n" +
-            "• Each change is reviewed and checked, then Patch Goblins pushes a branch and opens a pull request, with at most " + _settings.AgentOpenPrs + " " +
-            "waiting for your review. Nothing is merged, no issue is closed, and branch protections are never bypassed.\n" +
-            "• When an issue needs your decision, the question is posted on the issue and work moves to the next one.\n" +
-            "• They work only while this repository's agents terminal is open: closing it pauses them, and reopening it " +
-            "continues where they were. Pause or stop them in the agents terminal, or by right-clicking the agents button " +
-            "in the Patch Goblins flyout.\n" +
-            "• You're responsible for following Anthropic's terms (anthropic.com/legal) for the accounts you use.\n\n" +
-            $"Pull requests target {baseBranch}. " +
-            (verify is { Length: > 0 } v ? $"Before each one, Patch Goblins runs this command in the change's worktree:\n    {v}\n\n" : "No verification command: pull requests rely on CI.\n\n") +
-            $"{(repo.Authorized ? "Apply these settings to" : "Start agents for")} {repo.Path}?",
-            "Patch Goblins — agents", MessageBoxButtons.YesNo, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
-        return Task.FromResult(ok);
-    }
+    /// The owner's own decision, asked by Patch Goblins itself rather than by any model, once per repository:
+    /// a card in the flyout and a notice, never a popup. With Ask for approval off it is a yes.
+    Task<bool> AuthorizeAgents(RepoAgents repo, string? verify, string baseBranch) =>
+        Approve($"{(repo.Authorized ? "Apply new agent settings to" : "Start agents on")} {repo.Leaf}?",
+            "They take its actionable open GitHub issues, " + (_settings.AgentIssues > 0 ? $"up to {_settings.AgentIssues} at a time" : "as many at a time as accounts have quota to spare") +
+            ", each in its own git worktree on your other Claude accounts (never the one you're signed in with). " +
+            $"Each change is reviewed and checked, then pushed as a pull request to {baseBranch}, at most {_settings.AgentOpenPrs} waiting for you. " +
+            "Nothing is merged, no issue is closed, branch protections are never bypassed. They work only while the agents terminal is open. " +
+            "You're responsible for following Anthropic's terms for the accounts you use.\n\n" +
+            (verify is { Length: > 0 } v ? $"Before each pull request it runs, in the change's worktree:\n{v}" : "No verification command: pull requests rely on CI.") +
+            $"\n\n{repo.Path}");
 
     /// The owner's confirmation of the exact commands a goal's checks will run, asked by Patch Goblins itself.
-    Task<bool> ConfirmAgentChecks(RepoAgents repo, IReadOnlyList<string> checks)
+    Task<bool> ConfirmAgentChecks(RepoAgents repo, IReadOnlyList<string> checks) =>
+        Approve($"Run goal checks in {repo.Leaf}?",
+            $"Patch Goblins runs these unattended, as you, in a fresh checkout of {repo.Base} to decide whether the goal is achieved:\n" +
+            string.Join("\n", checks) + "\n\nNothing else asks them to run.");
+
+    /// A card in the flyout plus a notice; unanswered for 10 minutes it is a no, so the asking tool call ends.
+    async Task<bool> Approve(string title, string body)
     {
-        using var owner = new Form { TopMost = true, ShowInTaskbar = false, FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), Size = new Size(1, 1) };
-        owner.Show();
-        return Task.FromResult(MessageBox.Show(owner,
-            $"Let Patch Goblins run these commands unattended, as you, in a fresh checkout of {repo.Base} to decide whether a goal in {repo.Leaf} is achieved?\n\n" +
-            string.Join("\n", checks.Select(c => "    " + c)) + "\n\nNothing else asks them to run.",
-            "Patch Goblins — goal checks", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes);
+        if (!_settings.AskApproval) return true;
+        Notify("Approval needed", title); // the one interruption: its click opens the flyout and the card
+        return await _dash.Ask(title, body, TimeSpan.FromMinutes(10));
     }
 
     async Task ExitAsync()

@@ -66,7 +66,7 @@ public sealed partial class TrayApp : ApplicationContext
         _dash.TerminalRequested += a => _ = AccountActionAsync(a, "terminal-folder");
         _dash.AccountAction += (a, act) => _ = AccountActionAsync(a, act);
         _dash.RefreshRequested += () => _ = TickAsync(runAuto: false, refresh: true);
-        _dash.SettingsRequested += () => _ = ShowSettingsAsync();
+        _dash.SettingsRequested += () => { if (_dash.SettingsOpen) _dash.CloseSettings(); else _ = ShowSettingsAsync(); };
         _dash.AddRequested += PickProviderToAdd;
         _dash.VisibleChanged += (_, _) => { if (!_dash.Visible) _dashHiddenAt = DateTime.UtcNow; };
         _dash.PinToggled += pinned => { _settings.Pinned = pinned; SavePinnedPosition(); };
@@ -651,10 +651,11 @@ public sealed partial class TrayApp : ApplicationContext
 
     static string Name(AccountRef? r) => r == null ? "(none)" : $"#{r.Number} {r.Email}";
 
+    /// A small Patch Goblins card at the bottom right (not Windows' balloon); a click opens the flyout.
     void Notify(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
     {
         _notices++;
-        _tray.ShowBalloonTip(5000, title, Engine.Redact(text), icon);
+        Toast.Show(title, Engine.Redact(text), icon switch { ToolTipIcon.Warning => Palette.Warn, ToolTipIcon.Error => Palette.Critical, _ => null }, ShowDashboard);
     }
 
     void BuildMenu()
@@ -1021,7 +1022,7 @@ public sealed partial class TrayApp : ApplicationContext
 
     async Task ShowSettingsAsync()
     {
-        using var f = new SettingsForm();
+        var f = new SettingsPanel();
         try
         {
             var cfg = await _engine.ConfigAsync();
@@ -1030,7 +1031,7 @@ public sealed partial class TrayApp : ApplicationContext
             f.StrategyValue = cfg.GetValueOrDefault("autoswitch.strategy") ?? "best";
             f.Models.Text = cfg.GetValueOrDefault("autoswitch.model") ?? "";
         }
-        catch (Exception e) { Error("Could not read engine settings", e); return; }
+        catch (Exception e) { f.Dispose(); Error("Could not read engine settings", e); return; }
         f.AutoSwitch.Checked = _settings.AutoSwitch;
         f.RefreshInterval.Value = _settings.RefreshSeconds;
         f.Startup.Checked = Startup.IsEnabled();
@@ -1043,7 +1044,15 @@ public sealed partial class TrayApp : ApplicationContext
         f.AgentOpenPrs.Value = Math.Clamp(_settings.AgentOpenPrs, (int)f.AgentOpenPrs.Minimum, (int)f.AgentOpenPrs.Maximum);
         f.DraftPrs.Checked = _settings.AgentDraftPrs;
         f.Ultracode.Checked = _settings.AgentUltracode;
-        if (f.ShowDialog() != DialogResult.OK) return;
+        f.AskApproval.Checked = _settings.AskApproval;
+        f.CancelClicked += _dash.CloseSettings;
+        f.SaveClicked += () => _ = SaveSettingsAsync(f);
+        if (!_dash.Visible) ShowDashboard();
+        _dash.ShowSettings(f);
+    }
+
+    async Task SaveSettingsAsync(SettingsPanel f)
+    {
         try
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
@@ -1065,6 +1074,7 @@ public sealed partial class TrayApp : ApplicationContext
             _settings.AgentOpenPrs = (int)f.AgentOpenPrs.Value;
             _settings.AgentDraftPrs = f.DraftPrs.Checked;
             _settings.AgentUltracode = f.Ultracode.Checked;
+            _settings.AskApproval = f.AskApproval.Checked;
             ApplyAgentSettings();
             _settings.Save();
             _ = ReadEngineThresholdAsync(); // agents follow the engine's threshold
@@ -1072,6 +1082,7 @@ public sealed partial class TrayApp : ApplicationContext
             if (f.AutoSwitch.Checked != _settings.AutoSwitch) SetAutoSwitch(f.AutoSwitch.Checked); // asks for the owner's yes first when switching on
         }
         catch (Exception e) { Error("Could not save settings", e); }
+        finally { _dash.CloseSettings(); } // after: its controls were read above
     }
 
     static string? PickFolder(string description, string? start = null)

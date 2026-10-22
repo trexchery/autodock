@@ -35,6 +35,9 @@ public sealed class AgentsConfig
     public bool DraftPrs { get; set; }
     /// The shell verification, policy and goal checks run under (AgentProcess.StartShell); tests judge as another machine would.
     public CheckShell.Kind Shell { get; set; } = CheckShell.Runner;
+    /// Off: a push never waits for the owner's yes (review notes, a policy that asks before every push), except for
+    /// files the repository's policy protects: a pushed workflow runs with the repository's secrets before anyone reads it.
+    public bool AskApproval { get; set; } = true;
     /// A goal plans again at most this often after its last plan; the owner's answer or replan skips it.
     public TimeSpan ReplanEvery { get; set; } = TimeSpan.FromMinutes(10);
     /// A goal whose work has all landed looks again after this long.
@@ -255,6 +258,15 @@ public sealed partial class Supervisor : IDisposable
                         // Checks interrupted by a restart or a pause pick up where they were.
                         foreach (var item in repo.Items.Where(i => i.State == ItemState.Checking && !_checks.Contains(i) && _notBefore.GetValueOrDefault(i) <= DateTimeOffset.Now).ToList())
                             Fire(() => CheckAsync(repo, item));
+                        // Approvals turned off: a push already waiting for a yes goes ahead, as an answer without text would
+                        // send it. Protected files ("sensitive", "workflow" from older builds) still wait.
+                        if (!Config.AskApproval)
+                            foreach (var item in repo.Items.Where(i => i is { State: ItemState.NeedsOwner, HoldFor: "push" or "review", Worktree: not null }).ToList())
+                            {
+                                (item.State, item.PushApproved, item.HoldFor, item.Note) = (ItemState.Checking, true, null, null);
+                                Save();
+                                Fire(() => CheckAsync(repo, item));
+                            }
                         foreach (var goal in repo.Goals.Where(g => g.State == GoalState.Active).ToList()) Tend(repo, goal);
                     }
                     await DispatchAsync();
