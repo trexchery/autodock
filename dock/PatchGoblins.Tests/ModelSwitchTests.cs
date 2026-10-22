@@ -87,6 +87,8 @@ public class ModelSwitchTests
         Assert.Null(ResumeStopped.ScopeOf(new Limit("seven_day", FableReset, Now), a, Sonnet)); // Sonnet does not use Fable's window
         Assert.Null(ResumeStopped.ScopeOf(new Limit("seven_day", FableReset, Now), a, null));
         Assert.Equal("Fable", ResumeStopped.ScopeOf(new Limit("seven_day_fable", Now.AddDays(1), Now), a, Fable)); // a label naming it
+        Assert.Equal("Fable", ResumeStopped.ScopeOf(new Limit("model_weekly", FableReset, Now), a, Fable)); // an unknown label: the windows decide
+        Assert.Null(ResumeStopped.ScopeOf(new Limit("model_weekly", General, Now), a, Fable));
         // Both reset together: whichever reads full is the one that ran out.
         var together = new Account(1, "1@example.com", false, "ok", new Usage(new Window(40, Now), new Window(60, General), [new Window(100, General, "Fable")], null));
         Assert.Equal("Fable", ResumeStopped.ScopeOf(new Limit("seven_day", General, Now), together, Fable));

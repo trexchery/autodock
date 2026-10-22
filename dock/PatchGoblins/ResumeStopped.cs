@@ -100,7 +100,7 @@ public static class ResumeStopped
         if (model == null || a?.ShownUsage is not { } u) return null;
         var mine = (u.Scoped ?? []).Where(w => Uses(model, w)).ToList();
         if (mine.FirstOrDefault(w => l.Window?.Contains(w.Name!, StringComparison.OrdinalIgnoreCase) == true) is { } named) return named.Name;
-        if (l.Window is not (null or "seven_day")) return null; // the 5-hour window is always the account's own
+        if (l.Window == "five_hour") return null; // the 5-hour window is always the account's own; any other label is judged by the windows themselves
         bool At(Window? w) => w?.ResetsAt is { } r && l.ResetsAt is { } t && Math.Abs((r - t).TotalSeconds) <= 120;
         return mine.FirstOrDefault(w => At(w) && !At(u.SevenDay)
             || (At(w) || l.ResetsAt == null) && w.Pct >= Full && (u.SevenDay?.Pct ?? 0) < Full)?.Name;
