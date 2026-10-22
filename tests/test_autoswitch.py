@@ -2640,6 +2640,18 @@ class TestModelAwareSwitch:
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.to_ref == {"number": 2, "email": "b@example.com"}
 
+    def test_consume_first_moves_fable_to_another_accounts_fable(self, temp_home):
+        # consume-first (the owner's strategy) with Fable set: #1's Fable is
+        # maxed and #2's is too, despite its idle 5h, so only #3 has Fable left.
+        h = self._seed(temp_home, model="Fable", strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 100),
+            "3": _model_usage(5, 30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_without_model_setting_the_same_usage_holds(self, temp_home):
         # Default engine ignores scoped windows → #1 reads 5% used, no switch.
         h = self._seed(temp_home)

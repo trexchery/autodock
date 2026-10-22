@@ -1181,18 +1181,20 @@ public sealed class AgentsEndToEndTests : IDisposable
     [Fact]
     public async Task AGoalStepWhoseIssueClosedClearsTheGoalsClaim()
     {
-        const string docs = """{"number":5,"title":"Write the docs page","body":"Docs.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
+        // Held while it works: the issue closes during the work, never during its check (which finishes what it started).
+        const string docs = """{"number":5,"title":"Write the docs page","body":"[fake:hold] Docs.","assignees":[],"author":{"login":"owner"},"labels":[]}""";
         Issues($"[{docs}]");
         Plan("""{"status":"working","summary":"docs","items":[{"key":"b","issue":5}]}""");
         await StartAsync(GoalConfig());
         await Tool("agents_control", """{"action":"start"}""");
         await Goal(new { action = "set", title = "Docs" });
-        await Until(r => r.Items.Any(i => i.Issue == 5 && i.Goal != null), "the planned issue is in the goal");
+        await Until(r => r.Items.Any(i => i.Issue == 5 && i.Goal != null && i.State == ItemState.Working), "the planned issue is in the goal, at work");
         await _loop.Run(() => G(_sup!.RepoFor(_repo)!).Claim = "done once #5 lands");
         Issues("[]");
         await _loop.Run(() => { _sup!.RepoFor(_repo)!.LastScan = null; _sup.Poke(); return 0; });
-        await Until(r => !r.Items.Any(i => i.Issue == 5), "the closed issue's item goes");
+        await Until(r => !r.Items.Any(i => i.Issue == 5), "the closed issue's item goes", 150); // its held run ends within the fake's minute
         Assert.Equal((null, GoalState.Active), await On(r => (G(r).Claim, G(r).State))); // not Achieved on work that ended unmerged
+        File.WriteAllText(_log + ".release", "");
         _sup!.Dispose();
     }
 
