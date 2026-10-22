@@ -898,6 +898,8 @@ public class RenderTests
                 var rows = FindRows(form).ToList();
                 var menu = rows[0].ShowMenu(Point.Empty);
                 form.Render(snap, null);
+                Assert.All(rows, r => Assert.False(r.IsDisposed)); // nothing shown changed: the same rows, no rebuild to flicker
+                form.Render(new Snapshot(1, 1, [snap.Accounts[0], snap.Accounts[1] with { Disabled = true }]), null);
                 Assert.All(rows, r => Assert.True(r.IsDisposed));
 
                 menu.Items.Cast<ToolStripItem>().First(i => i.Text == "Open terminal").PerformClick();

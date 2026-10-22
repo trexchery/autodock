@@ -101,7 +101,13 @@ public sealed class DashboardForm : Form
         _tips.SetToolTip(_refresh, "Refresh now");
         _footer.Controls.AddRange([_agents, _refresh]);
         // The agents button glints every few seconds, whatever Windows' animation setting says. One timer, only while shown.
-        _shine.Tick += (_, _) => Shimmer((Environment.TickCount64 - _shineT0) % ShinePeriodMs / (float)ShineSweepMs);
+        // 40 ms only while it sweeps; between sweeps the timer sleeps until the next one (most of every 4.5 s).
+        _shine.Tick += (_, _) =>
+        {
+            var at = (Environment.TickCount64 - _shineT0) % ShinePeriodMs;
+            Shimmer(at / (float)ShineSweepMs);
+            _shine.Interval = at < ShineSweepMs ? 40 : (int)Math.Max(40, ShinePeriodMs - at);
+        };
         VisibleChanged += (_, _) =>
         {
             _shineT0 = Environment.TickCount64;
@@ -212,7 +218,13 @@ public sealed class DashboardForm : Form
         IReadOnlyList<ProjectMapping>? projects = null, IReadOnlyDictionary<string, Job>? jobs = null)
     {
         _last = (snap, error, others, projects, jobs);
+        // A refresh that changes nothing shown is no rebuild: tearing every row down and back up is what flickers.
+        var shown = Shown(snap, error, others, projects, jobs);
+        if (shown == _shown && _list.Controls.Count > 0) return;
+        _shown = shown;
         ApplyTheme();
+        // Painting off while the rows are rebuilt, then one paint: no row-by-row flash.
+        if (IsHandleCreated) SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 0, 0);
         _list.SuspendLayout();
         // Copy first: Dispose removes the control, so enumerating live would skip every other one.
         foreach (var c in _list.Controls.Cast<Control>().ToList()) c.Dispose();
@@ -261,7 +273,30 @@ public sealed class DashboardForm : Form
         }
         _list.ResumeLayout();
         FitHeight();
+        if (IsHandleCreated)
+        {
+            SendMessage(Handle, 0x000B /* WM_SETREDRAW */, 1, 0);
+            Refresh();
+        }
     }
+
+    string? _shown;
+
+    /// What a render would draw, as text: equal text, equal flyout. Minutes, not seconds, for times shown as "in 2h 5m".
+    string Shown(Snapshot? snap, string? error, IReadOnlyList<(string Provider, Snapshot? Snap, string? Error)>? others,
+        IReadOnlyList<ProjectMapping>? projects, IReadOnlyDictionary<string, Job>? jobs) =>
+        System.Text.Json.JsonSerializer.Serialize(new
+        {
+            snap = snap?.Accounts.Select(a => a with { UsageAgeSeconds = null, UsageFetchedAt = null }),
+            error,
+            others = others?.Select(o => new { o.Provider, accounts = o.Snap?.Accounts.Select(a => a with { UsageAgeSeconds = null, UsageFetchedAt = null }), o.Error }),
+            projects,
+            jobs = jobs?.OrderBy(j => j.Key).Select(j => j.Key + "=" + j.Value),
+            asks = _asks.Count,
+            _visitorsOpen,
+            minute = DateTimeOffset.Now.ToString("yyyyMMddHHmm"),
+            dark = Palette.Current.IsDark,
+        });
 
     /// Opens or closes the Visitors (Codex, Grok) rows and redraws.
     internal void SetVisitorsOpen(bool open)
