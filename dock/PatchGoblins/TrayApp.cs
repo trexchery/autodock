@@ -499,20 +499,24 @@ public sealed partial class TrayApp : ApplicationContext
                 return null;
             }
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // before the close, which can wait 30 s: a concurrent switch must not pick this account meanwhile
+            var spot = WindowSpot.Of(s.Pid); // the reopened window goes back where this one was
             await ResumeStopped.CloseAsync(s.Pid, s.Record);
             closed = true;
             try { await Task.Run(Copy); } catch (Exception e) { Program.Log(e); }
             _resumed[$"{s.SessionId}#{account.Number}"] = DateTime.UtcNow; // the launching window counts from the launch, not the plan
-            for (var attempt = 0; ; attempt++)
+            await WindowSpot.OpenAtAsync(spot, () =>
             {
-                try
+                for (var attempt = 0; ; attempt++)
                 {
-                    _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
-                        Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s, ResumeStopped.Moved(s, account.Number))));
-                    break;
+                    try
+                    {
+                        _engine.LaunchConsole($"Claude · {account.ShortName} · {(s.AtLimit ? "resumed" : "moved")}", s.Cwd,
+                            Launch.Run(account.Number, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(s)));
+                        break;
+                    }
+                    catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more: the old window is already gone
                 }
-                catch (Exception e) when (attempt == 0) { Program.Log(e); } // once more: the old window is already gone
-            }
+            });
             Program.Log($"nudge {s.SessionId} relaunched #{s.Account} on #{account.Number}");
             return (s.AtLimit, $"{Path.GetFileName(s.Cwd.TrimEnd('\\'))} on #{account.Number}");
         }
@@ -589,11 +593,13 @@ public sealed partial class TrayApp : ApplicationContext
         catch (Exception e) { Program.Log(e); return false; }
         Program.Log($"freeing #{n} for the default login: {windows.Count} idle window(s)" + (agents ? ", agent runs yield it" : ""));
         var closed = new List<StoppedSession>();
+        var spots = new Dictionary<string, WindowSpot?>();
         foreach (var w in windows)
         {
             // Someone typed, or a turn started: that window keeps the profile, so the switch refuses and the closed ones go back.
             if (!ResumeStopped.Unchanged(w) || ResumeStopped.UserIdle() < TimeSpan.FromSeconds(60)) break;
             if (w.Limit is { } old) _limitWatch.Remember(old.At);
+            spots[w.SessionId] = WindowSpot.Of(w.Pid);
             try { await ResumeStopped.CloseAsync(w.Pid, w.Record); closed.Add(w); }
             catch (Exception e) { Program.Log(e); break; }
         }
@@ -615,8 +621,8 @@ public sealed partial class TrayApp : ApplicationContext
         {
             try { ResumeStopped.CopyTranscript(w, ResumeStopped.DefaultDir); } catch (Exception e) { Program.Log(e); } // what it wrote on the way out
             _resumed[$"{w.SessionId}#{n}"] = _resumed[ResumeStopped.MoveStamp(w.SessionId, DateTime.UtcNow)] = DateTime.UtcNow;
-            _engine.LaunchConsole($"Claude · {account.ShortName} · moved", w.Cwd,
-                Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(w, moved: false)));
+            await WindowSpot.OpenAtAsync(spots.GetValueOrDefault(w.SessionId), () => _engine.LaunchConsole($"Claude · {account.ShortName} · moved", w.Cwd,
+                Launch.Run(n, _settings.PreserveRemoteControl, ResumeStopped.ResumeArgs(w))));
             Program.Log($"nudge {w.SessionId} relaunched on #{n}");
         }
         try { ResumeStopped.SaveMoves(MovesPath, _resumed, DateTime.UtcNow); } catch (Exception e) { Program.Log(e); }

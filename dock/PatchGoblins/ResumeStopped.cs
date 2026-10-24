@@ -39,21 +39,15 @@ public static class ResumeStopped
     public const double PerWindow = 10;
     /// A window moved this often within an hour is left where it is: it keeps stopping, and reopening it again won't help.
     public const int MovesPerHour = 3;
-    public static string Prompt(bool moved) =>
-        "This session stopped at a usage limit and Patch Goblins reopened it" + (moved ? " on another account" : " now that the limit has reset") +
-        ". Continue exactly where you left off.";
+    public const string Prompt = "A usage limit was hit. Continue.";
 
     /// Claude args that reopen `s` on another account: a stopped turn is told to carry on, a finished one
     /// just waits for its user again.
-    public static string[] ResumeArgs(StoppedSession s, bool moved) =>
-        s.AtLimit ? ["--resume", s.SessionId, Prompt(moved) + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
+    public static string[] ResumeArgs(StoppedSession s) =>
+        s.AtLimit ? ["--resume", s.SessionId, Prompt + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
 
-    /// Said to a window moved while its background commands ran: they still do, outside this session.
-    public const string Background = " Background commands it started were left running outside this session: check their output or effects before starting them again.";
-
-    /// Whether the reopened window is on another account than the one that refused it. A default-login stop from
-    /// before a switch is: its label already names the new default, but the account that said no was the old one.
-    public static bool Moved(StoppedSession s, int target) => target != s.Account || s.AtLimit && !s.OwnRefused;
+    /// Said to a window moved while its background commands ran: they still do, so it doesn't start them twice.
+    public const string Background = " Its background commands are still running.";
 
     /// The `autoswitch.model` names whose weekly windows the engine also decides on ("all": every one), read with its threshold.
     public static IReadOnlySet<string> Models { get; set; } = new HashSet<string>();
