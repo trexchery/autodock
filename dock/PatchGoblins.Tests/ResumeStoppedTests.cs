@@ -143,6 +143,8 @@ public class ResumeStoppedTests
     {
         Assert.Equal(["--resume", "id"], ResumeStopped.ResumeArgs(Done3, moved: true));
         Assert.Equal(["--resume", "id", ResumeStopped.Prompt(true)], ResumeStopped.ResumeArgs(On(3), moved: true));
+        // Moved from a shell: told its background commands still run, so it doesn't start them twice.
+        Assert.Equal(["--resume", "id", ResumeStopped.Prompt(true) + ResumeStopped.Background], ResumeStopped.ResumeArgs(On(3) with { Status = "shell" }, moved: true));
     }
 
     [Fact]

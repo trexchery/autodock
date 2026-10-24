@@ -14,7 +14,9 @@ still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 ``hysteresis_pct`` below the threshold so two accounts hovering at the line
 never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
+(bypassed only when the active account is hard at its limit). A proactive
+switch then waits a random ``switch_buffer_seconds`` so several accounts
+crossing the line in the same pass don't move in lockstep. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
 under-lock re-read sees a fresh token and aborts its own refresh); a target
@@ -53,7 +55,11 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    UsageEntry,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -1313,6 +1319,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
+            entry = None
             if trigger == "consume-first":
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
@@ -1321,6 +1328,7 @@ class AutoSwitchEngine:
                 # or slide to a worse-ranked target; hold and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
+                    # (Rechecked after the random buffer in `_perform` too.)
                     self._emit(
                         NoSwitchEvent(
                             reason="stale-usage",
@@ -1335,7 +1343,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(
+                    num, email, trigger, left_snapshot, entry, active_headroom
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1376,9 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(
+                num, email, trigger, left_snapshot, entry, active_headroom
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -2102,6 +2114,8 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        entry: UsageEntry | None = None,
+        active_headroom: float | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2115,6 +2129,31 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.SWITCHED
+
+        # The random buffer waits BEFORE the lock, so a concurrent engine
+        # (cron --once, another surface) is not parked behind it; the cooldown
+        # recheck below still happens after the wait and sees any switch that
+        # landed meanwhile.
+        pause = self._switch_buffer(trigger, active_headroom)
+        if pause > 0:
+            self._stop.wait(pause)
+            if trigger == "consume-first" and (
+                entry is None or not entry.fresh(self.clock())
+            ):
+                # The wait can outlive the serve TTL the phase-2 refetch was
+                # checked against (the buffer ceiling is longer than
+                # SERVE_TTL_S): act only on data still inside it, exactly as
+                # the pre-wait gate demands. The next tick retries.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="stale-usage",
+                        detail=(
+                            f"account {number} usage went stale during the "
+                            "random switch delay; retrying"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
 
         # Hold the state lock across the whole recheck -> switch -> record
         # sequence so two concurrent engines (loop + cron --once) make one
@@ -2172,6 +2211,28 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _switch_buffer(
+        self, trigger: str, active_headroom: float | None = None
+    ) -> float:
+        """Seconds to wait before switching, uniform in [0, switch_buffer].
+
+        Scoped to ``proactive`` and ``consume-first``: both fire while the
+        active account still works, so a random wait costs nothing but
+        staggers a fleet whose accounts cross the line together. ``at-limit``
+        and ``failover`` are already blocking work — the sooner they land the
+        better — and so is a ``consume-first`` move forced by an account at
+        its hard limit, which is the same state under the other strategy.
+        Dry-run never waits (it returns before this in ``_perform``).
+        """
+        if trigger not in ("proactive", "consume-first"):
+            return 0.0
+        if active_headroom is not None and active_headroom <= 0:
+            return 0.0
+        ceiling = self.settings.switch_buffer_seconds
+        if ceiling <= 0:
+            return 0.0
+        return random.uniform(0.0, float(ceiling))
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

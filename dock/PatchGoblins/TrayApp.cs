@@ -28,6 +28,7 @@ public sealed partial class TrayApp : ApplicationContext
     readonly SemaphoreSlim _movePass = new(1, 1); // one pass of reopening windows at a time, whoever asks
     bool _retry, _watching; // a nudge that had to wait (typing, a window busy at its limit): look again on the next poll; a poll running
     double? _engineThreshold, _engineHysteresis; // the engine's own, so windows move at the line the default login switches at
+    int _engineSwitchBuffer; // autoswitch.switchBufferSeconds, for the settings box
     double Threshold => _engineThreshold ?? 97; // the one fallback for it, until the engine's is read
     readonly Dictionary<string, DateTime> _busySince = []; // busy windows at a limit → when first seen so: only ones still busy after a grace are told about
     static readonly TimeSpan BusyGrace = TimeSpan.FromSeconds(10);
@@ -413,7 +414,7 @@ public sealed partial class TrayApp : ApplicationContext
                 continue;
             }
             if (plan.Any(p => p.S.SessionId == s.SessionId)) continue; // one live window per session moves per pass
-            var target = s.Idle ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil) : null;
+            var target = s.Movable ? ResumeStopped.Target(s, snap.Accounts, n => ResumeStopped.ProfileDir(n) != null, threshold, hysteresis, now, load, _limits.RefusedUntil) : null;
             // One try per session per account per ten minutes, kept across restarts: a reopened window that stops again waits for room, not a loop.
             var key = $"{s.SessionId}#{target}";
             var step = ResumeStopped.Decide(s, ResumeStopped.UserIdle(), TypingPause, target, _resumed.TryGetValue(key, out var at) && DateTime.UtcNow - at < TimeSpan.FromMinutes(10),
@@ -1027,6 +1028,7 @@ public sealed partial class TrayApp : ApplicationContext
         if (_engineThreshold == null) await ReadEngineThresholdAsync();
         if (_engineThreshold == null) { f.Dispose(); Error("Could not read engine settings", new EngineException("cswap config did not answer")); return; }
         f.Threshold.Value = Math.Clamp((decimal)_engineThreshold.Value, f.Threshold.Minimum, f.Threshold.Maximum);
+        f.SwitchBuffer.Value = Math.Clamp(_engineSwitchBuffer, (int)f.SwitchBuffer.Minimum, (int)f.SwitchBuffer.Maximum);
         f.AutoSwitch.Checked = _settings.AutoSwitch;
         f.Startup.Checked = Startup.IsEnabled();
         f.AutoProject.Checked = _settings.AutoProjectAccount;
@@ -1070,6 +1072,12 @@ public sealed partial class TrayApp : ApplicationContext
             {
                 await _engine.CommandAsync("config", "set", "autoswitch.threshold", threshold.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 await ReadEngineThresholdAsync(); // agents follow the engine's threshold
+            }
+            var buffer = (int)f.SwitchBuffer.Value;
+            if (buffer != _engineSwitchBuffer)
+            {
+                await _engine.CommandAsync("config", "set", "autoswitch.switchBufferSeconds", buffer.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await ReadEngineThresholdAsync();
             }
         }
         catch (Exception e) { _dash.CloseSettings(); Error("Could not save settings", e); }

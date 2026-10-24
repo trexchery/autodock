@@ -48,6 +48,27 @@ class FakeClock:
         self.now += seconds
 
 
+class RecordingWait:
+    """Stands in for ``engine._stop``: records the wait instead of sleeping."""
+
+    def __init__(self, clock=None, advance: float = 0.0):
+        self.waits: list[float] = []
+        self.clock = clock
+        self.advance = advance
+
+    def wait(self, seconds: float) -> bool:
+        self.waits.append(seconds)
+        if self.clock is not None:
+            self.clock.advance(self.advance)
+        return False
+
+    def is_set(self) -> bool:
+        return False
+
+    def set(self) -> None:
+        pass
+
+
 def _iso_at(epoch: float) -> str:
     """An absolute epoch as the ISO-Z string a window's ``resets_at`` carries."""
     from datetime import datetime, timezone
@@ -477,6 +498,45 @@ class TestDecisionTable:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
+
+    def test_switch_buffer_waits_a_random_amount_for_proactive(self, temp_home):
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, switch_buffer_seconds=30)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        waits = RecordingWait()
+        h.engine._stop = waits
+        outcome = h.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert len(waits.waits) == 1
+        assert 0.0 <= waits.waits[0] <= 30.0
+
+    def test_switch_buffer_skips_at_limit_and_failover(self, temp_home):
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, switch_buffer_seconds=30, unhealthy_ticks=1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        waits = RecordingWait()
+        h.engine._stop = waits
+        assert h.tick_with_usage({
+            "1": _usage(100), "2": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        # Failover: account 2 is active now, and its usage is unreadable.
+        assert h.tick_with_usage({
+            "2": None, "1": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert waits.waits == []
+
+    def test_switch_buffer_off_never_waits(self, harness):
+        waits = RecordingWait()
+        harness.engine._stop = waits
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert waits.waits == []
 
     def test_cooldown_expires(self, harness):
         harness.engine._mutate_state(
@@ -2879,6 +2939,40 @@ class TestConsumeFirstStrategy:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
         assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_a_switch_buffered_past_the_serve_ttl_holds(self, temp_home):
+        # The phase-2 refetch is fresh at the gate, but the random wait can
+        # outlive SERVE_TTL_S: act only on data still inside it.
+        h = self._harness(temp_home)
+        h.settings = replace(h.settings, switch_buffer_seconds=300)
+        h.engine.settings = h.settings
+        h.engine._stop = RecordingWait(clock=h.clock, advance=301)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "stale-usage"
+        ]
+
+    def test_no_buffer_wait_when_the_active_is_at_its_hard_limit(self, temp_home):
+        # A consume-first move forced by an exhausted active is the same
+        # "already blocking work" state the at-limit trigger names.
+        h = self._harness(temp_home)
+        h.settings = replace(h.settings, switch_buffer_seconds=300)
+        h.engine.settings = h.settings
+        waits = RecordingWait()
+        h.engine._stop = waits
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 100, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert waits.waits == []
 
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)

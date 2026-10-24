@@ -322,7 +322,7 @@ public class LimitWatchTests
     }
 
     [Fact]
-    public void BusyShellOrWaitingWindowAtALimitIsSeenButNeverMovable()
+    public void BusyOrWaitingWindowAtALimitIsSeenButNeverMovable()
     {
         var root = TempRoot();
         try
@@ -335,7 +335,9 @@ public class LimitWatchTests
                 var s = Assert.Single(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, includeBusy: true));
                 Assert.False(s.Idle);
                 Assert.True(s.AtLimit);
-                Assert.False(ResumeStopped.Unchanged(s)); // and the last check before a close refuses it too
+                // A shell at its limit has finished its turn: movable, its background command outlives the close. The others: the last check refuses them too.
+                Assert.Equal(status == "shell", s.Movable);
+                Assert.Equal(status == "shell", ResumeStopped.Unchanged(s));
             }
             Stage(root, "idle", LimitLine(Now, Now.AddHours(1)));
             Assert.True(Assert.Single(ResumeStopped.Scan([(root, 3)], later, DateTime.MinValue, includeBusy: true)).Idle);
@@ -732,14 +734,18 @@ public class LimitWatchTests
         ResumeStopped.Decide(s, TimeSpan.FromSeconds(idleSeconds), TimeSpan.FromSeconds(5), target, recent, moves, () => unchanged);
 
     [Fact]
-    public void ABusyShellOrWaitingWindowIsNeverMovedWhateverElseHolds()
+    public void ABusyOrWaitingWindowIsNeverMovedWhateverElseHolds()
     {
-        foreach (var status in new[] { "busy", "shell", "waiting" })
+        foreach (var status in new[] { "busy", "waiting" })
         {
             var step = Decide(Stopped(status), unchanged: true);
             Assert.Equal(status == "waiting" ? ResumeStopped.Step.Wait : ResumeStopped.Step.Left, step); // one balloon names the left ones
         }
         Assert.Equal(ResumeStopped.Step.Move, Decide(Stopped())); // idle at the limit, with room: moved
+        // In a shell at the limit (a background command running): its turn is over and it cannot carry on, so moved too, but
+        // a finished turn below the limit with a background command is left alone.
+        Assert.Equal(ResumeStopped.Step.Move, Decide(Stopped("shell")));
+        Assert.Equal(ResumeStopped.Step.Ignore, Decide(Stopped("shell", atLimit: false)));
     }
 
     [Fact]

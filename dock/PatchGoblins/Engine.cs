@@ -135,7 +135,8 @@ public sealed partial class Engine(string exe)
     /// quarantine and the disabled/API-key exclusions; exit 0=switched 2=no-op 3=blocked.
     public async Task<(int Code, List<AutoEvent> Events)> AutoOnceAsync()
     {
-        var r = await RunAsync(["auto", "--once", "--json"]);
+        // Pocket the random switch buffer (up to its 300 s ceiling) on top of the usual fetch time.
+        var r = await RunAsync(["auto", "--once", "--json"], TimeSpan.FromSeconds(360));
         return (r.ExitCode, ParseEvents(r.Stdout));
     }
 
@@ -218,7 +219,11 @@ public sealed partial class Engine(string exe)
     /// markers.
     internal static void TopLevel(IDictionary<string, string?> env, Func<IReadOnlyDictionary<string, string>?> fresh)
     {
-        if (env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)) && fresh() is { } clean)
+        // AI_AGENT too: a process started by one that already dropped the markers (a restarted tray) still carries the
+        // session's NO_COLOR, and every terminal it opened drew without colors.
+        if ((env.Keys.Any(k => k.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase))
+                || env.Any(v => v.Key.Equals("AI_AGENT", StringComparison.OrdinalIgnoreCase) && v.Value?.StartsWith("claude-code", StringComparison.OrdinalIgnoreCase) == true))
+            && fresh() is { } clean)
         {
             // Patch Goblins' own (an isolated instance's PATCH_GOBLINS_DATA) carry over: its terminals talk to it.
             var own = env.Where(v => v.Key.StartsWith("PATCH_GOBLINS_", StringComparison.OrdinalIgnoreCase) || v.Key.StartsWith("HANDOFF_", StringComparison.OrdinalIgnoreCase)).ToList();

@@ -9,11 +9,14 @@ namespace PatchGoblins;
 /// A Claude Code window waiting for someone to type: stopped on a usage-limit error (`AtLimit`), or done
 /// with its turn. `Record` and `Seen` (the transcript's write time) let the move check nothing changed since.
 /// `Limit` is the error as recorded; `OwnRefused`: the API refused the window's own account (not one it was
-/// only labelled with after a switch). `Status` is the record's: only an `idle` window is ever closed.
+/// only labelled with after a switch). `Status` is the record's: only a `Movable` window is ever closed.
 public sealed record StoppedSession(int Pid, string SessionId, string Cwd, string ConfigDir, int? Account, string Transcript,
     bool AtLimit = true, string? Record = null, DateTime Seen = default, Limit? Limit = null, bool OwnRefused = false, string Status = "idle")
 {
     public bool Idle => Status == "idle";
+    /// Idle, or in a shell at its limit: its turn is over and it cannot carry on where it is. The close kills only claude,
+    /// so the background command runs on to its end (the reopened window is told).
+    public bool Movable => Idle || AtLimit && Status == "shell";
 }
 
 /// A usage-limit stop as Claude Code recorded it: the window that ran out ("five_hour", "seven_day", ...), when it
@@ -43,7 +46,10 @@ public static class ResumeStopped
     /// Claude args that reopen `s` on another account: a stopped turn is told to carry on, a finished one
     /// just waits for its user again.
     public static string[] ResumeArgs(StoppedSession s, bool moved) =>
-        s.AtLimit ? ["--resume", s.SessionId, Prompt(moved)] : ["--resume", s.SessionId];
+        s.AtLimit ? ["--resume", s.SessionId, Prompt(moved) + (s.Status == "shell" ? Background : "")] : ["--resume", s.SessionId];
+
+    /// Said to a window moved while its background commands ran: they still do, outside this session.
+    public const string Background = " Background commands it started were left running outside this session: check their output or effects before starting them again.";
 
     /// Whether the reopened window is on another account than the one that refused it. A default-login stop from
     /// before a switch is: its label already names the new default, but the account that said no was the old one.
@@ -438,8 +444,8 @@ public static class ResumeStopped
         return found;
     }
 
-    /// What one scanned window gets in a pass. `Ignore`: nothing due. `Left`: busy or in a shell at its limit, never closed (its
-    /// background work would die): told about once, moved when idle. `Wait`: look again on the next poll (waiting on a dialog, someone typing,
+    /// What one scanned window gets in a pass. `Ignore`: nothing due. `Left`: busy at its limit, never closed (its turn
+    /// is still running): told about once, moved when idle. `Wait`: look again on the next poll (waiting on a dialog, someone typing,
     /// or it changed since the scan). `NoRoom`, `Recent` (reopened there under ten minutes ago), `Capped` (`MovesPerHour`): left as it is.
     /// `Move`: close and reopen it on `target`.
     public enum Step { Ignore, Left, Wait, NoRoom, Recent, Capped, Move }
@@ -448,7 +454,7 @@ public static class ResumeStopped
     /// A finished turn moves only off the default login, and only after a minute without input anywhere.
     public static Step Decide(StoppedSession s, TimeSpan userIdle, TimeSpan typingPause, int? target, bool recent, int moves, Func<bool> unchanged)
     {
-        if (!s.Idle) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
+        if (!s.Movable) return !s.AtLimit ? Step.Ignore : s.Status == "waiting" ? Step.Wait : Step.Left;
         if (!s.AtLimit && (s.ConfigDir == DefaultDir || userIdle < TimeSpan.FromSeconds(60))) return Step.Ignore;
         if (s.AtLimit && userIdle < typingPause) return Step.Wait;
         if (target == null) return Step.NoRoom;
@@ -483,7 +489,7 @@ public static class ResumeStopped
             if (s.Record == null) return true;
             using var doc = JsonDocument.Parse(File.ReadAllText(s.Record));
             var r = doc.RootElement;
-            return Str(r, "status") == "idle" && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
+            return s.Movable && Str(r, "status") == s.Status && Str(r, "sessionId") == s.SessionId && IsLiveClaude(s.Pid, Str(r, "procStart"));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
